@@ -5,6 +5,14 @@
   "type": "module",
   "main": "src/server.js",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/khanhle1406/codex-browser-use.git"
+  },
+  "homepage": "https://github.com/khanhle1406/codex-browser-use",
+  "bugs": {
+    "url": "https://github.com/khanhle1406/codex-browser-use/issues"
+  },
   "keywords": ["browser-use", "browser-automation", "mcp", "chrome", "accessibility-tree", "agent", "cdp"],
   "files": ["src", "bin", "extension", "README.md"],
   "publishConfig": {

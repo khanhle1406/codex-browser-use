@@ -171,7 +171,7 @@ npm publish
 Create the GitHub repository once, then push:
 
 ```sh
-git remote add origin git@github.com:OWNER/codex-browser-use.git
+git remote add origin git@github.com:khanhle1406/codex-browser-use.git
 git push -u origin main
 ```
 
