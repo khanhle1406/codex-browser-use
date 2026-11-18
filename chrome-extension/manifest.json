@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Antigravity Browser Bridge",
+  "version": "1.1.0",
+  "description": "Multi-agent browser automation bridge matching OpenAI Codex architecture 100% with virtual cursor and tab favicon badge.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvIAkNqeJ1B/ddeXgng8WDYGzQNS0V3+ehfIrCnp8WXVfryGq1/MY9b+guRan4bHidOfbsrHHO6bYYvy3y958S8CF8jtMd8Ch34QPPy73Qz4Fei1kVnxZFVkyGiMLtZBU1DJdNll6MASDfdgJi4Eoke1h+/KLQR4Tk+JsO03+kMNDDRlZnTZIfHbVNpB79YW+j2qZMCVhN9DaZw9dyDeBLdqetKoSI/ZuUMi8dgvKAlLoHm6wfBEn6E6CFZIYRcfla4tjAJDzWu4e2Hvg01sXSf5DY50p6xZ3AoEOxCsJ3oqdawiNfgiVZOVKxK0svK88+UbSY9ZFtRLReEXV57msSQIDAQAB",
+  "permissions": [
+    "debugger",
+    "nativeMessaging",
+    "tabs",
+    "scripting",
+    "webNavigation",
+    "favicon"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-script.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["images/cursor-chat.png"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "com.antigravity.browserhost",
+  "description": "Antigravity Multi-Agent Browser Gateway",
+  "path": "/Users/xuannguyen/.gemini/tools/antigravity-browser-host/bin/host.sh",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://efahhkjnlabijbbnkommfpfjlclkmfgd/"
+  ]
+}
