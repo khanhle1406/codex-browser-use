@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" role="img" aria-label="Core loop: snapshot the accessibility tree, act on an element index, then re-read the page">
+  <defs>
+    <linearGradient id="loop-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1220"/>
+      <stop offset="1" stop-color="#0E1730"/>
+    </linearGradient>
+    <linearGradient id="loop-card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#121C31"/>
+      <stop offset="1" stop-color="#0D1526"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="400" rx="24" fill="url(#loop-bg)"/>
+
+  <text x="64" y="54" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="3.2" fill="#7FA6FF">THE CORE LOOP</text>
+  <text x="64" y="94" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="30" font-weight="700" fill="#F2F6FF">Snapshot. Act. Re-read.</text>
+
+  <rect x="64" y="130" width="320" height="200" rx="14" fill="url(#loop-card)" stroke="#22304A"/>
+  <text x="88" y="166" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">1 · Snapshot</text>
+  <text x="88" y="204" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#9FB0CC">1 textbox &quot;Email&quot;</text>
+  <text x="88" y="228" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#9FB0CC">2 textbox &quot;Password&quot;</text>
+  <text x="88" y="252" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#34D399">3 button &quot;Create account&quot;</text>
+  <line x1="88" y1="284" x2="360" y2="284" stroke="#1B2940"/>
+  <text x="88" y="308" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7FA6FF">browser_get_state</text>
+
+  <rect x="440" y="130" width="320" height="200" rx="14" fill="url(#loop-card)" stroke="#22304A"/>
+  <text x="464" y="166" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">2 · Act</text>
+  <rect x="460" y="184" width="280" height="104" rx="8" fill="#0B1426" stroke="#22304A"/>
+  <text x="474" y="206" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#C7D3E6">browser_set_value</text>
+  <text x="474" y="224" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7FA6FF">  element_index: &quot;1&quot;</text>
+  <text x="474" y="248" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#C7D3E6">browser_click</text>
+  <text x="474" y="266" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" fill="#7FA6FF">  element_index: &quot;3&quot;</text>
+  <line x1="464" y1="284" x2="736" y2="284" stroke="#1B2940"/>
+  <text x="464" y="308" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">act on the index, not a guess</text>
+
+  <rect x="816" y="130" width="320" height="200" rx="14" fill="url(#loop-card)" stroke="#22304A"/>
+  <text x="840" y="166" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">3 · Re-read</text>
+  <circle cx="976" cy="210" r="24" fill="#0F2A22" stroke="#34D399" stroke-width="1.6"/>
+  <path d="M966 210 l7 7 l13 -14" fill="none" stroke="#34D399" stroke-width="3"/>
+  <text x="976" y="260" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" fill="#E6EDF7">state changed</text>
+  <text x="976" y="280" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">indices refreshed</text>
+  <line x1="840" y1="284" x2="1112" y2="284" stroke="#1B2940"/>
+  <text x="976" y="308" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">repeat until done</text>
+
+  <line x1="384" y1="230" x2="424" y2="230" stroke="#3B5170" stroke-width="1.6"/>
+  <polygon points="424,225 434,230 424,235" fill="#3B5170"/>
+  <line x1="760" y1="230" x2="800" y2="230" stroke="#3B5170" stroke-width="1.6"/>
+  <polygon points="800,225 810,230 800,235" fill="#3B5170"/>
+
+  <text x="600" y="372" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" fill="#93A4BF">Indices belong to one snapshot. Never reuse them after a change.</text>
+</svg>

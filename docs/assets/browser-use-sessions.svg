@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-label="Session ownership: two agents each own their own tabs, with no cross-session tab access">
+  <defs>
+    <linearGradient id="sess-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1220"/>
+      <stop offset="1" stop-color="#0E1730"/>
+    </linearGradient>
+    <linearGradient id="sess-card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#121C31"/>
+      <stop offset="1" stop-color="#0D1526"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="360" rx="24" fill="url(#sess-bg)"/>
+
+  <text x="64" y="54" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="3.2" fill="#7FA6FF">SESSION OWNERSHIP</text>
+  <text x="64" y="94" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="30" font-weight="700" fill="#F2F6FF">Tabs stay with the session that made them.</text>
+
+  <line x1="600" y1="110" x2="600" y2="318" stroke="#2A3B5C" stroke-width="1.4" stroke-dasharray="6 6"/>
+
+  <rect x="100" y="124" width="380" height="88" rx="14" fill="url(#sess-card)" stroke="#22304A"/>
+  <rect x="126" y="152" width="22" height="18" rx="4" fill="#A78BFA"/>
+  <circle cx="132" cy="161" r="1.7" fill="#0B1220"/>
+  <circle cx="142" cy="161" r="1.7" fill="#0B1220"/>
+  <text x="164" y="160" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">Agent A</text>
+  <text x="164" y="182" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">MCP connection A</text>
+  <rect x="382" y="146" width="72" height="24" rx="12" fill="#13203A" stroke="#2A3B5C"/>
+  <text x="418" y="162" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#A78BFA">session A</text>
+
+  <rect x="720" y="124" width="380" height="88" rx="14" fill="url(#sess-card)" stroke="#22304A"/>
+  <rect x="746" y="152" width="22" height="18" rx="4" fill="#38BDF8"/>
+  <circle cx="752" cy="161" r="1.7" fill="#0B1220"/>
+  <circle cx="762" cy="161" r="1.7" fill="#0B1220"/>
+  <text x="784" y="160" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">Agent B</text>
+  <text x="784" y="182" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">MCP connection B</text>
+  <rect x="1002" y="146" width="72" height="24" rx="12" fill="#13203A" stroke="#2A3B5C"/>
+  <text x="1038" y="162" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#38BDF8">session B</text>
+
+  <line x1="290" y1="212" x2="290" y2="232" stroke="#3B5170" stroke-width="1.6"/>
+  <polygon points="285,232 290,242 295,232" fill="#3B5170"/>
+  <line x1="910" y1="212" x2="910" y2="232" stroke="#3B5170" stroke-width="1.6"/>
+  <polygon points="905,232 910,242 915,232" fill="#3B5170"/>
+
+  <rect x="100" y="242" width="380" height="68" rx="12" fill="#0E1628" stroke="#22304A"/>
+  <rect x="126" y="258" width="22" height="17" rx="3" fill="none" stroke="#A78BFA" stroke-width="1.5"/>
+  <line x1="126" y1="264" x2="148" y2="264" stroke="#A78BFA" stroke-width="1.5"/>
+  <circle cx="131" cy="261" r="1.2" fill="#A78BFA"/>
+  <text x="164" y="270" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#E6EDF7">Tab 1</text>
+  <text x="164" y="290" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">owned by session A</text>
+
+  <rect x="720" y="242" width="380" height="68" rx="12" fill="#0E1628" stroke="#22304A"/>
+  <rect x="746" y="258" width="22" height="17" rx="3" fill="none" stroke="#38BDF8" stroke-width="1.5"/>
+  <line x1="746" y1="264" x2="768" y2="264" stroke="#38BDF8" stroke-width="1.5"/>
+  <circle cx="751" cy="261" r="1.2" fill="#38BDF8"/>
+  <text x="784" y="270" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#E6EDF7">Tab 2</text>
+  <text x="784" y="290" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">owned by session B</text>
+
+  <rect x="590" y="196" width="20" height="16" rx="3" fill="none" stroke="#FBBF24" stroke-width="1.5"/>
+  <path d="M594 196 v-5 a6 6 0 0 1 12 0 v5" fill="none" stroke="#FBBF24" stroke-width="1.5"/>
+  <rect x="520" y="222" width="160" height="48" rx="8" fill="#0B1220" stroke="#1B2940"/>
+  <text x="600" y="242" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="10" font-weight="600" fill="#FBBF24">session boundary</text>
+  <text x="600" y="258" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="9" fill="#93A4BF">no cross-tab access</text>
+
+  <text x="600" y="338" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" fill="#93A4BF">Unmarked tabs close at turn end. Handoff and deliverable tabs survive.</text>
+</svg>

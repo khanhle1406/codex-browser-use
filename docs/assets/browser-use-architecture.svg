@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="460" viewBox="0 0 1200 460" role="img" aria-label="Architecture: an MCP agent talks to the browser-use server over stdio, the server talks to a native host over a Unix socket, the host talks to the Chrome extension over native messaging, and the extension drives a Chrome tab over CDP">
+  <defs>
+    <linearGradient id="arch-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B1220"/>
+      <stop offset="1" stop-color="#0E1730"/>
+    </linearGradient>
+    <linearGradient id="arch-box" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#121C31"/>
+      <stop offset="1" stop-color="#0D1526"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="460" rx="24" fill="url(#arch-bg)"/>
+
+  <text x="64" y="58" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="3.2" fill="#7FA6FF">ARCHITECTURE</text>
+  <text x="64" y="100" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="30" font-weight="700" fill="#F2F6FF">Local, four layers</text>
+  <text x="64" y="130" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" fill="#9FB0CC">The agent speaks MCP. The bridge speaks CDP. Nothing leaves your machine.</text>
+
+  <text x="76" y="160" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" letter-spacing="2" fill="#5B8DEF">01</text>
+  <rect x="64" y="176" width="160" height="136" rx="14" fill="url(#arch-box)" stroke="#22304A"/>
+  <rect x="134" y="203" width="20" height="16" rx="4" fill="#A78BFA"/>
+  <circle cx="139" cy="211" r="1.6" fill="#0B1220"/>
+  <circle cx="149" cy="211" r="1.6" fill="#0B1220"/>
+  <text x="144" y="262" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">Agent</text>
+  <text x="144" y="284" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">any MCP client</text>
+
+  <text x="304" y="160" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" letter-spacing="2" fill="#5B8DEF">02</text>
+  <rect x="292" y="176" width="160" height="136" rx="14" fill="url(#arch-box)" stroke="#22304A"/>
+  <rect x="360" y="200" width="24" height="18" rx="4" fill="none" stroke="#5B8DEF" stroke-width="1.6"/>
+  <path d="M366 206 l4 3 l-4 3" fill="none" stroke="#5B8DEF" stroke-width="1.6"/>
+  <line x1="373" y1="212" x2="379" y2="212" stroke="#5B8DEF" stroke-width="1.6"/>
+  <text x="372" y="262" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">MCP server</text>
+  <text x="372" y="284" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">23 tools · sessions</text>
+
+  <text x="532" y="160" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" letter-spacing="2" fill="#5B8DEF">03</text>
+  <rect x="520" y="176" width="160" height="136" rx="14" fill="url(#arch-box)" stroke="#22304A"/>
+  <rect x="591" y="204" width="18" height="12" rx="3" fill="#34D399"/>
+  <line x1="596" y1="204" x2="596" y2="198" stroke="#34D399" stroke-width="1.6"/>
+  <line x1="604" y1="204" x2="604" y2="198" stroke="#34D399" stroke-width="1.6"/>
+  <line x1="600" y1="216" x2="600" y2="222" stroke="#34D399" stroke-width="1.6"/>
+  <text x="600" y="262" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">Native host</text>
+  <text x="600" y="284" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">launcher + manifests</text>
+
+  <text x="760" y="160" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" letter-spacing="2" fill="#5B8DEF">04</text>
+  <rect x="748" y="176" width="160" height="136" rx="14" fill="url(#arch-box)" stroke="#22304A"/>
+  <rect x="818" y="201" width="9" height="9" rx="2" fill="#FBBF24"/>
+  <rect x="831" y="201" width="9" height="9" rx="2" fill="none" stroke="#FBBF24" stroke-width="1.4"/>
+  <rect x="818" y="214" width="9" height="9" rx="2" fill="none" stroke="#FBBF24" stroke-width="1.4"/>
+  <rect x="831" y="214" width="9" height="9" rx="2" fill="none" stroke="#FBBF24" stroke-width="1.4"/>
+  <text x="828" y="262" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">Extension</text>
+  <text x="828" y="284" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">MV3 · native messaging</text>
+
+  <text x="988" y="160" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" letter-spacing="2" fill="#5B8DEF">05</text>
+  <rect x="976" y="176" width="160" height="136" rx="14" fill="url(#arch-box)" stroke="#22304A"/>
+  <rect x="1044" y="201" width="24" height="18" rx="3" fill="none" stroke="#38BDF8" stroke-width="1.6"/>
+  <line x1="1044" y1="207" x2="1068" y2="207" stroke="#38BDF8" stroke-width="1.6"/>
+  <circle cx="1049" cy="204" r="1.2" fill="#38BDF8"/>
+  <text x="1056" y="262" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#E6EDF7">Chrome tab</text>
+  <text x="1056" y="284" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11" fill="#93A4BF">chrome.debugger</text>
+
+  <line x1="234" y1="244" x2="280" y2="244" stroke="#3B5170" stroke-width="1.6"/>
+  <polygon points="280,239 290,244 280,249" fill="#3B5170"/>
+  <line x1="462" y1="244" x2="508" y2="244" stroke="#3B5170" stroke-width="1.6"/>
+  <polygon points="508,239 518,244 508,249" fill="#3B5170"/>
+  <line x1="690" y1="244" x2="736" y2="244" stroke="#3B5170" stroke-width="1.6"/>
+  <polygon points="736,239 746,244 736,249" fill="#3B5170"/>
+  <line x1="918" y1="244" x2="964" y2="244" stroke="#3B5170" stroke-width="1.6"/>
+  <polygon points="964,239 974,244 964,249" fill="#3B5170"/>
+
+  <text x="258" y="336" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#7FA6FF">stdio MCP</text>
+  <text x="486" y="336" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#7FA6FF">JSON-RPC</text>
+  <text x="714" y="336" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#7FA6FF">native msg</text>
+  <text x="942" y="336" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" fill="#7FA6FF">CDP</text>
+
+  <line x1="64" y1="366" x2="1136" y2="366" stroke="#1B2940"/>
+  <path d="M292 394 l12 5 v9 c0 7 -6 11 -12 14 c-6 -3 -12 -7 -12 -14 v-9 z" fill="none" stroke="#34D399" stroke-width="1.6"/>
+  <path d="M287 404 l3 3 l6 -7" fill="none" stroke="#34D399" stroke-width="1.6"/>
+  <text x="316" y="410" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" fill="#93A4BF">The extension only drives tabs it created. No cookies, history, or other windows.</text>
+</svg>
