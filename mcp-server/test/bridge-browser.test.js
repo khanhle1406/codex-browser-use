@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BridgeBrowser, buildAxState, parseKeyCombo, normalizeUrl } from "../src/bridge-browser.js";
+import { BridgeBrowser, buildAxState, parseKeyCombo, normalizeUrl, sameUrl } from "../src/bridge-browser.js";
 import { assertReadOnly } from "../src/read-only.js";
 
 const AX_NODES = [
@@ -129,13 +129,26 @@ test("normalizeUrl adds https and preserves explicit schemes", () => {
   assert.equal(normalizeUrl("example.com"), "https://example.com");
   assert.equal(normalizeUrl("http://localhost:3000"), "http://localhost:3000");
   assert.equal(normalizeUrl("about:blank"), "about:blank");
+  assert.equal(normalizeUrl("file:///tmp/form.html"), "file:///tmp/form.html");
+  assert.equal(normalizeUrl("/tmp/form.html"), "file:///tmp/form.html");
+  assert.equal(normalizeUrl("./form.html"), `file://${process.cwd()}/form.html`);
+  assert.equal(normalizeUrl("data:text/html,<h1>x</h1>"), "data:text/html,<h1>x</h1>");
+});
+
+test("sameUrl ignores the normalizations a browser applies", () => {
+  assert.equal(sameUrl("https://example.com/", "https://example.com"), true);
+  assert.equal(sameUrl("https://example.com/docs/", "https://example.com/docs"), true);
+  assert.equal(sameUrl("https://example.com/?q=1", "https://example.com?q=1"), true);
+  assert.equal(sameUrl("https://example.com/a", "https://example.com/b"), false);
+  assert.equal(sameUrl("about:blank", "https://example.com"), false);
+  assert.equal(sameUrl("file:///tmp/a.html", "file:///tmp/a.html"), true);
 });
 
 test("newTab creates, attaches, and activates a tab", async () => {
   const { browser, calls } = browserFixture();
   const tab = await browser.newTab();
   assert.equal(tab.tab_id, "2");
-  assert.deepEqual(calls.filter((call) => call.kind === "rpc").map((call) => call.method), ["createTab", "attach"]);
+  assert.deepEqual(calls.filter((call) => call.kind === "rpc").map((call) => call.method), ["createTab", "attach", "getTabs"]);
   assert.equal(browser.activeTabId, 2);
 });
 

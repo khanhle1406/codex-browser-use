@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { BridgeClient } from "./bridge-client.js";
 import { assertReadOnly } from "./read-only.js";
 
@@ -148,7 +149,11 @@ export function parseKeyCombo(combo) {
 export function normalizeUrl(url) {
   const value = String(url).trim();
   if (value === "about:blank") return value;
-  if (/^(?:https?|about|data):/iu.test(value)) return value;
+  if (/^(?:https?|about|data|file|blob|chrome-error):/iu.test(value)) return value;
+  if (value.startsWith("/") || value.startsWith("./") || value.startsWith("../")) {
+    return `file://${path.resolve(value)}`;
+  }
+  if (/^[a-z]:[\\/]/iu.test(value)) return `file:///${value.replaceAll("\\", "/")}`;
   return `https://${value}`;
 }
 
@@ -294,7 +299,9 @@ export class BridgeBrowser {
     this.activeTabId = tab.id;
     await this.attach(tab.id);
     if (url && normalizeUrl(url) !== "about:blank") await this.goto(url, tab.id);
-    return { tab_id: String(tab.id), title: tab.title || "Untitled", url: tab.url || "", active: true };
+    const current = (await this.#rpc("getTabs"))?.find((entry) => entry?.id === tab.id) ?? tab;
+    this.tabs.set(tab.id, current);
+    return { tab_id: String(tab.id), title: current.title || "Untitled", url: current.url || "", active: true };
   }
 
   /** @param {unknown} tabId */
@@ -722,8 +729,7 @@ export class BridgeBrowser {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const current = await this.#evaluateRaw(tabId, "location.href").catch(() => null);
-      if (typeof current === "string" && current !== "about:blank" &&
-          (current === target || current.startsWith("data:") || target.startsWith("data:"))) return;
+      if (typeof current === "string" && current !== "about:blank" && sameUrl(current, target)) return;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     throw new Error(`Browser navigation did not commit to ${target} within ${timeoutMs}ms`);
@@ -765,6 +771,25 @@ export class BridgeBrowser {
 function splitIndices(value) {
   if (value === undefined || value === null || value === "") return [];
   return String(value).split(/[,;\s]+/u).map((entry) => entry.trim()).filter(Boolean);
+}
+
+/**
+ * Compare two URLs after the normalizations a browser applies, such as adding a
+ * trailing slash to an origin and dropping an empty fragment.
+ * @param {string} current
+ * @param {string} target
+ * @returns {boolean}
+ */
+export function sameUrl(current, target) {
+  const normalize = (value) => {
+    try {
+      const url = new URL(value);
+      return `${url.origin}${url.pathname.replace(/\/+$/u, "")}${url.search}${url.hash}`;
+    } catch {
+      return value.replace(/\/+$/u, "");
+    }
+  };
+  return normalize(current) === normalize(target);
 }
 
 /**
