@@ -314,7 +314,7 @@ export function registerTools(server, deps = {}) {
           timeoutMs: timeout_ms ?? 45_000,
         });
 
-        const shouldEndTurn = end_turn === true || keep !== undefined || (end_turn !== false && run.keptTabs.length > 0);
+        const shouldEndTurn = end_turn === true || keep !== undefined || (end_turn !== false && (run.keptTabs.length > 0 || run.endTurnRequested));
         const effectiveReturnState = return_state ?? (!shouldEndTurn && run.value === undefined ? "diff" : "none");
 
         let state = null;
@@ -1012,13 +1012,13 @@ export function registerTools(server, deps = {}) {
 export function createStandaloneServer(deps = {}) {
   const profile = deps.profile ?? resolveToolProfile();
   const server = new McpServer(
-    { name: "browser-use", version: "4.7.0" },
+    { name: "browser-use", version: "4.7.1" },
     {
       instructions: [
-        "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.tabs.read()` / `browser.user.claimTab()` in `browser_run`). Claimed user tabs are released (never auto-closed) when a turn ends.",
-        "Speed & efficiency: Use `browser_run` (timeout up to 300000ms) for persistent variables (`const`/`let`/`class`), bound tabs (`browser.tabs.new()` / `browser.tabs.get(id)` / parallel `browser.tabs.content(urls)`), `browser.nameSession()` Chrome tab groups, auto-waiting locators (`getByRole`/`getByText`/`.filter({ has, hasNot, hasNotText })`/`.getAttribute()`/read-only `evaluate(fn, arg)`), `locator.screenshot()` / `saveScreenshot()`, `saveFile()`/`readFile()` for bulk scraped output without flooding context, `dev.enableNetwork({ captureBodies: true })` + `dev.responseBody(id)`, and `markDeliverable`/`markHandoff`; or `browser_batch` for linear steps.",
+        "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.tabs.read()` / `browser.user.claimTab()` in `browser_run`). Claimed user tabs join the session Chrome Tab Group and are released (kept open & grouped) when a turn ends.",
+        "Speed & efficiency (Probe 1 -> Batch Loop All): When facing repetitive UI rows/modals/pages, inspect 1 sample item first, then pack the full loop (clicks, chunked reads, `saveFile()`, pagination) or known deterministic click sequence into ONE `browser_run` call (up to 300000ms) instead of repeating small calls. Includes persistent variables (`const`/`let`/`class`), bound tabs (`browser.tabs.new()` / `browser.tabs.get(id)` / parallel `browser.tabs.content(urls)` returning structured `.links`/`.tables`), `browser.nameSession()`, auto-waiting locators (including async CKEditor sync), `locator.screenshot()` / `saveScreenshot()`, `dev.enableNetwork({ captureBodies: true })` + `dev.responseBody(id)`, `markDeliverable`/`markHandoff`, and `browser.endTurn()`/`browser.end_turn()`.",
         "Diff-first & inspect-first: Start with `ariaSnapshot({ mode: \"compact\" })` or `browser_get_state` / `ax.write()` before guessing selectors; narrow multi-matches with `.first()`/`.nth(i)` and use `reload()` rather than `goto(sameUrl)`. Request `screenshot: true` / `ax.write('screenshot')` / `saveScreenshot(..., { emit: true })` when visual inspection or Proof of Work is needed.",
-        "Pass end_turn/keep to browser_run or browser_batch, or `browser_name_session` / `browser.nameSession()` to group owned tabs visually, and `browser_end_turn` at the end for tabs that must survive cleanup.",
+        "Pass end_turn/keep to browser_run or browser_batch (or call `browser.endTurn()`/`markDeliverable()` inside `browser_run`), `browser_name_session` / `browser.nameSession()` to group tabs visually, and `browser_end_turn` at the end for tabs that must survive cleanup.",
       ].join("\n"),
     },
   );

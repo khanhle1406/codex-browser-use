@@ -156,14 +156,60 @@ const SHARED_DOM_HELPERS = `
   const tryFillRichEditor = (el, assigned, inputType = "insertText") => {
     if (!el) return false;
     const win = el.ownerDocument?.defaultView || window;
+    const setNativeValue = (node, val) => {
+      if (!node || !("value" in node)) return;
+      const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(node), "value");
+      if (desc?.set) desc.set.call(node, val); else node.value = val;
+      node.dispatchEvent?.(new Event("input", { bubbles: true }));
+      node.dispatchEvent?.(new Event("change", { bubbles: true }));
+    };
     try {
       const cke = win?.CKEDITOR?.instances;
       if (cke && typeof cke === "object") {
         const ckeRoot = el.closest?.(".cke");
         for (const inst of Object.values(cke)) {
           if (inst && (inst.element?.$ === el || (el.id && inst.name === el.id) || (el.name && inst.name === el.name) || (ckeRoot && inst.container?.$ === ckeRoot))) {
+            const targetEl = inst.element?.$ || (el.tagName === "TEXTAREA" ? el : null);
+            const syncTextarea = () => {
+              try { inst.updateElement?.(); } catch (_e) {}
+              try {
+                const current = typeof inst.getData === "function" ? inst.getData() : assigned;
+                if (targetEl && "value" in targetEl && targetEl.value !== current) {
+                  setNativeValue(targetEl, current);
+                }
+              } catch (_e) {}
+            };
+            const isAsyncSetData = typeof inst.setData === "function" &&
+              (typeof inst.once === "function" || inst.setData.length >= 2) &&
+              typeof Promise === "function";
+            if (isAsyncSetData) {
+              return new Promise((resolve) => {
+                let settled = false;
+                let timer = null;
+                const finish = () => {
+                  if (settled) return;
+                  settled = true;
+                  if (timer !== null && typeof clearTimeout === "function") clearTimeout(timer);
+                  syncTextarea();
+                  resolve(true);
+                };
+                try { inst.once?.("dataReady", finish); } catch (_e) {}
+                try {
+                  inst.setData(assigned, finish);
+                } catch (_e) {
+                  finish();
+                  return;
+                }
+                syncTextarea();
+                if (!settled && typeof setTimeout === "function") {
+                  timer = setTimeout(finish, 300);
+                } else if (!settled) {
+                  finish();
+                }
+              });
+            }
             inst.setData?.(assigned);
-            inst.updateElement?.();
+            syncTextarea();
             return true;
           }
         }
@@ -173,6 +219,11 @@ const SHARED_DOM_HELPERS = `
       const ck5 = el.ckeditorInstance || el.closest?.(".ck-editor__editable")?.ckeditorInstance;
       if (ck5 && typeof ck5.setData === "function") {
         ck5.setData(assigned);
+        ck5.updateSourceElement?.();
+        if ("value" in el) {
+          const current = typeof ck5.getData === "function" ? ck5.getData() : assigned;
+          if (el.value !== current) setNativeValue(el, current);
+        }
         return true;
       }
     } catch (_e) {}
@@ -181,6 +232,10 @@ const SHARED_DOM_HELPERS = `
       if (tiny && typeof tiny.setContent === "function") {
         tiny.setContent(assigned);
         tiny.save?.();
+        if ("value" in el && typeof tiny.getContent === "function") {
+          const current = tiny.getContent();
+          if (el.value !== current) setNativeValue(el, current);
+        }
         return true;
       }
     } catch (_e) {}
@@ -445,7 +500,7 @@ const SHARED_LOCATOR_RESOLVER = `
   };
 `;
 
-export const LOCATOR_RUNTIME_VERSION = 2;
+export const LOCATOR_RUNTIME_VERSION = 3;
 
 const SHARED_RUNNER_CORE = `
   const isDisabledEl = (el) => !!(el.matches?.(":disabled") || el.getAttribute?.("aria-disabled") === "true");
@@ -686,9 +741,10 @@ const SHARED_RUNNER_CORE = `
         element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
         const assigned = mutation === "clear" ? "" : String(nextValue ?? "");
         const inputType = mutation === "clear" ? "deleteContentBackward" : "insertText";
-        if (tryFillRichEditor(element, assigned, inputType)) {
-          return { count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }), ...cursorPt(element) };
-        }
+        const rich = tryFillRichEditor(element, assigned, inputType);
+        const donePayload = () => ({ count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }), ...cursorPt(element) });
+        if (rich && typeof rich.then === "function") return rich.then(donePayload);
+        if (rich) return donePayload();
         element.focus();
         const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value");
         if (descriptor?.set) descriptor.set.call(element, assigned); else element.value = assigned;
@@ -918,7 +974,7 @@ export function locatorRuntimeInstallExpression() {
  */
 export function locatorInvokeExpression(selector, options = {}) {
   const waitMs = Math.max(0, Math.round(Number(options.inPageWaitMs) || 0));
-  const isAsync = Boolean(options.asyncEval || waitMs > 0);
+  const isAsync = Boolean(options.asyncEval || waitMs > 0 || options.mutation === "fill" || options.mutation === "clear");
   const compactOpts = {};
   if (options.mutation != null) compactOpts.mutation = options.mutation;
   if (options.value != null) compactOpts.value = options.value;
@@ -953,7 +1009,7 @@ export function locatorInvokeExpression(selector, options = {}) {
 export function locatorExpression(selector, options = {}) {
   const embeddedEvalFn = options.evalFn ? `(${options.evalFn})` : "null";
   const waitMs = Math.max(0, Math.round(Number(options.inPageWaitMs) || 0));
-  const isAsync = Boolean(options.asyncEval || waitMs > 0);
+  const isAsync = Boolean(options.asyncEval || waitMs > 0 || options.mutation === "fill" || options.mutation === "clear");
   const wrapperStart = isAsync ? "(async () => {" : "(() => {";
   const evalAwait = isAsync ? "await " : "";
   const optsExpr = JSON.stringify({

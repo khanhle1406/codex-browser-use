@@ -115,7 +115,20 @@ function richMockBridge() {
         if (expr === "window.devicePixelRatio") return { result: { value: 2 } };
         if (expr.includes("document.body ? document.body.innerText")) return { result: { value: `Email=${valueText} Plan=${selectValue}` } };
         if (expr.includes("BOILERPLATE_TAGS")) {
-          return { result: { value: { title: tabTitle, url: tabUrl, format: "markdown", content: `# ${tabUrl}`, text: `# ${tabUrl}`, truncated: false } } };
+          return {
+            result: {
+              value: {
+                title: tabTitle,
+                url: tabUrl,
+                format: expr.includes('"links"') ? "links" : (expr.includes('"tables"') ? "tables" : "markdown"),
+                content: `# ${tabUrl}`,
+                text: `# ${tabUrl}`,
+                ...(expr.includes('"links"') ? { links: [{ text: "Item", href: `${tabUrl}/item` }] } : {}),
+                ...(expr.includes('"tables"') ? { tables: [[["H1", "H2"], ["a", "b"]]] } : {}),
+                truncated: false,
+              },
+            },
+          };
         }
         if (expr.includes("document.elementsFromPoint")) {
           return { result: { value: { x: 60, y: 40, elements: [{ tagName: "button", candidates: ['role=button[name="Save"]'] }] } } };
@@ -798,7 +811,9 @@ test("MCP server v4.7.0 supports 300s browser_run, saveFile/readFile/saveScreens
         const savedElShot = await tab.locator("css=button").saveScreenshot(${JSON.stringify(elShotPath)}, { padding: 2 });
 
         const batchRead = await browser.tabs.content(["https://one.example", "https://two.example"]);
-        return { sel, respBody, written, loaded, elBox: elCap.box, savedPageShot, savedElShot, batchRead };
+        const linksRead = await browser.tabs.content(["https://links.example"], { format: "links" });
+        const scheduledEnd = await browser.end_turn({ keep: [{ tab_id: tab.id, mode: "deliverable" }] });
+        return { sel, respBody, written, loaded, elBox: elCap.box, savedPageShot, savedElShot, batchRead, linksRead, scheduledEnd };
       `,
     },
   });
@@ -806,6 +821,8 @@ test("MCP server v4.7.0 supports 300s browser_run, saveFile/readFile/saveScreens
   assert.notEqual(res.isError, true, JSON.stringify(res));
   const body = JSON.parse(res.content[0].text);
   assert.equal(body.ok, true);
+  assert.ok(body.end_turn);
+  assert.equal(body.result.scheduledEnd.scheduled, true);
   assert.deepEqual(body.logs, ["repl-msg"]);
   assert.equal(body.result.sel.selected, true);
   assert.equal(JSON.parse(body.result.respBody.body).requestId, "req-42");
@@ -815,6 +832,7 @@ test("MCP server v4.7.0 supports 300s browser_run, saveFile/readFile/saveScreens
   assert.equal(body.result.batchRead.length, 2);
   assert.equal(body.result.batchRead[0].content, "# https://one.example");
   assert.equal(body.result.batchRead[1].content, "# https://two.example");
+  assert.deepEqual(body.result.linksRead[0].links, [{ text: "Item", href: "https://links.example/item" }]);
   assert.equal(res.content[1].type, "image");
 
   const diskJson = JSON.parse(await readFile(dataPath, "utf8"));

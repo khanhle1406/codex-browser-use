@@ -363,6 +363,29 @@ export class BrowserScriptSession {
     return { tab_id: resolved, mode: normalized };
   }
 
+  #requestEndTurn(optsOrMode, fixedTabId = null) {
+    const run = this.#requireRun();
+    run.endTurnRequested = true;
+    const targetKeep = (optsOrMode && typeof optsOrMode === "object" && !Array.isArray(optsOrMode))
+      ? optsOrMode.keep
+      : optsOrMode;
+    if (typeof targetKeep === "string") {
+      this.#keepTab(targetKeep, fixedTabId);
+    } else if (Array.isArray(targetKeep)) {
+      for (const entry of targetKeep) {
+        if (entry && typeof entry === "object" && entry.tab_id != null) {
+          this.#keepTab(entry.mode ?? "deliverable", entry.tab_id);
+        } else if (typeof entry === "string" || typeof entry === "number") {
+          this.#keepTab("deliverable", entry);
+        }
+      }
+    }
+    return {
+      scheduled: true,
+      keep: [...run.keptTabs.entries()].map(([tab_id, mode]) => ({ tab_id, mode })),
+    };
+  }
+
   #parseLocatorEvalArgs(fnOrExpr, argOrOpts, maybeOpts, extraLen) {
     if (extraLen >= 3) {
       return { arg: argOrOpts, hasArg: true, opts: isPlainObject(maybeOpts) ? maybeOpts : {} };
@@ -985,6 +1008,8 @@ export class BrowserScriptSession {
       keepTab: (mode, id) => self.#keepTab(mode, id ?? boundId),
       markDeliverable: (id) => self.#keepTab("deliverable", id ?? boundId),
       markHandoff: (id) => self.#keepTab("handoff", id ?? boundId),
+      endTurn: (opts) => self.#requestEndTurn(opts, boundId),
+      end_turn: (opts) => self.#requestEndTurn(opts, boundId),
       dev: {
         logs: async (opts = {}) => (await tabApi.consoleLogs(opts)).logs,
         network: async (opts = {}) => (await tabApi.networkLogs(opts)).requests,
@@ -1235,6 +1260,7 @@ export class BrowserScriptSession {
       lastAction: null,
       touchedTabs: new Set(this.currentTabId ? [this.currentTabId] : []),
       keptTabs: new Map(),
+      endTurnRequested: false,
       logs: [],
       logChars: 0,
       images: [],
@@ -1301,6 +1327,7 @@ export class BrowserScriptSession {
         notifications,
         activeTabId: finalActive,
         keptTabs: [...run.keptTabs.entries()].map(([tab_id, mode]) => ({ tab_id, mode })),
+        endTurnRequested: run.endTurnRequested,
       };
     } finally {
       run.aborted = true;

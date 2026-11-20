@@ -78,7 +78,7 @@ export function createTabHandlers(driver, options) {
       if (!session.group || !driver.groupTabs) {
         return { groupId: session.group?.groupId ?? null, supported: false };
       }
-      const ownedIds = tabIds.filter((id) => session.tabs.has(id) && !session.userTabs.has(id));
+      const ownedIds = tabIds.filter((id) => session.tabs.has(id));
       if (ownedIds.length === 0) {
         return { groupId: session.group.groupId, supported: true };
       }
@@ -274,6 +274,12 @@ export function createTabHandlers(driver, options) {
         const current = await driver.readTab(rawId);
         signal.throwIfAborted();
         if (!current) throw new Error("Browser tab is unavailable to this session");
+        if (driver.groupTabs) {
+          if (!session.group) {
+            session.group = { title: "🔎 Browser Use", color: "blue", groupId: null };
+          }
+          await applySessionGroup(session, [rawId]).catch(() => {});
+        }
         return {
           ...current,
           owned: true,
@@ -299,6 +305,12 @@ export function createTabHandlers(driver, options) {
       owners.set(tab.id, session);
       session.tabs.set(tab.id, null);
       session.userTabs.add(tab.id);
+      if (driver.groupTabs) {
+        if (!session.group) {
+          session.group = { title: "🔎 Browser Use", color: "blue", groupId: null };
+        }
+        await applySessionGroup(session, [tab.id]).catch(() => {});
+      }
       return {...tab, owned: true, origin: "user"};
     }],
     ["readTabContext", async (params, signal) => {

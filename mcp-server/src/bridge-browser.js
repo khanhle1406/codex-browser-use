@@ -2259,6 +2259,8 @@ export class BridgeBrowser {
               title: res?.title ?? "",
               content: res?.content ?? extractedText,
               text: extractedText,
+              ...(Array.isArray(res?.links) ? { links: res.links } : {}),
+              ...(Array.isArray(res?.tables) ? { tables: res.tables } : {}),
               truncated: Boolean(res?.truncated),
             };
           } catch (error) {
@@ -3260,7 +3262,12 @@ export class BridgeBrowser {
   /** @param {number} tabId @param {string|null} sessionId @param {string} selector @param {Record<string, any>} [options] */
   async #evaluateLocator(tabId, sessionId, selector, options = {}) {
     const userGesture = ["fill", "clear", "click", "select", "check", "uncheck"].includes(options.mutation);
-    const awaitPromise = Boolean(options.asyncEval || (options.inPageWaitMs ?? 0) > 0);
+    const awaitPromise = Boolean(
+      options.asyncEval ||
+      (options.inPageWaitMs ?? 0) > 0 ||
+      options.mutation === "fill" ||
+      options.mutation === "clear",
+    );
     const cacheKey = `${tabId}:${sessionId ?? "main"}`;
     const runExpr = async (expression) => {
       const response = await this.#cdpTarget(tabId, sessionId, "Runtime.evaluate", {

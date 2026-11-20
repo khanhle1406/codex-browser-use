@@ -1,4 +1,4 @@
-# codex-browser-use Cookbook (v4.7.0)
+# codex-browser-use Cookbook (v4.7.1)
 
 Copy-paste patterns for `browser_run` and `browser_batch`. All local file paths passed to `saveFile`, `readFile`, and `saveScreenshot` must be **absolute paths**; parent directories are created automatically.
 
@@ -31,9 +31,73 @@ return { count: rows.length, file: saved.path, bytes: saved.bytes, sample: rows.
 
 ---
 
-## Recipe 2: Passive Scan → Selective `claimTab`
+## Recipe 2: Probe 1 → Batch Loop Modal/Table Extraction & Multi-Click Chaining
 
-Never attach the Chrome debugger or loop `tabs.get()` across unrelated personal tabs. Scan open tabs, read passively first, and claim only the matching tab if interaction is required.
+After probing **1 sample row/modal** to learn the fixed DOM/ARIA structure, pack the entire multi-page loop or deterministic multi-click chain into **1 `browser_run` call** (`timeout_ms: 300000`) with zero intermediate screenshots or AX dumps.
+
+```js
+// Pattern A: 4-click deterministic chain with zero intermediate state reads
+const tab = await browser.user.claimTab(match); // auto-grouped into session Chrome Tab Group
+await tab.getByRole("tab", { name: "Submissions" }).click();
+await tab.getByRole("button", { name: "1", exact: true }).click();
+await tab.getByRole("combobox", { name: /Rows per page/i }).click();
+await tab.getByRole("option", { name: "5", exact: true }).click();
+
+// Pattern B: Batch loop View details -> chunk large <code> blocks -> saveFile -> close -> next page
+const savedFiles = [];
+let globalIndex = 0;
+
+for (let pageIdx = 0; pageIdx < 10; pageIdx++) {
+  const detailsButtons = tab.getByRole("button", { name: "View details", exact: true });
+  const rowCount = await detailsButtons.count();
+
+  for (let i = 0; i < rowCount; i++) {
+    await detailsButtons.nth(i).click();
+    const modal = tab.getByRole("dialog").first();
+    await modal.waitFor({ state: "visible" });
+
+    const payload = await modal.evaluate((el) => {
+      const codes = Array.from(el.querySelectorAll("code")).map((c) => c.innerText);
+      return {
+        heading: el.querySelector("h2, h3, .modal-title")?.innerText?.trim() || "",
+        input: codes[0] || "",
+        expected: codes[1] || "",
+        actual: codes[2] || "",
+      };
+    });
+
+    globalIndex += 1;
+    // Chunk huge text into 100_000-char parts if needed before saving
+    const outPath = "/abs/path/artifacts/case-" + globalIndex + ".json";
+    if (payload.input.length > 100_000) {
+      const chunks = [];
+      for (let off = 0; off < payload.input.length; off += 100_000) {
+        chunks.push(payload.input.slice(off, off + 100_000));
+      }
+      await saveFile(outPath, { heading: payload.heading, inputChunks: chunks, expected: payload.expected, actual: payload.actual });
+    } else {
+      await saveFile(outPath, payload);
+    }
+    savedFiles.push(outPath);
+
+    await modal.getByRole("button", { name: "close", exact: true }).click();
+    await modal.waitFor({ state: "hidden" });
+  }
+
+  const nextBtn = tab.getByRole("button", { name: "Trang tiếp theo" }).first();
+  if (!(await nextBtn.isVisible()) || !(await nextBtn.isEnabled())) break;
+  await nextBtn.click();
+}
+
+await browser.endTurn({ keep: [{ tab_id: tab.tab_id, mode: "deliverable" }] });
+return { count: savedFiles.length, files: savedFiles, sample: savedFiles.slice(0, 3) };
+```
+
+---
+
+## Recipe 3: Passive Scan → Selective `claimTab` (Auto-Grouped)
+
+Never attach the Chrome debugger or loop `tabs.get()` across unrelated personal tabs. Scan open tabs, read passively first, and claim only the matching tab if interaction is required (`claimTab` automatically places it in the session's Chrome Tab Group and keeps it grouped on release).
 
 ```js
 const open = await browser.user.openTabs();
@@ -49,15 +113,16 @@ const tab = await browser.user.claimTab(match);
 const snap = await tab.ariaSnapshot({ mode: "compact" });
 log(snap.split("\n").slice(0, 30).join("\n"));
 
-await tab.markDeliverable(); // Claimed user tabs are always released, never closed
+// Either markDeliverable() or browser.endTurn({ keep }) releases cleanly without closing
+await tab.markDeliverable();
 return { claimedTabId: tab.tab_id, url: await tab.url() };
 ```
 
 ---
 
-## Recipe 3: Rich-Text CMS Forms, `ax.paste` & `ax.selectText`
+## Recipe 4: Rich-Text CMS Forms, `ax.paste` & `ax.selectText`
 
-`locator.fill()` handles CKEditor 4/5, TinyMCE, Quill, and `[contenteditable]`, while `tab.ax.paste` and `tab.ax.selectText` work directly on AX indices for complex editors or inline replacements.
+`locator.fill()` handles CKEditor 4/5 (awaiting `setData` + hidden `<textarea>` sync before submit), TinyMCE, Quill, and `[contenteditable]`, while `tab.ax.paste` and `tab.ax.selectText` work directly on AX indices for complex editors or inline replacements.
 
 ```js
 const tab = await browser.tabs.new("https://example.com/cms/edit");
@@ -81,12 +146,12 @@ await tab.ax.paste(12, "FINAL");
 
 await tab.getByRole("button", { name: /Publish/i }).filter({ hasNotText: "Schedule" }).click();
 await tab.saveScreenshot("/abs/path/artifacts/cms-published.png", { emit: true });
-await tab.markDeliverable();
+await browser.endTurn({ keep: [{ tab_id: tab.tab_id, mode: "deliverable" }] });
 ```
 
 ---
 
-## Recipe 4: Uploads & Long Archive Downloads (300s Cap)
+## Recipe 5: Uploads & Long Archive Downloads (300s Cap)
 
 Set `timeout_ms: 300000` on `browser_run` for large exports or slow CI/staging downloads.
 
@@ -110,7 +175,7 @@ return { downloadedPath, suggestedFilename: download.suggestedFilename?.() };
 
 ---
 
-## Recipe 5: Network Response Body Capture (`dev.responseBody`)
+## Recipe 6: Network Response Body Capture (`dev.responseBody`)
 
 Enable body capture before triggering an action so you can inspect JSON payloads or error responses directly without scraping the UI.
 
@@ -133,21 +198,22 @@ return { status: apiReq.status, length: bodyResult.length, truncated: bodyResult
 
 ---
 
-## Recipe 6: Parallel `browser.tabs.content()` & Dual-Tab Popups
+## Recipe 7: Parallel `browser.tabs.content()` (Structured `.links` & `.tables`) & Dual-Tab Popups
 
-Use `browser.tabs.content(urls, opts)` when you only need clean extracted content from up to 10 URLs; use `browser.tabs.new()` + `waitForEvent("popup")` when interacting across tabs.
+Use `browser.tabs.content(urls, opts)` when you only need clean extracted content from up to 10 URLs — passing `format: "links"` or `"tables"` returns structured `page.links` (`[{ text, href }]`) or `page.tables` arrays directly alongside `page.content`. Use `browser.tabs.new()` + `waitForEvent("popup")` when interacting across tabs.
 
 ```js
-// Pattern A: Parallel multi-URL read (auto-opens and auto-closes up to 10 temp tabs)
+// Pattern A: Parallel multi-URL read with structured links (no Markdown link regex!)
 const pages = await browser.tabs.content(
   [
     "https://example.com/docs/install",
     "https://example.com/docs/api",
     "https://example.com/changelog",
   ],
-  { format: "markdown", maxChars: 12_000, concurrency: 3, timeoutMs: 30_000 }
+  { format: "links", maxChars: 12_000, concurrency: 3, timeoutMs: 30_000 }
 );
-await saveFile("/abs/path/artifacts/docs-bundle.json", pages);
+const allLinks = pages.flatMap((p) => (p.ok && Array.isArray(p.links) ? p.links : []));
+await saveFile("/abs/path/artifacts/docs-links.json", { pages, allLinks });
 
 // Pattern B: Dual interactive tabs + auto-claimed target="_blank" popup
 await browser.nameSession("Checkout QA", "green");
@@ -161,6 +227,7 @@ const [popup] = await Promise.all([
 ]);
 return {
   extractedCount: pages.filter((p) => p.ok).length,
+  linkCount: allLinks.length,
   popupUrl: await popup.url(),
   helpTitle: await helpTab.evaluate(() => document.title),
 };
@@ -168,7 +235,7 @@ return {
 
 ---
 
-## Recipe 7: Responsive QA, `elementScreenshot` & `nodeRepl` Alias
+## Recipe 8: Responsive QA, `elementScreenshot` & `nodeRepl` Alias
 
 Capture tight element-level Proof of Work alongside mobile/desktop viewport checks without blowing up token limits.
 
@@ -201,7 +268,7 @@ await tab.markDeliverable();
 
 ---
 
-## Recipe 8: Troubleshooting Table (Real-World Failure Fixes)
+## Recipe 9: Troubleshooting Table (Real-World Failure Fixes)
 
 | Symptom / Error | Root Cause | Exact Fix |
 | --- | --- | --- |
@@ -211,4 +278,4 @@ await tab.markDeliverable();
 | Click succeeds in script or misses 2 times in a row | Element is inside an iframe/OOPIF, covered by an overlay, or index went stale | Stop blind retries after 2 misses: check `tab.frameLocator(...)`, `browser_inspect_element(x, y)`, or `locator.screenshot()`. |
 | `evaluate` rejected with mutation/network error | `evaluate(fn, arg)` enforces read-only AST checks | Use `evaluate` only for reading DOM/computed styles/`dataset`/`classList`; perform writes with `.click()`, `.fill()`, or `ax.paste()`. |
 | `saveFile` / `readFile` / `saveScreenshot` rejected | Relative path passed | Always pass an absolute path (e.g. `"/Users/.../out.json"`). |
-| Login / 2FA / CAPTCHA / permission dialog blocks script | Security boundary reached | Call `await tab.markHandoff()`, stop automation, and ask the user to sign in manually. |
+| Login / 2FA / CAPTCHA / permission dialog blocks script | Security boundary reached | Call `await tab.markHandoff()` (or `await browser.endTurn({ keep: [{ tab_id: tab.tab_id, mode: "handoff" }] })`), stop automation, and ask the user to sign in manually. |

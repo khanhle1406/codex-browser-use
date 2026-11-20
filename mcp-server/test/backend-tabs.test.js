@@ -210,6 +210,55 @@ test("getUserTabs and claimUserTab allow claiming open user tabs, enforce sessio
   }
 });
 
+test("claimUserTab groups claimed user tabs into the session group (or default group) and keeps them grouped after turnEnded", async () => {
+  const tabs = new Map([
+    [51, { id: 51, url: "https://example.com/user-tab", title: "User Tab", active: true }],
+  ]);
+  const grouped = [];
+  const released = [];
+  const ungrouped = [];
+  const ac = new AbortController();
+  const sess = { session_id: "sess-group-user", turn_id: "turn-1" };
+
+  const handlers = createTabHandlers({
+    async createBlankTab() { return { id: 61, url: "about:blank" }; },
+    async listTabs() { return [...tabs.values()]; },
+    async claimTab(id) { return { ...tabs.get(id), owned: true, origin: "user" }; },
+    async readTab(id) { return tabs.get(id) ?? null; },
+    async closeTab(id) { tabs.delete(id); },
+    async releaseTab(id) { released.push(id); },
+    async groupTabs(tabIds, opts) {
+      const gid = opts.groupId ?? 88;
+      grouped.push({ tabIds, title: opts.title, color: opts.color, groupId: gid });
+      return { groupId: gid, supported: true };
+    },
+    async ungroupTabs(tabIds) { ungrouped.push(tabIds); },
+  }, { name: "Group claimed tab fixture", version: "4.7.1" });
+
+  try {
+    handlers.get("getInfo")(sess, ac.signal, () => {});
+    // Claiming without prior nameSession auto-creates default session group
+    const claimed = await handlers.get("claimUserTab")({ ...sess, tabId: 51 }, ac.signal);
+    assert.equal(claimed.id, 51);
+    assert.equal(grouped.length, 1);
+    assert.deepEqual(grouped[0], { tabIds: [51], title: "🔎 Browser Use", color: "blue", groupId: 88 });
+
+    // Calling nameSession afterward reuses the same groupId 88 to rename/recolor it
+    const named = await handlers.get("nameSession")({ ...sess, name: "CNT Admin", color: "green" }, ac.signal);
+    assert.equal(named.groupId, 88);
+    assert.equal(named.groupedTabs, 1);
+    assert.deepEqual(grouped[1], { tabIds: [51], title: "CNT Admin", color: "green", groupId: 88 });
+
+    // Ending turn releases tab 51 without closing or ungrouping it
+    await handlers.get("turnEnded")(sess, ac.signal);
+    assert.deepEqual(released, [51]);
+    assert.deepEqual(ungrouped, []);
+    assert.equal(tabs.has(51), true);
+  } finally {
+    ac.abort();
+  }
+});
+
 test("onTabCreated auto-claims popup child tabs into the opener's session and tab group", async () => {
   let emitDriverEvent = () => {};
   const notifications = [];

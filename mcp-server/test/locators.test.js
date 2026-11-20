@@ -378,7 +378,7 @@ test("locatorRuntimeInstallExpression installs globalThis.__buRt and locatorInvo
   assert.equal(hit.y, 20);
 });
 
-test("tryFillRichEditor supports CKEditor 4, CKEditor 5, TinyMCE, and Quill editors", () => {
+test("tryFillRichEditor supports CKEditor 4 (including async setData + textarea sync), CKEditor 5, TinyMCE, and Quill editors", async () => {
   const calls = [];
   const doc = {
     body: { nodeType: 1, tagName: "BODY", children: [], childNodes: [] },
@@ -394,6 +394,7 @@ test("tryFillRichEditor supports CKEditor 4, CKEditor 5, TinyMCE, and Quill edit
     tagName: extra.tag || "TEXTAREA",
     id,
     name: id,
+    value: "",
     children: [],
     childNodes: [],
     labels: [],
@@ -413,6 +414,7 @@ test("tryFillRichEditor supports CKEditor 4, CKEditor 5, TinyMCE, and Quill edit
   });
 
   const ckeArea = makeRichEl("cke4");
+  const ckeAsyncArea = makeRichEl("cke4async");
   const tinyArea = makeRichEl("tiny1");
   const ck5Div = makeRichEl("ck5", {
     tag: "DIV",
@@ -425,12 +427,14 @@ test("tryFillRichEditor supports CKEditor 4, CKEditor 5, TinyMCE, and Quill edit
   });
   doc.querySelectorAll = (css) => {
     if (css === "#cke4") return [ckeArea];
+    if (css === "#cke4async") return [ckeAsyncArea];
     if (css === "#tiny1") return [tinyArea];
     if (css === "#ck5") return [ck5Div];
     if (css === "#quill1") return [quillDiv];
     return [];
   };
 
+  let asyncEditorData = "";
   const vmCtx = vm.createContext({
     document: doc,
     window: {
@@ -444,6 +448,21 @@ test("tryFillRichEditor supports CKEditor 4, CKEditor 5, TinyMCE, and Quill edit
             element: { $: ckeArea },
             setData: (v) => calls.push(["ck4.setData", v]),
             updateElement: () => calls.push(["ck4.update"]),
+          },
+          cke4async: {
+            name: "cke4async",
+            element: { $: ckeAsyncArea },
+            once: () => {},
+            setData: (v, cb) => {
+              setTimeout(() => {
+                // Simulate CKEditor 4 encoding + buggy/partial updateElement where textarea still needs sync
+                asyncEditorData = `${v}&nbsp;`;
+                ckeAsyncArea.value = v;
+                cb?.();
+              }, 15);
+            },
+            getData: () => asyncEditorData,
+            updateElement: () => { ckeAsyncArea.value = "stale-value"; },
           },
         },
       },
@@ -461,12 +480,15 @@ test("tryFillRichEditor supports CKEditor 4, CKEditor 5, TinyMCE, and Quill edit
     MutationObserver: class { observe() {} disconnect() {} },
     InputEvent: class { constructor(t) { this.type = t; } },
     Event: class { constructor(t) { this.type = t; } },
+    setTimeout,
+    clearTimeout,
+    Promise,
   });
 
-  vm.runInNewContext(locatorExpression("css=#cke4", { mutation: "fill", value: "<p>CK4</p>" }), vmCtx);
-  vm.runInNewContext(locatorExpression("css=#tiny1", { mutation: "fill", value: "<p>Tiny</p>" }), vmCtx);
-  vm.runInNewContext(locatorExpression("css=#ck5", { mutation: "fill", value: "CK5" }), vmCtx);
-  vm.runInNewContext(locatorExpression("css=#quill1", { mutation: "fill", value: "Quill" }), vmCtx);
+  await vm.runInNewContext(locatorExpression("css=#cke4", { mutation: "fill", value: "<p>CK4</p>" }), vmCtx);
+  await vm.runInNewContext(locatorExpression("css=#tiny1", { mutation: "fill", value: "<p>Tiny</p>" }), vmCtx);
+  await vm.runInNewContext(locatorExpression("css=#ck5", { mutation: "fill", value: "CK5" }), vmCtx);
+  await vm.runInNewContext(locatorExpression("css=#quill1", { mutation: "fill", value: "Quill" }), vmCtx);
 
   assert.deepEqual(calls, [
     ["ck4.setData", "<p>CK4</p>"],
@@ -476,4 +498,11 @@ test("tryFillRichEditor supports CKEditor 4, CKEditor 5, TinyMCE, and Quill edit
     ["ck5", "CK5"],
     ["quill", "Quill"],
   ]);
+
+  const asyncFillRes = await vm.runInNewContext(
+    locatorExpression("css=#cke4async", { mutation: "fill", value: "<p>Tiếng Việt</p>" }),
+    vmCtx,
+  );
+  assert.equal(asyncFillRes.filled, true);
+  assert.equal(ckeAsyncArea.value, "<p>Tiếng Việt</p>&nbsp;");
 });
