@@ -593,6 +593,7 @@ export class BridgeBrowser {
         consoleLogs: [],
         networkLogs: [],
         networkById: new Map(),
+        networkBodyCaptureEnabled: false,
         downloads: [],
         downloadById: new Map(),
         downloadWatchCount: 0,
@@ -2036,6 +2037,249 @@ export class BridgeBrowser {
       tabState.networkById.clear();
     }
     return { tab_id: String(id), count: sliced.length, requests: sliced };
+  }
+
+  /**
+   * Enable network tracking, optionally with buffered response bodies for `networkResponseBody()`.
+   * @param {{tabId?:unknown, captureBodies?:boolean}} [options]
+   */
+  async enableNetwork({ tabId, captureBodies = false } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const state = this.#tabState(id);
+    if (captureBodies && !state.networkBodyCaptureEnabled) {
+      await this.#cdp(id, "Network.enable", {
+        maxTotalBufferSize: 8 * 1024 * 1024,
+        maxResourceBufferSize: 2 * 1024 * 1024,
+      });
+      let set = this.enabledDomains.get(id);
+      if (!set) {
+        set = new Set();
+        this.enabledDomains.set(id, set);
+      }
+      set.add("Network");
+      state.networkBodyCaptureEnabled = true;
+    } else {
+      await this.#enableInspectionDomains(id, { network: true }).catch(() => {});
+    }
+    return { tab_id: String(id), ok: true, captureBodies: state.networkBodyCaptureEnabled };
+  }
+
+  /**
+   * Read the captured response body for a network request ID via CDP `Network.getResponseBody`.
+   * @param {string} requestId
+   * @param {{tabId?:unknown, maxChars?:number}} [options]
+   */
+  async networkResponseBody(requestId, { tabId, maxChars = 64_000 } = {}) {
+    const reqId = typeof requestId === "string" ? requestId.trim() : "";
+    if (!reqId) throw new Error("networkResponseBody requires a non-empty requestId");
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const res = await this.#cdp(id, "Network.getResponseBody", { requestId: reqId });
+    const raw = typeof res?.body === "string" ? res.body : "";
+    const limit = Math.max(256, Math.min(2_000_000, Number(maxChars) || 64_000));
+    const truncated = raw.length > limit;
+    const body = truncated ? raw.slice(0, limit) : raw;
+    return {
+      tab_id: String(id),
+      requestId: reqId,
+      body,
+      base64Encoded: Boolean(res?.base64Encoded),
+      truncated,
+      length: raw.length,
+    };
+  }
+
+  /**
+   * Capture a cropped screenshot clipped tightly around a locator match.
+   * @param {string} selector
+   * @param {{tabId?:unknown, frame?:string, force?:boolean, timeoutMs?:number, padding?:number, format?:"jpeg"|"png", quality?:number, scale?:"css"|"device"}} [options]
+   */
+  async elementScreenshot(selector, {
+    tabId,
+    frame,
+    force = false,
+    timeoutMs,
+    padding = 0,
+    format = "jpeg",
+    quality = 75,
+    scale = "css",
+  } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const { result } = await this.#runLocatorWithAutoWait(id, selector, {
+      frame,
+      mutation: "box",
+      force,
+      timeoutMs,
+    });
+    const box = result?.box;
+    if (!box || !Number.isFinite(box.width) || !Number.isFinite(box.height) || box.width <= 0 || box.height <= 0) {
+      throw new Error(`Element has no visible bounding box: ${selector}`);
+    }
+    const pad = Math.max(0, Math.min(200, Number(padding) || 0));
+    const clip = {
+      x: Math.max(0, box.x - pad),
+      y: Math.max(0, box.y - pad),
+      width: Math.max(1, box.width + pad * 2),
+      height: Math.max(1, box.height + pad * 2),
+    };
+    const cap = await this.screenshot(id, { format, quality, scale, clip });
+    return { ...cap, box: clip };
+  }
+
+  /**
+   * Focus an AX element (if specified) and paste/insert text cleanly via `Input.insertText`.
+   * @param {unknown} elementIndex
+   * @param {string} text
+   * @param {{tabId?:unknown, settle?:boolean}} [options]
+   */
+  async pasteText(elementIndex, text, { tabId, settle = false } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    if (elementIndex !== undefined && elementIndex !== null && elementIndex !== "") {
+      const node = this.#axNode(id, elementIndex);
+      const sessionId = node.sessionId ?? null;
+      await this.#scrollIntoView(id, node, sessionId).catch(() => {});
+      try {
+        await this.#cdpTarget(id, sessionId, "DOM.focus", { backendNodeId: node.backendDOMNodeId });
+      } catch {
+        await this.#clickNode(id, node, { clickCount: 1, button: "left", modifiers: 0 });
+      }
+    }
+    await this.#cdp(id, "Input.insertText", { text: String(text ?? "") });
+    if (settle) await this.#waitForSettle(id);
+    return { tab_id: String(id), ok: true, action: "paste" };
+  }
+
+  /**
+   * Select matching text inside an input, textarea, contenteditable, or text element.
+   * @param {unknown} elementIndex
+   * @param {string} text
+   * @param {{tabId?:unknown, settle?:boolean}} [options]
+   */
+  async selectText(elementIndex, text, { tabId, settle = false } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const needle = String(text ?? "");
+    if (!needle) throw new Error("selectText requires non-empty text");
+    if (elementIndex === undefined || elementIndex === null || elementIndex === "") {
+      throw new Error("selectText requires element_index");
+    }
+    const node = this.#axNode(id, elementIndex);
+    const sessionId = node.sessionId ?? null;
+    const { object } = await this.#cdpTarget(id, sessionId, "DOM.resolveNode", { backendNodeId: node.backendDOMNodeId });
+    if (!object?.objectId) throw new Error("Browser element could not be resolved");
+    const response = await this.#cdpTarget(id, sessionId, "Runtime.callFunctionOn", {
+      objectId: object.objectId,
+      functionDeclaration: `function (needle) {
+        const query = String(needle || "");
+        if (!query) return { selected: false };
+        if (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) {
+          const val = String(this.value || "");
+          const idx = val.indexOf(query);
+          if (idx === -1) return { selected: false };
+          this.focus();
+          this.setSelectionRange(idx, idx + query.length);
+          return { selected: true, start: idx, end: idx + query.length };
+        }
+        const doc = this.ownerDocument || document;
+        const win = doc.defaultView || window;
+        const walker = doc.createTreeWalker(this, NodeFilter.SHOW_TEXT);
+        let current;
+        while ((current = walker.nextNode())) {
+          const str = current.nodeValue || "";
+          const idx = str.indexOf(query);
+          if (idx !== -1) {
+            if (typeof this.focus === "function") this.focus();
+            const range = doc.createRange();
+            range.setStart(current, idx);
+            range.setEnd(current, idx + query.length);
+            const sel = win.getSelection();
+            if (sel) {
+              sel.removeAllRanges();
+              sel.addRange(range);
+            }
+            return { selected: true, start: idx, end: idx + query.length };
+          }
+        }
+        return { selected: false };
+      }`,
+      arguments: [{ value: needle }],
+      returnByValue: true,
+    });
+    if (response?.exceptionDetails) {
+      throw new Error(response.exceptionDetails.exception?.description || response.exceptionDetails.text || "selectText failed");
+    }
+    if (settle) await this.#waitForSettle(id);
+    const outcome = (response?.result?.value && typeof response.result.value === "object")
+      ? response.result.value
+      : { selected: false };
+    return { tab_id: String(id), ok: true, action: "select_text", ...outcome };
+  }
+
+  /**
+   * Open up to 10 URLs in temporary parallel tabs, extract structured content, and close the temporary tabs.
+   * @param {string[]} urls
+   * @param {{format?:"markdown"|"tables"|"links"|"text", maxChars?:number, concurrency?:number, timeoutMs?:number, waitUntil?:string}} [options]
+   */
+  async extractUrlsContent(urls, {
+    format = "markdown",
+    maxChars = 16_000,
+    concurrency = 3,
+    timeoutMs = 15_000,
+    waitUntil = "domcontentloaded",
+  } = {}) {
+    if (!Array.isArray(urls) || urls.length === 0) {
+      throw new Error("tabs.content requires a non-empty array of URLs");
+    }
+    if (urls.length > 10) {
+      throw new Error("tabs.content accepts at most 10 URLs per call");
+    }
+    const items = urls.map((u, idx) => ({ url: String(u), idx }));
+    const results = new Array(items.length);
+    const workers = Math.min(items.length, Math.max(1, Math.min(4, Number(concurrency) || 3)));
+    const prevActive = this.activeTabId;
+    let cursor = 0;
+
+    try {
+      await Promise.all(Array.from({ length: workers }, async () => {
+        while (cursor < items.length) {
+          const item = items[cursor++];
+          let tempId = null;
+          try {
+            const tab = await this.newTab();
+            tempId = tab.tab_id;
+            await this.goto(item.url, tempId, { waitUntil, timeoutMs });
+            const res = await this.getContent(tempId, { format, maxChars });
+            const extractedText = String(res?.text ?? res?.content ?? "");
+            results[item.idx] = {
+              url: item.url,
+              ok: true,
+              title: res?.title ?? "",
+              content: res?.content ?? extractedText,
+              text: extractedText,
+              truncated: Boolean(res?.truncated),
+            };
+          } catch (error) {
+            results[item.idx] = {
+              url: item.url,
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          } finally {
+            if (tempId != null) {
+              await this.closeTab(tempId).catch(() => {});
+            }
+          }
+        }
+      }));
+    } finally {
+      if (prevActive !== null && this.tabs.has(prevActive)) {
+        this.activeTabId = prevActive;
+      }
+    }
+    return results;
   }
 
   /**

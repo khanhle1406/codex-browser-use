@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { configureClient, installExtension, installSkill } from "../src/install.js";
+import { configureClient, installExtension, installRules, installSkill } from "../src/install.js";
 import { EXTENSION_ID, EXTENSION_VERSION, extensionSource } from "../src/extension.js";
 
 async function extensionFixture(root, version = EXTENSION_VERSION) {
@@ -81,7 +81,7 @@ test("configureClient prints instead of writing when write is false or the clien
   );
 });
 
-test("installSkill writes SKILL.md into each client directory with backup on overwrite", async (t) => {
+test("installSkill writes SKILL.md and companion references/cookbook.md with backup on overwrite", async (t) => {
   const home = await mkdtemp(path.join(tmpdir(), "browser-skill-home-"));
   t.after(() => rm(home, { recursive: true, force: true }));
 
@@ -89,7 +89,10 @@ test("installSkill writes SKILL.md into each client directory with backup on ove
   assert.equal(agy.written, true);
   assert.equal(agy.file, path.join(home, ".gemini", "config", "skills", "codex-browser-use", "SKILL.md"));
   assert.equal(agy.backup, null);
+  assert.ok(agy.files.includes("SKILL.md"));
+  assert.ok(agy.files.includes("references/cookbook.md"));
   assert.match(await readFile(agy.file, "utf8"), /browser_batch/);
+  assert.match(await readFile(path.join(agy.dir, "references", "cookbook.md"), "utf8"), /saveFile/);
 
   await writeFile(agy.file, "old skill\n");
   const updated = await installSkill({ client: "agy", home });
@@ -98,8 +101,46 @@ test("installSkill writes SKILL.md into each client directory with backup on ove
 
   const cursor = await installSkill({ client: "cursor", home });
   assert.equal(cursor.file, path.join(home, ".cursor", "skills", "codex-browser-use", "SKILL.md"));
+  assert.ok(cursor.files.includes("references/cookbook.md"));
   const windsurf = await installSkill({ client: "windsurf", home });
   assert.equal(windsurf.file, path.join(home, ".codeium", "windsurf", "skills", "codex-browser-use", "SKILL.md"));
+});
+
+test("installRules writes client-appropriate rule files and skips skill-only clients", async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), "browser-rules-home-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const agy = await installRules({ client: "antigravity", home });
+  assert.equal(agy.written, true);
+  assert.equal(agy.file, path.join(home, ".gemini", "config", "rules", "browser_use.md"));
+  assert.match(await readFile(agy.file, "utf8"), /trigger: always_on/);
+
+  await writeFile(agy.file, "old rule\n");
+  const agyUpdated = await installRules({ client: "antigravity", home });
+  assert.equal(agyUpdated.backup, `${agy.file}.bak`);
+  assert.equal(await readFile(agyUpdated.backup, "utf8"), "old rule\n");
+
+  const cc = await installRules({ client: "commandcode", home });
+  assert.equal(cc.written, true);
+  assert.equal(cc.file, path.join(home, ".agents", "rules", "browser_use.md"));
+
+  const cursor = await installRules({ client: "cursor", home });
+  assert.equal(cursor.written, true);
+  assert.equal(cursor.file, path.join(home, ".cursor", "rules", "browser_use.mdc"));
+  assert.match(await readFile(cursor.file, "utf8"), /alwaysApply: true/);
+
+  const windsurf = await installRules({ client: "windsurf", home });
+  assert.equal(windsurf.written, true);
+  assert.equal(windsurf.file, path.join(home, ".codeium", "windsurf", "rules", "browser_use.md"));
+
+  const claude = await installRules({ client: "claude_code", home });
+  assert.equal(claude.written, false);
+  assert.equal(claude.skipped, true);
+  assert.equal(claude.file, null);
+
+  const codex = await installRules({ client: "codex", home });
+  assert.equal(codex.written, false);
+  assert.equal(codex.skipped, true);
 });
 
 test("bundled extension manifest bundles 16/32/48/128 PNG icons matching EXTENSION_VERSION", async () => {

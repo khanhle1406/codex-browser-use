@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -50,8 +53,13 @@ function richMockBridge() {
         return { cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 1280, clientHeight: 800 }, cssLayoutViewport: { clientWidth: 1280, clientHeight: 800 } };
       case "Page.captureScreenshot":
         return { data: "LzlqLzRBQVFTa1pKUmdBQkFRQUFBUUFC" };
+      case "Page.close":
+        tabs.delete(tabId);
+        return {};
       case "Page.handleJavaScriptDialog":
         return {};
+      case "Network.getResponseBody":
+        return { body: JSON.stringify({ ok: true, requestId: params.requestId }), base64Encoded: false };
       case "Accessibility.getFullAXTree":
         return {
           nodes: [
@@ -77,6 +85,9 @@ function richMockBridge() {
         uploaded = params.files;
         return {};
       case "Runtime.callFunctionOn":
+        if (params.functionDeclaration.includes("createTreeWalker")) {
+          return { result: { value: { selected: true, start: 0, end: 4 } } };
+        }
         if (params.functionDeclaration.includes("hitsTarget")) {
           return { result: { value: { hitsTarget: true, point: { x: 60, y: 40 }, width: 100, height: 40 } } };
         }
@@ -103,6 +114,9 @@ function richMockBridge() {
         if (expr === "document.readyState") return { result: { value: "complete" } };
         if (expr === "window.devicePixelRatio") return { result: { value: 2 } };
         if (expr.includes("document.body ? document.body.innerText")) return { result: { value: `Email=${valueText} Plan=${selectValue}` } };
+        if (expr.includes("BOILERPLATE_TAGS")) {
+          return { result: { value: { title: tabTitle, url: tabUrl, format: "markdown", content: `# ${tabUrl}`, text: `# ${tabUrl}`, truncated: false } } };
+        }
         if (expr.includes("document.elementsFromPoint")) {
           return { result: { value: { x: 60, y: 40, elements: [{ tagName: "button", candidates: ['role=button[name="Save"]'] }] } } };
         }
@@ -114,6 +128,7 @@ function richMockBridge() {
           if (expr.includes("missing")) return { result: { value: { error: "Locator did not match any element: missing" } } };
           if (expr.includes('const mutation = "wait"')) return { result: { value: { count: 1, visibleCount: 1, satisfied: true } } };
           if (expr.includes('const mutation = "hover"')) return { result: { value: { count: 1, hovered: true, x: 60, y: 40 } } };
+          if (expr.includes('const mutation = "box"')) return { result: { value: { count: 1, box: { x: 10, y: 20, width: 100, height: 40 } } } };
           if (expr.includes('const mutation = "select"')) return { result: { value: { count: 1, selected: ["pro"] } } };
           if (expr.includes('const mutation = "check"')) return { result: { value: { count: 1, changed: true, checked: true, x: 60, y: 40 } } };
           if (expr.includes('const mutation = "uncheck"')) return { result: { value: { count: 1, changed: true, checked: false, x: 60, y: 40 } } };
@@ -742,4 +757,72 @@ test("MCP tool profiles reduce compact schema bytes by >=75% and support WebMCP,
     assetsCount: 1,
     popupId: "2",
   });
+});
+
+test("MCP server v4.7.0 supports 300s browser_run, saveFile/readFile/saveScreenshot, nodeRepl, elementScreenshot, ax.paste/selectText, dev.responseBody, and tabs.content", async (t) => {
+  const workDir = await mkdtemp(path.join(tmpdir(), "browser-v47-"));
+  t.after(() => rm(workDir, { recursive: true, force: true }));
+  const { browser, calls } = richMockBridge();
+  const server = createStandaloneServer({ getBrowser: async () => browser, resetBrowser: async () => {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-v47-agent", version: "1.0.0" });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const dataPath = path.join(workDir, "nested", "data.json");
+  const pageShotPath = path.join(workDir, "shots", "page.jpg");
+  const elShotPath = path.join(workDir, "shots", "elem.png");
+
+  const res = await client.callTool({
+    name: "browser_run",
+    arguments: {
+      timeout_ms: 250_000,
+      return_state: "none",
+      code: `
+        const tab = await browser.tabs.new("https://v47.example");
+        await tab.ax.get();
+        await tab.ax.paste("1", "pasted-value");
+        const sel = await tab.ax.selectText("1", "past");
+        await tab.dev.enableNetwork({ captureBodies: true });
+        const respBody = await tab.dev.responseBody("req-42");
+
+        const written = await saveFile(${JSON.stringify(dataPath)}, { count: 2, ok: true });
+        const loaded = JSON.parse(await readFile(${JSON.stringify(dataPath)}));
+        nodeRepl.write("repl-msg");
+
+        const elCap = await tab.locator("css=button").screenshot({ padding: 4 });
+        const savedPageShot = await saveScreenshot(${JSON.stringify(pageShotPath)}, { emit: true });
+        const savedElShot = await tab.locator("css=button").saveScreenshot(${JSON.stringify(elShotPath)}, { padding: 2 });
+
+        const batchRead = await browser.tabs.content(["https://one.example", "https://two.example"]);
+        return { sel, respBody, written, loaded, elBox: elCap.box, savedPageShot, savedElShot, batchRead };
+      `,
+    },
+  });
+
+  assert.notEqual(res.isError, true, JSON.stringify(res));
+  const body = JSON.parse(res.content[0].text);
+  assert.equal(body.ok, true);
+  assert.deepEqual(body.logs, ["repl-msg"]);
+  assert.equal(body.result.sel.selected, true);
+  assert.equal(JSON.parse(body.result.respBody.body).requestId, "req-42");
+  assert.equal(body.result.loaded.count, 2);
+  assert.equal(body.result.savedElShot.mimeType, "image/png");
+  assert.deepEqual(body.result.elBox, { x: 6, y: 16, width: 108, height: 48 });
+  assert.equal(body.result.batchRead.length, 2);
+  assert.equal(body.result.batchRead[0].content, "# https://one.example");
+  assert.equal(body.result.batchRead[1].content, "# https://two.example");
+  assert.equal(res.content[1].type, "image");
+
+  const diskJson = JSON.parse(await readFile(dataPath, "utf8"));
+  assert.equal(diskJson.ok, true);
+  assert.ok((await readFile(pageShotPath)).byteLength > 0);
+  assert.ok((await readFile(elShotPath)).byteLength > 0);
+  assert.ok(calls.some((c) => c.method === "Network.enable" && c.params.maxTotalBufferSize > 0));
+  assert.ok(calls.some((c) => c.method === "Network.getResponseBody" && c.params.requestId === "req-42"));
+  assert.ok(calls.some((c) => c.method === "Input.insertText" && c.params.text === "pasted-value"));
+  assert.ok(calls.filter((c) => c.method === "Page.close").length >= 2);
 });

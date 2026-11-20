@@ -6,7 +6,7 @@ import { discoverEngine } from "../src/engine-discovery.js";
 import { defaultBridgeFile, readBackend } from "../src/backend-discovery.js";
 import { buildConfig, codexToml, normalizeClient } from "../src/config.js";
 import { EXTENSION_ID } from "../src/extension.js";
-import { configureClient, installExtension, installNativeHost, installSkill } from "../src/install.js";
+import { configureClient, installExtension, installNativeHost, installRules, installSkill } from "../src/install.js";
 
 export { buildConfig };
 
@@ -53,10 +53,18 @@ export async function setupWorkspace(workspace, bridgeFile) {
 
 /**
  * @param {string[]} argv
- * @returns {{command:string, client?:string, enginePath?:string, bridgeFile?:string, workspace?:string, extensionId?:string, profile?:string, write:boolean, skill:boolean, json:boolean, help:boolean}}
+ * @returns {{command:string, client?:string, enginePath?:string, bridgeFile?:string, workspace?:string, extensionId?:string, profile?:string, write:boolean, skill:boolean, rules:boolean, noRules:boolean, json:boolean, help:boolean}}
  */
 function parseArgs(argv) {
-  const options = { command: argv[0] ?? "help", json: false, help: false, write: false, skill: false };
+  const options = {
+    command: argv[0] ?? "help",
+    json: false,
+    help: false,
+    write: false,
+    skill: false,
+    rules: false,
+    noRules: false,
+  };
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i];
     if (["--client", "--engine", "--bridge", "--workspace", "--extension-id", "--profile"].includes(arg)) {
@@ -74,6 +82,8 @@ function parseArgs(argv) {
       } else options.workspace = value;
     } else if (arg === "--write") options.write = true;
     else if (arg === "--skill") options.skill = true;
+    else if (arg === "--rules") options.rules = true;
+    else if (arg === "--no-rules") options.noRules = true;
     else if (arg === "--json") options.json = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
     else throw new Error(`Unknown option: ${arg}`);
@@ -87,7 +97,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.help || ["help", "--help", "-h"].includes(options.command)) {
     process.stdout.write([
       "Usage:",
-      "  browser-use install [--client NAME] [--profile compact|standard|full] [--write] [--skill] [--bridge FILE] [--extension-id ID] [--json]",
+      "  browser-use install [--client NAME] [--profile compact|standard|full] [--write] [--skill] [--rules] [--no-rules] [--bridge FILE] [--extension-id ID] [--json]",
       "  browser-use doctor [--bridge FILE] [--engine PATH] [--json]",
       "  browser-use config --client NAME [--profile compact|standard|full] [--bridge FILE]",
       "  browser-use setup --workspace DIR [--bridge FILE] [--json]",
@@ -112,6 +122,10 @@ export async function main(argv = process.argv.slice(2)) {
     const skill = options.skill
       ? await installSkill({ client: options.client ?? "generic" })
       : null;
+    const wantRules = options.rules || (options.skill && !options.noRules);
+    const rules = wantRules
+      ? await installRules({ client: options.client ?? "generic" })
+      : null;
     const report = {
       ok: true,
       extension: { ...extension, loadUnpackedPath: extension.path },
@@ -119,6 +133,7 @@ export async function main(argv = process.argv.slice(2)) {
       bridgeFile,
       client,
       skill,
+      rules,
       next: [
         `Open chrome://extensions, enable Developer mode, and Load unpacked from ${extension.path}.`,
         "Portable Browser Bridge connects automatically once loaded (no manual toggle needed).",
@@ -133,7 +148,11 @@ export async function main(argv = process.argv.slice(2)) {
       process.stdout.write(`Extension ${extension.version} at ${extension.path} (id ${extension.id})\n`);
       process.stdout.write(`Native host launcher: ${nativeHost.launcher}\n`);
       for (const manifest of nativeHost.manifests) process.stdout.write(`Native host manifest: ${manifest.file}\n`);
-      if (skill?.written) process.stdout.write(`Installed skill at ${skill.file}\n`);
+      if (skill?.written) {
+        const extra = skill.files?.length > 1 ? ` (${skill.files.length} files in ${skill.dir})` : "";
+        process.stdout.write(`Installed skill at ${skill.file}${extra}\n`);
+      }
+      if (rules?.written) process.stdout.write(`Installed rule at ${rules.file}\n`);
       if (client) {
         if (client.written) process.stdout.write(`Updated ${client.file}\n`);
         else {

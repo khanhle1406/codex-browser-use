@@ -52,11 +52,16 @@ test("page commands reject foreign tabs, browser-wide access and unenforceable n
     await handlers.get("executeCdp")({...session, target, method: "Page.getFrameTree", commandParams: {}}, first.signal);
     await handlers.get("executeCdp")({...session, target, method: "Page.handleJavaScriptDialog",
       commandParams: {accept: true, promptText: "fixture"}}, first.signal);
+    await assert.rejects(handlers.get("executeCdp")({...session, target, method: "Network.getResponseBody",
+      commandParams: {requestId: ""}}, first.signal), /non-empty requestId/);
+    await handlers.get("executeCdp")({...session, target, method: "Network.getResponseBody",
+      commandParams: {requestId: "req-1"}}, first.signal);
     assert.deepEqual(executed, [
       {tabId: 1, method: "DOM.setFileInputFiles"},
       {tabId: 1, method: "DOMSnapshot.captureSnapshot"},
       {tabId: 1, method: "Page.getFrameTree"},
       {tabId: 1, method: "Page.handleJavaScriptDialog"},
+      {tabId: 1, method: "Network.getResponseBody"},
     ]);
     await handlers.get("turnEnded")(session, first.signal);
   } finally {

@@ -117,6 +117,30 @@ export function clientSkillTarget(client, home = homedir()) {
   }
 }
 
+/**
+ * Where each client keeps its always-on browser-use rules file (`file: null` when skills alone apply).
+ * @param {string} client
+ * @param {string} [home]
+ * @returns {{file:string|null, format:"md"|"mdc"|null}}
+ */
+export function clientRuleTarget(client, home = homedir()) {
+  switch (normalizeClient(client)) {
+    case "antigravity":
+      return { file: path.join(home, ".gemini", "config", "rules", "browser_use.md"), format: "md" };
+    case "cursor":
+      return { file: path.join(home, ".cursor", "rules", "browser_use.mdc"), format: "mdc" };
+    case "windsurf":
+      return { file: path.join(home, ".codeium", "windsurf", "rules", "browser_use.md"), format: "md" };
+    case "commandcode":
+    case "copilot":
+    case "opencode":
+    case "generic":
+      return { file: path.join(home, ".agents", "rules", "browser_use.md"), format: "md" };
+    default:
+      return { file: null, format: null };
+  }
+}
+
 /** @param {string} client @returns {string} */
 export function normalizeClient(client) {
   if (client === "command-code") return "commandcode";

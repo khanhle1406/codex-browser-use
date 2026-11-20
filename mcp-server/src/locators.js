@@ -445,7 +445,7 @@ const SHARED_LOCATOR_RESOLVER = `
   };
 `;
 
-export const LOCATOR_RUNTIME_VERSION = 1;
+export const LOCATOR_RUNTIME_VERSION = 2;
 
 const SHARED_RUNNER_CORE = `
   const isDisabledEl = (el) => !!(el.matches?.(":disabled") || el.getAttribute?.("aria-disabled") === "true");
@@ -647,6 +647,35 @@ const SHARED_RUNNER_CORE = `
         const rect = element.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) return fail("Locator matched an element with no visible box: " + raw, "not_visible", true);
         return { count: 1, hovered: true, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, __cursorMove: true };
+      }
+      if (mutation === "box") {
+        if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
+        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        const rect = element.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) {
+          return fail("Locator matched an element with no visible box: " + raw, "not_visible", true);
+        }
+        let offsetX = 0;
+        let offsetY = 0;
+        let fWin = element.ownerDocument?.defaultView || window;
+        while (fWin && fWin !== window) {
+          const frameEl = fWin.frameElement;
+          if (!frameEl) break;
+          const fr = frameEl.getBoundingClientRect();
+          offsetX += fr.left + (frameEl.clientLeft || 0);
+          offsetY += fr.top + (frameEl.clientTop || 0);
+          fWin = fWin.parent;
+        }
+        return {
+          count: 1,
+          box: {
+            x: offsetX + rect.left + (window.scrollX || 0),
+            y: offsetY + rect.top + (window.scrollY || 0),
+            width: rect.width,
+            height: rect.height,
+          },
+          ...cursorPt(element),
+        };
       }
       if (mutation === "fill" || mutation === "clear") {
         if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);

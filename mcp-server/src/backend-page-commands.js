@@ -10,7 +10,7 @@ const pageCommands = new Set([
   "Emulation.setFocusEmulationEnabled",
   "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Input.dispatchTouchEvent",
   "Input.insertText", "Input.synthesizeScrollGesture",
-  "Network.disable", "Network.enable",
+  "Network.disable", "Network.enable", "Network.getResponseBody",
   "Page.addScriptToEvaluateOnNewDocument", "Page.removeScriptToEvaluateOnNewDocument",
   "Page.bringToFront", "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.enable", "Page.getFrameTree",
   "Page.getLayoutMetrics", "Page.getNavigationHistory", "Page.handleJavaScriptDialog",
@@ -49,6 +49,10 @@ export function validatePageCommand(method, params) {
   }
   if (method === "Page.setInterceptFileChooserDialog" && typeof params.enabled !== "boolean") {
     throw new Error("Page.setInterceptFileChooserDialog requires a boolean enabled flag");
+  }
+  if (method === "Network.getResponseBody" &&
+      (typeof params.requestId !== "string" || params.requestId.length === 0 || params.requestId.length > 256)) {
+    throw new Error("Network.getResponseBody requires a non-empty requestId");
   }
   if (method === "Emulation.setDeviceMetricsOverride") {
     const validSize = (value) => Number.isSafeInteger(value) && value >= 100 && value <= 4096;

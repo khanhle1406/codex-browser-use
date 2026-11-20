@@ -1,4 +1,4 @@
-import { cp, copyFile, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { cp, copyFile, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { homedir } from "node:os";
@@ -12,11 +12,13 @@ import {
   installedExtensionDir,
   nativeHostLauncher,
 } from "./extension.js";
-import { buildConfig, clientSkillTarget, clientTarget, normalizeClient, stableNodePath } from "./config.js";
+import { buildConfig, clientRuleTarget, clientSkillTarget, clientTarget, normalizeClient, stableNodePath } from "./config.js";
 
 const nativeHostEntry = fileURLToPath(new URL("../bin/chrome-native-host.js", import.meta.url));
 const repoSkillSource = fileURLToPath(new URL("../../skill/SKILL.md", import.meta.url));
 const localSkillSource = fileURLToPath(new URL("../skill/SKILL.md", import.meta.url));
+const repoRuleSource = fileURLToPath(new URL("../../rules/browser_use.md", import.meta.url));
+const localRuleSource = fileURLToPath(new URL("../rules/browser_use.md", import.meta.url));
 
 /** @returns {Promise<string>} */
 async function resolveDefaultSkillSource() {
@@ -29,6 +31,19 @@ async function resolveDefaultSkillSource() {
     }
   }
   throw new Error("Bundled Browser Use skill (skill/SKILL.md) was not found");
+}
+
+/** @returns {Promise<string>} */
+async function resolveDefaultRuleSource() {
+  for (const candidate of [repoRuleSource, localRuleSource]) {
+    try {
+      const info = await stat(candidate);
+      if (info.isFile()) return candidate;
+    } catch {
+      // Try next location.
+    }
+  }
+  throw new Error("Bundled Browser Use policy rule (rules/browser_use.md) was not found");
 }
 
 /** @param {string} value */
@@ -194,17 +209,95 @@ export async function configureClient({ client, bridgeFile = defaultBridgeFile()
   return { written: true, file: target.file, backup, config };
 }
 
+const IGNORED_SKILL_FILES = new Set(["SKILL.md", ".DS_Store"]);
+
 /**
- * Install the Browser Use skill markdown into a client's standard skills directory.
+ * Resolve source SKILL.md + directory even if caller passes either a file or a directory.
+ * @param {string|undefined} source
+ * @returns {Promise<{skillFile:string, skillDir:string}>}
+ */
+async function resolveSkillPaths(source) {
+  if (!source) {
+    const skillFile = await resolveDefaultSkillSource();
+    return { skillFile, skillDir: path.dirname(skillFile) };
+  }
+  const resolved = path.resolve(source);
+  const info = await stat(resolved);
+  if (info.isDirectory()) {
+    return { skillFile: path.join(resolved, "SKILL.md"), skillDir: resolved };
+  }
+  return { skillFile: resolved, skillDir: path.dirname(resolved) };
+}
+
+/**
+ * Recursively copy companion files inside a skill bundle (`references/`, etc.).
+ * @param {string} srcDir
+ * @param {string} dstDir
+ * @param {string} [prefix]
+ * @returns {Promise<string[]>}
+ */
+async function copyCompanionSkillFiles(srcDir, dstDir, prefix = "") {
+  const entries = await readdir(srcDir, { withFileTypes: true });
+  const copied = [];
+  for (const entry of entries) {
+    if (IGNORED_SKILL_FILES.has(entry.name) && prefix === "") continue;
+    if (entry.name === ".DS_Store" || entry.name.endsWith(".bak") || entry.name.startsWith(".tmp-")) continue;
+    const rel = prefix ? path.posix.join(prefix, entry.name) : entry.name;
+    const srcPath = path.join(srcDir, entry.name);
+    const dstPath = path.join(dstDir, entry.name);
+    if (entry.isDirectory()) {
+      copied.push(...await copyCompanionSkillFiles(srcPath, dstPath, rel));
+    } else if (entry.isFile()) {
+      await writeAtomic(dstPath, await readFile(srcPath), 0o644);
+      copied.push(rel);
+    }
+  }
+  return copied;
+}
+
+/**
+ * Install the Browser Use skill bundle (`SKILL.md` + companion `references/` files)
+ * into a client's standard skills directory.
  * @param {{client?:string, home?:string, source?:string}} [options]
- * @returns {Promise<{written:boolean, client:string, file:string, backup:string|null}>}
+ * @returns {Promise<{written:boolean, client:string, file:string, dir:string, files:string[], backup:string|null}>}
  */
 export async function installSkill({ client = "generic", home = homedir(), source } = {}) {
   const name = normalizeClient(client);
   const target = clientSkillTarget(name, home);
-  const src = source ? path.resolve(source) : await resolveDefaultSkillSource();
-  const content = await readFile(src, "utf8");
+  const targetDir = path.dirname(target);
+  const { skillFile, skillDir } = await resolveSkillPaths(source);
+  const content = await readFile(skillFile, "utf8");
   const backup = await backupOnce(target);
   await writeAtomic(target, content, 0o644);
-  return { written: true, client: name, file: target, backup };
+  const companions = await copyCompanionSkillFiles(skillDir, targetDir);
+  return {
+    written: true,
+    client: name,
+    file: target,
+    dir: targetDir,
+    files: ["SKILL.md", ...companions.sort()],
+    backup,
+  };
+}
+
+/**
+ * Install the always-on Browser Use policy rules file for clients that use standalone rule files.
+ * @param {{client?:string, home?:string, source?:string}} [options]
+ * @returns {Promise<{written:boolean, client:string, file:string|null, backup:string|null, skipped?:boolean}>}
+ */
+export async function installRules({ client = "generic", home = homedir(), source } = {}) {
+  const name = normalizeClient(client);
+  const target = clientRuleTarget(name, home);
+  if (!target.file) {
+    return { written: false, client: name, file: null, backup: null, skipped: true };
+  }
+  const src = source ? path.resolve(source) : await resolveDefaultRuleSource();
+  let content = await readFile(src, "utf8");
+  if (target.format === "mdc") {
+    const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n*/u, "");
+    content = `---\ndescription: Browser Use MCP automation policy\nalwaysApply: true\n---\n\n${body}`;
+  }
+  const backup = await backupOnce(target.file);
+  await writeAtomic(target.file, content, 0o644);
+  return { written: true, client: name, file: target.file, backup };
 }

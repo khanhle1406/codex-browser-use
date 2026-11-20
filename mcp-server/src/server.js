@@ -291,11 +291,11 @@ export function registerTools(server, deps = {}) {
 
   registerTool(
     "browser_run",
-    "Execute an async JavaScript browser script with persistent session bindings (`browser`/`page`, `ariaSnapshot()`, `ax.write()`, `content.export()`, read-only `evaluate`, `viewImage`, `markDeliverable`) and optional `end_turn`.",
+    "Execute an async JavaScript browser script with persistent session bindings (`browser`/`page`, `ariaSnapshot()`, `ax.write()`, `content.export()`, read-only `evaluate`, `viewImage`, `saveFile`, `readFile`, `saveScreenshot`, `dev.responseBody`, `tabs.content`, `markDeliverable`) and optional `end_turn`.",
     {
-      code: z.string().min(1).describe("Async JavaScript body with `browser`/`page`, `log`, `sleep`, `viewImage` in scope"),
+      code: z.string().min(1).describe("Async JavaScript body with `browser`/`page`, `log`, `sleep`, `viewImage`, `saveFile`, `readFile`, `saveScreenshot` in scope"),
       tab_id: stringOrNumber.optional().describe("Optional initial tab_id"),
-      timeout_ms: z.number().int().min(500).max(120_000).optional().describe("Timeout ms (default 45000)"),
+      timeout_ms: z.number().int().min(500).max(300_000).optional().describe("Timeout ms (default 45000, max 300000)"),
       return_state: returnStateEnum.optional().describe("Post-script state (default diff if result undefined, else none)"),
       mode: axModeEnum.optional().describe("AX compression mode: full (default), compact, or interactive"),
       end_turn: z.boolean().optional().describe("End turn automatically after script succeeds"),
@@ -1012,13 +1012,12 @@ export function registerTools(server, deps = {}) {
 export function createStandaloneServer(deps = {}) {
   const profile = deps.profile ?? resolveToolProfile();
   const server = new McpServer(
-    { name: "browser-use", version: "4.6.0" },
+    { name: "browser-use", version: "4.7.0" },
     {
       instructions: [
-        "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.user.claimTab()` in `browser_run`). Claimed user tabs are released (never auto-closed) when a turn ends.",
-        "Speed & efficiency: Use `browser_run` for persistent multi-turn variables (`const`/`let`/`class`), bound multi-tab handles (`browser.tabs.new()` / `browser.tabs.get(tabId)`), `browser.nameSession()` Chrome tab grouping, auto-waiting fluent locators (`getByRole`/`getByText`/`.filter({ has, hasNot, hasNotText })`/`.getAttribute()`/read-only `evaluate(fn, arg)`), diff-first `ax.write()`, filterable `ariaSnapshot()` with child iframes, `setViewport()`/`resetViewport()`, `waitForEvent('filechooser'|'download')`, and inline `end_turn`/`keep`; or `browser_batch` for linear step arrays.",
-        "Diff-first: browser_get_state and ax.write() use compact structural diffs and omit screenshots by default; request screenshot=true / ax.write('screenshot') only when visual context or layout checking is needed.",
-        "Always inspect with ariaSnapshot() / getState() before guessing CSS selectors; chain >> or getByRole()/getByText() locators across Shadow DOM and iframes.",
+        "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.tabs.read()` / `browser.user.claimTab()` in `browser_run`). Claimed user tabs are released (never auto-closed) when a turn ends.",
+        "Speed & efficiency: Use `browser_run` (timeout up to 300000ms) for persistent variables (`const`/`let`/`class`), bound tabs (`browser.tabs.new()` / `browser.tabs.get(id)` / parallel `browser.tabs.content(urls)`), `browser.nameSession()` Chrome tab groups, auto-waiting locators (`getByRole`/`getByText`/`.filter({ has, hasNot, hasNotText })`/`.getAttribute()`/read-only `evaluate(fn, arg)`), `locator.screenshot()` / `saveScreenshot()`, `saveFile()`/`readFile()` for bulk scraped output without flooding context, `dev.enableNetwork({ captureBodies: true })` + `dev.responseBody(id)`, and `markDeliverable`/`markHandoff`; or `browser_batch` for linear steps.",
+        "Diff-first & inspect-first: Start with `ariaSnapshot({ mode: \"compact\" })` or `browser_get_state` / `ax.write()` before guessing selectors; narrow multi-matches with `.first()`/`.nth(i)` and use `reload()` rather than `goto(sameUrl)`. Request `screenshot: true` / `ax.write('screenshot')` / `saveScreenshot(..., { emit: true })` when visual inspection or Proof of Work is needed.",
         "Pass end_turn/keep to browser_run or browser_batch, or `browser_name_session` / `browser.nameSession()` to group owned tabs visually, and `browser_end_turn` at the end for tabs that must survive cleanup.",
       ].join("\n"),
     },

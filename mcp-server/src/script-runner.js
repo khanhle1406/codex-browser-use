@@ -1,8 +1,16 @@
 import vm from "node:vm";
+import { mkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
+import path from "node:path";
 import { URL, URLSearchParams } from "node:url";
 import { parse } from "acorn";
 
-const RESERVED_PARAM_NAMES = new Set(["browser", "page", "log", "sleep", "viewImage", "console", "__scope"]);
+const RESERVED_PARAM_NAMES = new Set([
+  "browser", "page", "log", "sleep", "viewImage",
+  "saveFile", "readFile", "saveScreenshot", "nodeRepl", "console", "__scope",
+]);
+const MAX_SCRIPT_WRITE_BYTES = 25 * 1024 * 1024;
+const MAX_SCRIPT_READ_BYTES = 10 * 1024 * 1024;
+const DEFAULT_SCRIPT_READ_BYTES = 2 * 1024 * 1024;
 const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 
 /**
@@ -267,6 +275,81 @@ export class BrowserScriptSession {
     return { captured: true, count: run.images.length };
   }
 
+  /** @param {unknown} filePath @param {string} fnName @returns {string} */
+  #assertAbsolutePath(filePath, fnName) {
+    if (typeof filePath !== "string" || filePath.length === 0 || filePath.includes("\0") || !path.isAbsolute(filePath)) {
+      throw new Error(`${fnName} requires a non-empty absolute file path`);
+    }
+    return filePath;
+  }
+
+  /** @param {string} filePath @param {unknown} data */
+  async #saveFile(filePath, data) {
+    this.#requireRun();
+    const target = this.#assertAbsolutePath(filePath, "saveFile");
+    const payload = Buffer.isBuffer(data)
+      ? data
+      : Buffer.from(typeof data === "string" ? data : `${JSON.stringify(data, null, 2)}\n`, "utf8");
+    if (payload.byteLength > MAX_SCRIPT_WRITE_BYTES) {
+      throw new Error(`saveFile payload exceeds ${MAX_SCRIPT_WRITE_BYTES} bytes limit`);
+    }
+    await mkdir(path.dirname(target), { recursive: true });
+    await fsWriteFile(target, payload);
+    return { path: target, bytes: payload.byteLength };
+  }
+
+  /** @param {string} filePath @param {{encoding?:"utf8"|"base64", maxBytes?:number}} [opts] */
+  async #readFile(filePath, opts = {}) {
+    this.#requireRun();
+    const target = this.#assertAbsolutePath(filePath, "readFile");
+    const maxBytes = Math.max(1, Math.min(MAX_SCRIPT_READ_BYTES, Number(opts?.maxBytes ?? DEFAULT_SCRIPT_READ_BYTES)));
+    const raw = await fsReadFile(target);
+    const sliced = raw.subarray(0, maxBytes);
+    return opts?.encoding === "base64" ? sliced.toString("base64") : sliced.toString("utf8");
+  }
+
+  /** @param {string} filePath @param {Record<string, any>} [opts] @param {string|null} [fixedTabId] */
+  async #saveScreenshot(filePath, opts = {}, fixedTabId = null) {
+    const run = this.#requireRun();
+    const target = this.#assertAbsolutePath(filePath, "saveScreenshot");
+    const ext = path.extname(target).toLowerCase();
+    const format = opts.format ?? (ext === ".png" ? "png" : "jpeg");
+    const tabId = this.#resolveTabArg(opts, fixedTabId);
+    const cap = opts.selector
+      ? await this.#guard((b) => b.elementScreenshot(opts.selector, {
+        tabId,
+        frame: opts.frame,
+        force: opts.force === true,
+        padding: opts.padding,
+        format,
+        quality: opts.quality ?? 75,
+        scale: opts.scale ?? "css",
+        timeoutMs: opts.timeoutMs !== undefined || opts.timeout_ms !== undefined
+          ? this.#clampTimeout(opts.timeoutMs ?? opts.timeout_ms)
+          : undefined,
+      }), `saveScreenshot(${opts.selector})`, { trackActiveTab: fixedTabId === null })
+      : await this.#guard((b) => b.screenshot(tabId, {
+        fullPage: opts.fullPage ?? opts.full_page ?? false,
+        format,
+        quality: opts.quality ?? 75,
+        ...(opts.maxWidth !== undefined || opts.max_width !== undefined
+          ? { maxWidth: opts.maxWidth ?? opts.max_width }
+          : {}),
+        clip: opts.clip,
+        scale: opts.scale ?? "css",
+      }), "saveScreenshot", { trackActiveTab: fixedTabId === null });
+    const buf = Buffer.from(cap.data, "base64");
+    await mkdir(path.dirname(target), { recursive: true });
+    await fsWriteFile(target, buf);
+    if (opts.emit === true) {
+      if (run.images.length >= run.maxImages) {
+        throw new Error(`Maximum ${run.maxImages} images per browser_run call exceeded`);
+      }
+      run.images.push({ data: cap.data, mimeType: cap.mimeType });
+    }
+    return { path: target, bytes: buf.byteLength, mimeType: cap.mimeType, tab_id: cap.tab_id };
+  }
+
   #keepTab(mode = "deliverable", id) {
     const run = this.#requireRun();
     const resolved = id !== undefined && id !== null && id !== ""
@@ -436,6 +519,21 @@ export class BrowserScriptSession {
         force: opts?.force === true,
         timeoutMs: timeoutOpt(opts),
       }), `locator.hover(${selector})`, guardOpts),
+      screenshot: (opts = {}) => this.#guard((b) => b.elementScreenshot(selector, {
+        tabId: tabFor(opts),
+        frame: opts?.frame ?? frame ?? undefined,
+        force: opts?.force === true,
+        padding: opts?.padding,
+        format: opts?.format ?? "jpeg",
+        quality: opts?.quality ?? 75,
+        scale: opts?.scale ?? "css",
+        timeoutMs: timeoutOpt(opts),
+      }), `locator.screenshot(${selector})`, guardOpts),
+      saveScreenshot: (filePath, opts = {}) => this.#saveScreenshot(filePath, {
+        ...opts,
+        selector,
+        frame: opts?.frame ?? frame ?? undefined,
+      }, boundTabId),
       setInputFiles: (files, opts = {}) => this.#guard((b) => b.uploadFiles(files, {
         tabId: tabFor(opts),
         selector,
@@ -621,6 +719,19 @@ export class BrowserScriptSession {
         clip: opts?.clip,
         scale: opts?.scale ?? "css",
       }), "screenshot", guardOpts),
+      elementScreenshot: (selector, opts = {}) => self.#guard((b) => b.elementScreenshot(selector, {
+        tabId: resolveTab(opts),
+        frame: opts?.frame,
+        force: opts?.force === true,
+        padding: opts?.padding,
+        format: opts?.format ?? "jpeg",
+        quality: opts?.quality ?? 75,
+        scale: opts?.scale ?? "css",
+        timeoutMs: opts?.timeoutMs !== undefined || opts?.timeout_ms !== undefined
+          ? self.#clampTimeout(opts.timeoutMs ?? opts.timeout_ms)
+          : undefined,
+      }), `elementScreenshot(${selector})`, guardOpts),
+      saveScreenshot: (filePath, opts = {}) => self.#saveScreenshot(filePath, opts, boundId),
       getContent: async (opts) => {
         const format = typeof opts === "string" ? opts : opts?.format;
         const maxChars = typeof opts === "object" && opts ? (opts.maxChars ?? opts.max_chars) : undefined;
@@ -877,6 +988,14 @@ export class BrowserScriptSession {
       dev: {
         logs: async (opts = {}) => (await tabApi.consoleLogs(opts)).logs,
         network: async (opts = {}) => (await tabApi.networkLogs(opts)).requests,
+        enableNetwork: (opts = {}) => self.#guard((b) => b.enableNetwork({
+          tabId: resolveTab(opts),
+          captureBodies: opts?.captureBodies !== false,
+        }), "dev.enableNetwork", guardOpts),
+        responseBody: (requestId, opts = {}) => self.#guard((b) => b.networkResponseBody(requestId, {
+          tabId: resolveTab(opts),
+          maxChars: opts?.maxChars ?? opts?.max_chars ?? 64_000,
+        }), `dev.responseBody(${requestId})`, guardOpts),
       },
       ax: {
         getState: (opts = {}) => tabApi.getState(opts),
@@ -927,6 +1046,23 @@ export class BrowserScriptSession {
           return tabApi.click(target, opts);
         },
         setValue: (idx, val, opts = {}) => tabApi.setValue(idx, val, opts),
+        paste: (idxOrText, maybeText, opts = {}) => {
+          if (typeof maybeText === "string") {
+            return self.#guard((b) => b.pasteText(idxOrText, maybeText, {
+              tabId: resolveTab(opts),
+              settle: opts?.settle === true,
+            }), "ax.paste", guardOpts);
+          }
+          const extra = isPlainObject(maybeText) ? maybeText : {};
+          return self.#guard((b) => b.pasteText(undefined, String(idxOrText), {
+            tabId: resolveTab(extra),
+            settle: extra?.settle === true,
+          }), "ax.paste", guardOpts);
+        },
+        selectText: (idx, text, opts = {}) => self.#guard((b) => b.selectText(idx, text, {
+          tabId: resolveTab(opts),
+          settle: opts?.settle === true,
+        }), `ax.selectText(${idx})`, guardOpts),
         pressKey: (idxOrKey, maybeKey, opts = {}) => {
           if (typeof maybeKey === "string") {
             return tabApi.press(maybeKey, {
@@ -1037,6 +1173,13 @@ export class BrowserScriptSession {
         }
         return self.#createTabHandle(target.tab_id);
       },
+      content: (urls, opts = {}) => self.#guard((b) => b.extractUrlsContent(urls, {
+        format: opts?.format ?? "markdown",
+        maxChars: opts?.maxChars ?? opts?.max_chars ?? 16_000,
+        concurrency: opts?.concurrency ?? 3,
+        waitUntil: opts?.waitUntil ?? opts?.wait_until ?? "domcontentloaded",
+        timeoutMs: self.#clampTimeout(opts?.timeoutMs ?? opts?.timeout_ms ?? 15_000),
+      }), "tabs.content", { trackActiveTab: false }),
     };
     api.user = {
       openTabs: async () => {
@@ -1066,13 +1209,14 @@ export class BrowserScriptSession {
 
   /**
    * Execute an async multi-step browser script with `browser`/`page`, bound `Tab` handles,
-   * fluent auto-waiting Locators, `ariaSnapshot()`, `log`, `sleep`, `viewImage`, and persisted top-level variables.
+   * fluent auto-waiting Locators, `ariaSnapshot()`, `log`, `sleep`, `viewImage`,
+   * `saveFile`, `readFile`, `saveScreenshot`, `nodeRepl`, and persisted top-level variables.
    * @param {import("./bridge-browser.js").BridgeBrowser} browser
    * @param {string} code
    * @param {{tabId?:unknown, timeoutMs?:number, maxLogChars?:number, maxResultChars?:number, maxImages?:number}} [options]
    */
   async run(browser, code, options = {}) {
-    const timeoutMs = Math.max(500, Math.min(120_000, Number(options.timeoutMs) || 45_000));
+    const timeoutMs = Math.max(500, Math.min(300_000, Number(options.timeoutMs) || 45_000));
     const maxLogChars = options.maxLogChars ?? 16_000;
     const maxResultChars = options.maxResultChars ?? 32_000;
     const maxImages = options.maxImages ?? 4;
@@ -1104,6 +1248,10 @@ export class BrowserScriptSession {
     const log = (...args) => this.#log(...args);
     const sleep = (ms) => this.#sleep(ms);
     const viewImage = (captureOrOpts) => this.#viewImage(captureOrOpts);
+    const saveFile = (filePath, data) => this.#saveFile(filePath, data);
+    const readFile = (filePath, opts) => this.#readFile(filePath, opts);
+    const saveScreenshot = (filePath, opts) => this.#saveScreenshot(filePath, opts);
+    const nodeRepl = { write: log, emitImage: viewImage };
     const consoleFacade = {
       log,
       info: log,
@@ -1119,7 +1267,7 @@ export class BrowserScriptSession {
       .map((k) => `try { __scope[${JSON.stringify(k)}] = ${k}; } catch { /* uninitialized */ }`)
       .join("\n");
 
-    const wrapped = `(async function __browserRun(browser, page, log, sleep, viewImage, console, __scope) {\n${preloadLines}\ntry {\n${transformed}\n} finally {\n${saveLines}\n}\n})`;
+    const wrapped = `(async function __browserRun(browser, page, log, sleep, viewImage, saveFile, readFile, saveScreenshot, nodeRepl, console, __scope) {\n${preloadLines}\ntry {\n${transformed}\n} finally {\n${saveLines}\n}\n})`;
     const script = new vm.Script(wrapped, { filename: "browser-run.js" });
     const runner = script.runInContext(this.context, { timeout: Math.min(timeoutMs, 5_000) });
 
@@ -1133,7 +1281,7 @@ export class BrowserScriptSession {
 
     try {
       const rawValue = await Promise.race([
-        runner(api, api, log, sleep, viewImage, consoleFacade, this.scope),
+        runner(api, api, log, sleep, viewImage, saveFile, readFile, saveScreenshot, nodeRepl, consoleFacade, this.scope),
         timeoutPromise,
       ]);
       const notifications = [];
