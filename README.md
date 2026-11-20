@@ -1,51 +1,44 @@
 <div align="center">
 
-<img src="docs/assets/logo.png" alt="codex-browser-use logo" width="104" />
+<img src="docs/assets/logo.png" alt="codex-browser-use logo" width="96" />
 
 # codex-browser-use
 
-**Fast, token-efficient Chrome automation for any MCP coding agent.**
+### Give any coding agent your real Chrome browser.
 
-*Persistent 1-shot workflows, batch pipelines, diff-first accessibility trees, Shadow DOM & iframe locators — zero Playwright, zero proprietary engine.*
+**Codex's Browser Use feature is so good — so I cloned it and built a faster, open-source version for every coding agent.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-26.12.1%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#quick-start)
-[![MCP tools](https://img.shields.io/badge/MCP-36%20tools%20(v4.5)-5B8DEF?style=flat-square)](#tools-36)
+[![MCP tools](https://img.shields.io/badge/MCP-36%20tools-5B8DEF?style=flat-square)](#why-its-better)
 [![Extension](https://img.shields.io/badge/Extension-v0.5.2-34D399?style=flat-square)](#quick-start)
-[![Zero Playwright](https://img.shields.io/badge/Zero%20Playwright-CDP%20Direct-0B1220?style=flat-square)](#architecture)
 [![GitHub stars](https://img.shields.io/github/stars/khanhle1406/codex-browser-use?style=flat-square)](https://github.com/khanhle1406/codex-browser-use/stargazers)
 
-[Features](#features) · [Quick Start](#quick-start) · [Examples](#examples) · [Benchmarks](#benchmarks) · [Architecture](#architecture) · [Tools (36)](#tools-36) · [Safety](#safety-model) · [Documentation](#documentation)
+[Quick start](#quick-start) · [What you can do](#what-you-can-do) · [How it works](#how-it-works) · [Why it's better](#why-its-better) · [FAQ](#faq) · [Docs](#documentation)
+
+<code>node mcp-server/bin/browser-use.js install --client antigravity --write --skill</code>
+
+<br />
+
+<img src="docs/assets/banner.png" alt="codex-browser-use — Local Chrome MCP Bridge" width="100%" />
 
 </div>
 
-<p align="center">
-  <img src="docs/assets/banner.png" alt="codex-browser-use — Local Chrome MCP Bridge" width="100%" />
-</p>
-
-> [!NOTE]
-> **100% standalone MIT core.** No proprietary runtime binary and no Playwright installation required. The MCP server drives your local Chrome-family browser directly over Chrome DevTools Protocol through a lightweight Native Messaging bridge and Chrome extension (`v0.5.2`), with strict per-session tab isolation.
-
 ---
 
-## Features
+OpenAI Codex's built-in Browser Use feature is one of the best developer experiences for web automation. Instead of fighting flaky headless browsers or wasting thousands of tokens on huge HTML dumps, it drives your real Chrome window using clean, numbered page outlines and fast JavaScript workflows. The only problem is that it stays locked inside one proprietary tool.
 
-- **Persistent 1-Shot `browser_run`**: Execute full multi-step JavaScript automation scripts in a single MCP tool call with persistent top-level bindings across turns, independent parallel `browser.tabs.new()` handles, named Chrome Tab Groups (`browser.nameSession()`), fluent auto-waiting locators (`.filter({ has, hasNot, hasNotText })`, `.and()`, `.or()`, `.check()`, `.evaluateAll()`), child-iframe-merged YAML `ariaSnapshot()`, read-only `evaluate(fn, arg)`, `waitForEvent("filechooser" | "download")`, `viewImage`, and inline `markDeliverable()` + `end_turn` cleanup.
-- **One-Call `browser_batch` Pipelines**: Chain linear steps (`goto`, `locator_fill`, `locator_click`, `select_option`, `wait`, `set_viewport`, `name_session`) with automatic event-driven settling, optional inline `end_turn`, and final diff state in one round-trip.
-- **Diff-First `<ax_state>` & 1x CSS-Scaled JPEG**: Redundant `StaticText` nodes under semantic controls are pruned cleanly, subsequent reads emit compact structural diffs (`+added`, `~changed`, `-removed` counts), default state reads skip images (`screenshot: false`), and Retina screenshots are downscaled `1 / devicePixelRatio` to fast JPEG (`quality: 80`).
-- **Full Locator Engine**: Supports CSS, `text=`, `role=…[name=…]`, `label=`, `placeholder=`, `testid=`, chained `>>` pipelines (`first`, `last`, `nth=`, `visible=true`, `has=`, `has-not=`, `has-text=`, `has-not-text=`), `and=`/`or=`, open Shadow DOM piercing, and both same-origin and cross-origin out-of-process iframes (OOPIFs).
-- **High-Throughput Local IPC Engine (`v4.5.1`)**: Bounded concurrent Unix socket dispatch (`32` max in-flight RPCs, zero head-of-line blocking with turn barriers), parallel CDP domain initialization, concurrent child-iframe AX collection + Retina screenshot capture, event-driven navigation waits (`0` `readyState` polls), in-page `MutationObserver` waiting, `navRevision`-keyed iframe route caching, O(n) zero-copy `FrameReader`, lazy zero-buffer `Network.enable`, and `512 KB` extension chunking.
-- **Works With Any MCP Coding Agent**: Built for Antigravity, Claude Code, Codex CLI, Cursor, Windsurf, GitHub Copilot CLI, Command Code, OpenCode, or any stdio MCP client.
+So I rebuilt that workflow cleanly from scratch as a standalone MIT MCP server — and made it faster. Your coding agent connects straight to your local Chrome, reads pages as lightweight accessibility trees, runs multi-step scripts in a single turn, and groups its own tabs neatly without ever touching your personal browsing.
 
----
+There is no Playwright download, no proprietary runtime binary, and no cloud proxy. One install command wires everything up for **Antigravity, Claude Code, Codex, Cursor, Windsurf, Copilot CLI, Command Code, and OpenCode**.
 
-## Quick Start
+## Quick start
 
-**Requirements:** Node.js **26.12.1 or newer**, npm, and Google Chrome, Chromium, Microsoft Edge, or Brave.
+**You need:** Node.js **26.12.1 or newer**, npm, and Chrome (or Chromium, Edge, or Brave).
 
-### 1. Install Dependencies, Extension & Client Config
+### 1. Install
 
-From the repository root:
+Run these commands from the repository root:
 
 ```sh
 npm --prefix mcp-server ci
@@ -53,23 +46,18 @@ node mcp-server/bin/browser-use.js install --client antigravity --write --skill
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-`install` copies the bundled Chrome extension (`v0.5.2` with 16/32/48/128 toolbar icons) to `~/.local/share/browser-use/extension`, registers the Chrome Native Messaging host manifest, merges the MCP server config (with `.bak` backup), and installs [skill/SKILL.md](skill/SKILL.md).
+`install` copies the Chrome extension (`v0.5.2`) to your home directory, registers Chrome's local bridge, adds the MCP entry to your agent (with a `.bak` backup), and installs the matching workflow skill.
 
 <details>
-<summary><strong>Supported clients & TOML / JSONC manual config</strong></summary>
+<summary><strong>Using Claude Code, Codex, Cursor, Windsurf, Copilot, Command Code, or OpenCode?</strong></summary>
 
-| Client Flag (`--client`) | Auto `--write` Config Target | `--skill` Install Target |
-| --- | --- | --- |
-| `antigravity` (`agy`) | `~/.gemini/config/mcp_config.json` (eager core tools enabled) | `~/.gemini/config/skills/codex-browser-use/SKILL.md` |
-| `claude_code` (`claude`) | `~/.claude.json` | `~/.claude/skills/codex-browser-use/SKILL.md` |
-| `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills/codex-browser-use/SKILL.md` |
-| `windsurf` | `~/.codeium/windsurf/mcp_config.json` | `~/.codeium/windsurf/skills/codex-browser-use/SKILL.md` |
-| `copilot` (`github-copilot`) | `~/.copilot/mcp-config.json` | `~/.agents/skills/codex-browser-use/SKILL.md` |
-| `commandcode` | `~/.commandcode/mcp.json` | `~/.agents/skills/codex-browser-use/SKILL.md` |
-| `codex` | Print TOML snippet via `config` | `~/.codex/skills/codex-browser-use/SKILL.md` |
-| `opencode` | Print JSONC snippet via `config` | `~/.agents/skills/codex-browser-use/SKILL.md` |
+Swap `--client antigravity` with your editor (`claude_code`, `cursor`, `windsurf`, `copilot`, or `commandcode`):
 
-Print mergeable snippets for Codex or OpenCode:
+```sh
+node mcp-server/bin/browser-use.js install --client cursor --write --skill
+```
+
+For Codex or OpenCode (TOML / JSONC configs), print the exact config snippet and install the skill:
 
 ```sh
 node mcp-server/bin/browser-use.js config --client codex
@@ -79,18 +67,54 @@ node mcp-server/bin/browser-use.js install --client codex --skill
 
 </details>
 
-### 2. Load & Connect the Chrome Extension
+### 2. Connect Chrome
 
-1. Open `chrome://extensions` in Chrome and enable **Developer mode**.
-2. Click **Load unpacked** and select `~/.local/share/browser-use/extension` (or click **Reload** when upgrading to `0.5.2`).
-3. Click the **Portable Browser Bridge** icon on Chrome's toolbar once so the badge reads `ON` (this publishes the live socket descriptor to `~/.local/share/browser-use/chrome-host/bridge.json`).
-4. Restart your MCP client / agent session to load all **36 tools**.
+1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and pick `~/.local/share/browser-use/extension`.
+2. Click the **Portable Browser Bridge** icon on Chrome's toolbar once so the green badge shows `ON`.
+3. Restart your coding agent so it picks up all **36 tools**.
 
----
+### 3. Ask your agent
 
-## Examples
+Once connected, just ask in plain English:
 
-### 1-Shot Multi-Tab Workflow with Named Tab Group (`browser_run`)
+```text
+Open http://127.0.0.1:3000 in a Chrome tab group named "App QA".
+Test the signup form on both desktop and mobile viewports, check for console
+or failed network requests, and leave the finished tab open for me to review.
+```
+
+## What you can do
+
+| Use case | How it helps |
+| --- | --- |
+| **Test your app end-to-end** | Fill forms, click buttons, switch mobile/desktop viewports, and catch JS console errors or failed API requests right after editing code. |
+| **Research across multiple tabs** | Open several tabs in parallel inside a single turn, extract structured data with read-only JavaScript, and summarize pages cleanly. |
+| **Handle modern web UIs** | Works inside Shadow DOM components and embedded third-party iframes (like checkout widgets), plus real file uploads and downloads. |
+| **Keep Chrome organized** | Label each agent's work into a color-coded Chrome Tab Group (`Checkout QA`, `Docs Audit`) while scratch tabs auto-clean when done. |
+| **Hand off logins & CAPTCHAs safely** | Never tries to bypass security checks — the agent pauses on login/2FA screens and leaves the live tab open for you to sign in manually. |
+
+## How it works
+
+### 1. Everything runs locally on your machine
+
+<img src="docs/assets/how-it-works-architecture.png" alt="4-layer local architecture: AI Agent to MCP Server to Local Bridge to Chrome Tab" width="100%" />
+
+[Open full-size figure](docs/assets/how-it-works-architecture.png).
+
+Your agent talks to a local MCP server, which sends fast commands over a local Unix socket and Chrome Native Messaging straight into a lightweight Chrome extension. Nothing passes through an external browser cloud or Playwright wrapper — every click and page read stays on your laptop.
+
+### 2. Fast actions, tiny token usage
+
+<img src="docs/assets/how-it-works-workflow.png" alt="Workflow: run multi-step scripts in one call, read diff-first accessibility trees, and act without polling" width="100%" />
+
+[Open full-size figure](docs/assets/how-it-works-workflow.png).
+
+- **Multi-step scripts in one call**: Instead of burning an LLM turn per click, `browser_run` (or `browser_batch`) runs full multi-step flows and parallel tabs in a single tool call while remembering variables across turns.
+- **Diff-first `<ax_state>`**: Instead of re-sending huge HTML pages or Retina screenshots every step, the server strips noisy decorative nodes and only sends what actually changed (`+` added, `~` modified, `-` removed). Screenshots are optional and scaled down to crisp 1x JPEG when needed.
+- **Zero-polling waiting**: Page loads wake directly on Chrome events, and element waits observe live DOM mutations inside the page instead of hammering Chrome with timer loops.
+
+<details>
+<summary><strong>Example: what a 1-shot <code>browser_run</code> workflow looks like</strong></summary>
 
 ```json
 {
@@ -98,116 +122,125 @@ node mcp-server/bin/browser-use.js install --client codex --skill
   "arguments": {
     "return_state": "none",
     "end_turn": true,
-    "code": "await browser.nameSession('Docs Audit', 'cyan');\nconst [docsTab, pricingTab] = await Promise.all([\n  browser.tabs.new('https://example.com/docs'),\n  browser.tabs.new('https://example.com/pricing')\n]);\nconst aria = await docsTab.ariaSnapshot();\nconst tiers = await pricingTab.locator('css=.tier-card').evaluateAll((els) => els.map((e) => e.dataset.tier));\nawait pricingTab.markDeliverable();\nreturn { ariaLines: aria.split('\\n').length, tiers };"
+    "code": "await browser.nameSession('Docs Audit', 'cyan');\nconst [docsTab, pricingTab] = await Promise.all([\n  browser.tabs.new('https://example.com/docs'),\n  browser.tabs.new('https://example.com/pricing')\n]);\nconst outline = await docsTab.ariaSnapshot();\nconst plans = await pricingTab.locator('css=.plan-card').evaluateAll((els) => els.map((e) => e.dataset.tier));\nawait pricingTab.markDeliverable();\nreturn { outlineLines: outline.split('\\n').length, plans };"
   }
 }
 ```
 
-### Responsive Audit + Form Flow (`browser_batch`)
+Or use `browser_batch` for linear steps (`goto`, `set_viewport`, `locator_fill`, `locator_click`, `wait`) in one call.
 
-```json
-{
-  "name": "browser_batch",
-  "arguments": {
-    "return_state": "diff",
-    "end_turn": true,
-    "keep": "handoff",
-    "steps": [
-      { "action": "name_session", "name": "Checkout QA", "color": "green" },
-      { "action": "goto", "url": "https://example.com/signup" },
-      { "action": "set_viewport", "width": 390, "height": 844, "device_scale_factor": 2, "mobile": true },
-      { "action": "locator_fill", "selector": "label=Email", "text": "ada@example.com" },
-      { "action": "locator_click", "selector": "role=button[name='Continue']" },
-      { "action": "wait", "text": "Verify your inbox" }
-    ]
-  }
-}
-```
+</details>
 
----
+### 3. Your personal tabs stay untouched
 
-## Benchmarks
+<img src="docs/assets/how-it-works-isolation.png" alt="Chrome Tab Groups isolating Personal Tabs from Agent A and Agent B sessions" width="100%" />
 
-Reproducible harness in [perf-benchmark.mjs](mcp-server/bench/perf-benchmark.mjs) measured on **Node `v26.13.0`** over real Unix domain sockets, Native Messaging `PassThrough` streams running `extension/background.js`, and a DOM VM with live `MutationObserver` (holding simulated CDP latencies constant before vs. after optimization):
+[Open full-size figure](docs/assets/how-it-works-isolation.png).
 
-| Scenario | Before (`v4.5.0`) | After (`v4.5.1`) | Improvement |
+The Chrome extension keeps a strict list of tabs it created for each agent session. Pre-existing personal tabs, cookies, and windows are off-limits to agents. When multiple agents run at the same time, each gets its own isolated tabs (and optional named Chrome Tab Group), and scratch tabs close automatically when a turn ends unless kept as a `handoff` (for user login) or `deliverable` (final result).
+
+## Why it's better
+
+| Feature | Playwright / Screenshot MCPs | Codex Built-in Browser Use | `codex-browser-use` |
+| --- | :---: | :---: | :---: |
+| Works with any coding agent | ✅ | ❌ Codex only | ✅ Any MCP client |
+| Zero Playwright / closed binaries | ❌ | ❌ | ✅ Pure MIT JS + MV3 |
+| 1-call scripting + parallel tabs | ❌ Turn-by-turn | ✅ | ✅ + `browser.tabs.new` |
+| Diff-first `<ax_state>` + YAML ARIA | ❌ Raw DOM / PNG spam | ✅ | ✅ Structural diffs |
+| Named Chrome Tab Groups | ❌ | ❌ | ✅ Color-coded groups |
+| Concurrent socket & DOM-observer speed | ❌ Sequential / timer polls | Partial | ✅ Up to 6.8x faster |
+
+Even better, v4.5.1 removes the hidden bottlenecks that slow local browser bridges down: **6.83x faster** parallel multi-tab workflows, **2.9x–3.1x faster** full page + iframe + Retina screenshot reads, and **zero** wasted polling requests while pages load.
+
+<details>
+<summary><strong>See full benchmark numbers &amp; reproduce locally</strong></summary>
+
+Measured on Node `v26.13.0` with [perf-benchmark.mjs](mcp-server/bench/perf-benchmark.mjs) using real Unix sockets, Native Messaging streams running `extension/background.js`, and a DOM VM with live `MutationObserver` (holding simulated CDP latencies constant before vs. after optimization):
+
+| Scenario | Before | After | Speedup |
 | --- | --- | --- | --- |
-| **Multi-Tab Parallel** (`4` tabs `goto` + `getState`) | `606.79 ms` (`68` RPCs) | **`88.86 ms`** (`60` RPCs) | **6.83x faster** (`-85.4%`) |
-| **`getState` + `4` Child Iframes + Retina Screenshot** | Cold `267.63 ms` / Warm `226.38 ms` | Cold **`90.88 ms`** / Warm **`72.59 ms`** | **2.94x** cold / **3.12x** warm |
-| **`goto(..., waitUntil: "load")`** (+ 8 subresources) | `130.54 ms` (`10` eval polls, `Network` on) | **`113.58 ms`** (**`0`** eval polls, lazy `Network`) | `-13.0%` latency / **`-100%` polls** |
-| **`goto(..., waitUntil: "networkidle")`** | `474.30 ms` (`14` eval polls) | `467.91 ms` (**`0`** eval polls) | **Zero `readyState` polling** |
-| **DOM `MutationObserver` Wait** (`selector`, `text`, `click` @90ms) | `406.74 ms` (`8` evals) | **`289.37 ms`** (`3` evals) | **1.41x faster** / `-62.5%` IPC calls |
-| **`setValue` Sequential** (`10` calls) | `399.85 ms` (`40` CDPs) | **`187.89 ms`** (`20` CDPs) | **2.13x faster** (`50%` fewer CDPs) |
-| **Cross-Origin Iframe Cached Route** (`10` clicks) | `494.31 ms` (`51` CDPs) | **`151.28 ms`** (`15` CDPs) | **3.27x faster** (`-70.6%` CDPs) |
-| **Extension Stream + `40 x 350 KB` Replies** | `34.18 ms` events / `120` wire msgs | **`26.57 ms`** events / **`40`** wire msgs | `-22.3%` event CPU / **`-66.7%` wire msgs** |
-| **Fragmented `1 MB` Frames Over Unix Socket (`40 MB`)** | `263.01 ms` (`152.1 MB/s`) | **`132.20 ms`** (**`302.6 MB/s`**) | **~2.0x throughput** (`-49.7%`) |
+| **4 Parallel Tabs** (`goto` + `getState`) | `606.79 ms` | **`88.86 ms`** | **6.83x faster** (`-85.4%`) |
+| **`getState` + 4 Child Iframes + Screenshot** | `267.63 ms` / `226.38 ms` | **`90.88 ms`** / **`72.59 ms`** | **2.94x** cold / **3.12x** warm |
+| **`goto(..., waitUntil: "load")`** (+ assets) | `130.54 ms` (`10` polls) | **`113.58 ms`** (**`0`** polls) | **`-100%` polling RPCs** |
+| **Wait for DOM Elements & Text** (`90ms` delay) | `406.74 ms` (`8` RPCs) | **`289.37 ms`** (`3` RPCs) | **1.41x faster** / `-62.5%` calls |
+| **`setValue` Sequential** (`10` fields) | `399.85 ms` (`40` CDPs) | **`187.89 ms`** (`20` CDPs) | **2.13x faster** (`50%` fewer CDPs) |
+| **Cross-Origin Iframe Clicks** (`10` clicks) | `494.31 ms` (`51` CDPs) | **`151.28 ms`** (`15` CDPs) | **3.27x faster** (`-70.6%` CDPs) |
+| **Extension 2,000 Events & 40 Large Replies** | `34.18 ms` / `120` msgs | **`26.57 ms`** / **`40` msgs** | `-22.3%` CPU / **`-66.7%` wire msgs** |
+| **Fragmented 1 MB Frames (`40 MB` IPC)** | `263.01 ms` (`152.1 MB/s`) | **`132.20 ms`** (**`302.6 MB/s`**) | **~2.0x throughput** |
 
-Run the benchmark locally:
+Run it yourself:
 
 ```sh
 npm --prefix mcp-server run bench
 ```
 
----
+</details>
 
-## Architecture
+<details>
+<summary><strong>View all 36 MCP tools</strong></summary>
 
-<p align="center">
-  <img src="docs/assets/browser-use-architecture.svg" alt="Architecture: agent to MCP server to native host to Chrome extension to Chrome tab" width="100%" />
-</p>
+| Group | Tools |
+| --- | --- |
+| **1-Shot, Batch & Status** (`3`) | `browser_run`, `browser_batch`, `browser_status` |
+| **Read & Debug** (`8`) | `browser_get_state`, `browser_screenshot`, `browser_get_content`, `browser_dom_snapshot`, `browser_inspect_element`, `browser_console_logs`, `browser_network_logs`, `browser_evaluate` |
+| **Actions** (`9`) | `browser_click`, `browser_set_value`, `browser_type_text`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_drag`, `browser_scroll`, `browser_upload_files` |
+| **Locators, Waits & Viewport** (`4`) | `browser_locator_click`, `browser_locator_fill`, `browser_wait_for`, `browser_set_viewport` |
+| **Navigation, Tabs & Groups** (`9`) | `browser_goto`, `browser_back`, `browser_forward`, `browser_reload`, `browser_list_tabs`, `browser_new_tab`, `browser_select_tab`, `browser_close_tab`, `browser_name_session` |
+| **Dialogs & Turn Lifecycle** (`3`) | `browser_handle_dialog`, `browser_end_turn`, `browser_reset` |
 
-| Component | Path | Responsibility |
-| --- | --- | --- |
-| **MCP Server & Tool Surface** | [server.js](mcp-server/src/server.js) | Exposes all 36 MCP tools (`v4.5.0`), batch execution, state modes, and lifecycle controls |
-| **Persistent Script Runner** | [script-runner.js](mcp-server/src/script-runner.js) | Stateful async `vm` context, bound multi-tab handles, `ax.write` diffing, and `viewImage` |
-| **CDP Client & Event State** | [bridge-browser.js](mcp-server/src/bridge-browser.js) | Parallel domain/frame/screenshot orchestration, event-driven navigation, route cache, CSS JPEG scaling |
-| **AX Tree & Diff Engine** | [ax-tree.js](mcp-server/src/ax-tree.js) | Prunes redundant `StaticText`, merges child iframes, renders ARIA YAML & compact structural diffs |
-| **In-Page Locator Engine** | [locators.js](mcp-server/src/locators.js) | Deep Shadow DOM & iframe resolution, `MutationObserver` waits, hit-testing, semantic setters |
-| **Unix Socket & O(n) Framing** | [backend-transport.js](mcp-server/src/backend-transport.js), [frame-reader.js](mcp-server/src/frame-reader.js), [bridge-client.js](mcp-server/src/bridge-client.js) | Zero-copy `FrameReader`, single-alloc `encodeFrame`, concurrent dispatch (`32` slots) with turn barriers |
-| **Native Driver & Session Store** | [backend-native-driver.js](mcp-server/src/backend-native-driver.js), [backend-tabs.js](mcp-server/src/backend-tabs.js), [backend-page-commands.js](mcp-server/src/backend-page-commands.js) | Per-session tab/group isolation, per-tab timeout isolation, strict CDP command allowlist |
-| **Chrome MV3 Extension** | [background.js](mcp-server/extension/background.js), [manifest.json](mcp-server/extension/manifest.json) | Manages owned session tabs, Chrome Tab Groups (`tabGroups`), `downloads`, CDP forwarding, `512 KB` chunking |
+</details>
 
----
+## FAQ
 
-## Tools (36)
+<details>
+<summary><strong>Which coding agents work with this?</strong></summary>
 
-| Category | Tools | Purpose |
-| --- | --- | --- |
-| **1-Shot, Batch & Status** (`3`) | `browser_run`, `browser_batch`, `browser_status` | Stateful async automation scripts, multi-step linear pipelines, bridge diagnostics |
-| **Observe & Diagnostics** (`8`) | `browser_get_state`, `browser_screenshot`, `browser_get_content`, `browser_dom_snapshot`, `browser_inspect_element`, `browser_console_logs`, `browser_network_logs`, `browser_evaluate` | Diff-first `<ax_state>`, CSS-scaled JPEG/PNG, DOM/ARIA snapshots, coordinate locators, logs, AST-guarded read-only JS |
-| **Index & Coordinate Actions** (`9`) | `browser_click`, `browser_set_value`, `browser_type_text`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_drag`, `browser_scroll`, `browser_upload_files` | Hit-tested index or `(x, y)` actions, semantic value setting, native `<select>`, wheel scroll, file input uploads |
-| **Locators, Waits & Viewport** (`4`) | `browser_locator_click`, `browser_locator_fill`, `browser_wait_for`, `browser_set_viewport` | Shadow DOM & iframe auto-waiting locators, `MutationObserver`/URL/load waits, responsive viewport emulation |
-| **Navigate, Tabs & Groups** (`9`) | `browser_goto`, `browser_back`, `browser_forward`, `browser_reload`, `browser_list_tabs`, `browser_new_tab`, `browser_select_tab`, `browser_close_tab`, `browser_name_session` | Isolated tab creation/switching, navigation with diff state, Chrome Tab Group title & color |
-| **Dialogs & Turn Lifecycle** (`3`) | `browser_handle_dialog`, `browser_end_turn`, `browser_reset` | `alert`/`confirm`/`prompt`/`beforeunload` responses, `handoff`/`deliverable` tab retention, clean VM & browser reset |
+Any tool that speaks local MCP stdio: Antigravity, Claude Code, Codex CLI, Cursor, Windsurf, GitHub Copilot CLI, Command Code, OpenCode, or custom agent harnesses.
 
----
+</details>
 
-## Safety Model
+<details>
+<summary><strong>Can the agent see my personal Chrome tabs or passwords?</strong></summary>
 
-- **AST-Validated Read-Only Evaluation**: `browser_evaluate` and `tab.evaluate()` parse code via `acorn` ([read-only.js](mcp-server/src/read-only.js)) and reject assignments, mutations, `delete`, DOM/style/`classList`/`dataset` writes, storage/history writes, dynamic code evaluation, and network requests while permitting non-mutating DOM/style inspection.
-- **Session & Tab Isolation**: The extension maintains an explicit `owned` set of tabs created within each MCP connection and validates ownership on CDP execution, downloads, and `tabGroups`. Existing user tabs, cookies, and windows remain untouched.
-- **Strict CDP & URL Allowlist**: [backend-page-commands.js](mcp-server/src/backend-page-commands.js) permits only reviewed page-scoped CDP methods, requires absolute paths on `DOM.setFileInputFiles`, and rejects credentialed or `javascript:` URLs on navigation.
-- **Human-in-the-Loop Auth & CAPTCHA**: Never bypasses logins, permission prompts, or CAPTCHAs — agents retain the live tab via `handoff` so you can interact directly in Chrome.
+No. The extension only attaches to blank tabs it created for that MCP session. Your existing tabs, bookmarks, and unrelated windows cannot be read or closed. Read-only JavaScript inspection (`browser_evaluate`) is also AST-checked to block DOM writes, navigation, storage writes, and network calls.
 
----
+</details>
 
-## Development
+<details>
+<summary><strong>Why not just use Playwright MCP?</strong></summary>
+
+Playwright spawns separate heavy browser binaries, lacks your everyday Chrome environment, and typically sends verbose DOM snapshots or full PNGs per action. `codex-browser-use` connects straight to your running Chrome over CDP with diff-first `<ax_state>`, named Tab Groups, and 1-shot script execution — zero extra browsers to install.
+
+</details>
+
+<details>
+<summary><strong>What happens on login screens, 2FA, or CAPTCHAs?</strong></summary>
+
+Agents are instructed never to bypass login walls or CAPTCHAs. Instead, the agent marks the tab `handoff`, tells you it is waiting, and lets you log in or solve the prompt directly in Chrome before continuing.
+
+</details>
+
+<details>
+<summary><strong>How do I verify my setup or update the extension?</strong></summary>
+
+Pull the latest code, re-run `node mcp-server/bin/browser-use.js install --client <your-client> --skill`, click **Reload** on **Portable Browser Bridge** in `chrome://extensions`, and run `node mcp-server/bin/browser-use.js doctor --json`.
+
+</details>
+
+## Documentation
+
+Run tests, lint, and health checks anytime:
 
 ```sh
-node --check mcp-server/extension/background.js
 npm --prefix mcp-server test
 npm --prefix mcp-server run lint
 npm --prefix mcp-server run bench
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
----
-
-## Documentation
-
-- **Agent Skill Definition**: [skill/SKILL.md](skill/SKILL.md)
-- **Always-On Policy Rule**: [rules/browser_use.md](rules/browser_use.md)
-- **Compatibility & Engine Modes**: [docs/compatibility.md](docs/compatibility.md)
-- **IPC & Transport Notes**: [docs/transport-investigation.md](docs/transport-investigation.md)
-- **Legacy v1 Reference**: [docs/legacy-v1.md](docs/legacy-v1.md)
-- **License**: [MIT](LICENSE)
+- [Agent Skill Instructions](skill/SKILL.md) — workflow guidance installed into your coding agent
+- [Browser Policy Rule](rules/browser_use.md) — always-on safety & tool selection rule template
+- [Compatibility & Engine Modes](docs/compatibility.md) — standalone vs. optional comparison mode details
+- [Transport & IPC Notes](docs/transport-investigation.md) — Unix socket and Native Messaging internals
+- [Legacy v1 Notes](docs/legacy-v1.md) — archived v1 architecture reference
+- [MIT License](LICENSE)
