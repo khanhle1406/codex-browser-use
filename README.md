@@ -4,9 +4,9 @@
 
 # codex-browser-use
 
-### Give any coding agent your real Chrome browser.
+### One fast local MCP that gives any coding agent your real Chrome browser.
 
-**Codex's Browser Use feature is so good — so I cloned it and built a faster, open-source version for every coding agent.**
+**Codex's Browser Use feature is so good — so I cloned it and made a faster, open-source version for every coding agent.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-26.12.1%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#quick-start)
@@ -14,9 +14,13 @@
 [![Extension](https://img.shields.io/badge/Extension-v0.5.2-34D399?style=flat-square)](#quick-start)
 [![GitHub stars](https://img.shields.io/github/stars/khanhle1406/codex-browser-use?style=flat-square)](https://github.com/khanhle1406/codex-browser-use/stargazers)
 
-[Quick start](#quick-start) · [What you can do](#what-you-can-do) · [How it works](#how-it-works) · [Why it's better](#why-its-better) · [FAQ](#faq) · [Docs](#documentation)
+[Quick start](#quick-start) · [How it works](#how-it-works) · [What you can do](#what-you-can-do) · [Why it's better](#why-its-better) · [FAQ](#faq) · [Documentation](#documentation)
 
 <code>node mcp-server/bin/browser-use.js install --client antigravity --write --skill</code>
+
+</div>
+
+<div align="center">
 
 <br />
 
@@ -26,19 +30,19 @@
 
 ---
 
-OpenAI Codex's built-in Browser Use feature is one of the best developer experiences for web automation. Instead of fighting flaky headless browsers or wasting thousands of tokens on huge HTML dumps, it drives your real Chrome window using clean, numbered page outlines and fast JavaScript workflows. The only problem is that it stays locked inside one proprietary tool.
+Want your coding agent to open a website, click buttons, fill out forms, and test if your app actually works? Usually that means installing Playwright, launching a heavy extra browser, and burning through your token limit on giant HTML dumps and screenshots.
 
-So I rebuilt that workflow cleanly from scratch as a standalone MIT MCP server — and made it faster. Your coding agent connects straight to your local Chrome, reads pages as lightweight accessibility trees, runs multi-step scripts in a single turn, and groups its own tabs neatly without ever touching your personal browsing.
+OpenAI Codex solved this cleanly by connecting straight to your real Chrome browser and reading pages as a short numbered list instead of raw HTML. The only catch is that it only works inside Codex. So I cloned the idea from scratch as a free, open-source tool that works with **any coding agent** — and tuned it to run even faster.
 
-There is no Playwright download, no proprietary runtime binary, and no cloud proxy. One install command wires everything up for **Antigravity, Claude Code, Codex, Cursor, Windsurf, Copilot CLI, Command Code, and OpenCode**.
+Setup takes one command. It installs a small Chrome extension, registers the local bridge, and sets up your agent automatically. Everything stays on your computer, and your personal Chrome tabs stay completely untouched.
 
 ## Quick start
 
-**You need:** Node.js **26.12.1 or newer**, npm, and Chrome (or Chromium, Edge, or Brave).
+You need **Node.js 26.12.1 or newer**, npm, and Chrome (or Chromium, Edge, or Brave).
 
-### 1. Install
+### Set up your agent
 
-Run these commands from the repository root:
+Run these commands from the repo folder:
 
 ```sh
 npm --prefix mcp-server ci
@@ -46,18 +50,18 @@ node mcp-server/bin/browser-use.js install --client antigravity --write --skill
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-`install` copies the Chrome extension (`v0.5.2`) to your home directory, registers Chrome's local bridge, adds the MCP entry to your agent (with a `.bak` backup), and installs the matching workflow skill.
+`install` copies the Chrome extension (`v0.5.2`) to your home folder, hooks up Chrome's local bridge, adds the MCP server to your agent (saving a `.bak` backup first), and installs the matching instructions.
 
 <details>
 <summary><strong>Using Claude Code, Codex, Cursor, Windsurf, Copilot, Command Code, or OpenCode?</strong></summary>
 
-Swap `--client antigravity` with your editor (`claude_code`, `cursor`, `windsurf`, `copilot`, or `commandcode`):
+Replace `--client antigravity` with your editor (`claude_code`, `cursor`, `windsurf`, `copilot`, or `commandcode`):
 
 ```sh
 node mcp-server/bin/browser-use.js install --client cursor --write --skill
 ```
 
-For Codex or OpenCode (TOML / JSONC configs), print the exact config snippet and install the skill:
+For Codex or OpenCode, print the config snippet and install the skill:
 
 ```sh
 node mcp-server/bin/browser-use.js config --client codex
@@ -67,54 +71,42 @@ node mcp-server/bin/browser-use.js install --client codex --skill
 
 </details>
 
-### 2. Connect Chrome
+### Connect Chrome
 
-1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and pick `~/.local/share/browser-use/extension`.
-2. Click the **Portable Browser Bridge** icon on Chrome's toolbar once so the green badge shows `ON`.
-3. Restart your coding agent so it picks up all **36 tools**.
+1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and choose `~/.local/share/browser-use/extension`.
+2. Click the **Portable Browser Bridge** icon on Chrome's toolbar once so the green badge says `ON`.
+3. Restart your coding agent so it loads all **36 tools**.
 
-### 3. Ask your agent
+### Ask your agent
 
 Once connected, just ask in plain English:
 
 ```text
-Open http://127.0.0.1:3000 in a Chrome tab group named "App QA".
-Test the signup form on both desktop and mobile viewports, check for console
-or failed network requests, and leave the finished tab open for me to review.
+Open http://127.0.0.1:3000 in a Chrome tab group called "App QA".
+Test the signup form on desktop and mobile sizes, check for any console
+or failed network errors, and leave the final tab open for me to check.
 ```
-
-## What you can do
-
-| Use case | How it helps |
-| --- | --- |
-| **Test your app end-to-end** | Fill forms, click buttons, switch mobile/desktop viewports, and catch JS console errors or failed API requests right after editing code. |
-| **Research across multiple tabs** | Open several tabs in parallel inside a single turn, extract structured data with read-only JavaScript, and summarize pages cleanly. |
-| **Handle modern web UIs** | Works inside Shadow DOM components and embedded third-party iframes (like checkout widgets), plus real file uploads and downloads. |
-| **Keep Chrome organized** | Label each agent's work into a color-coded Chrome Tab Group (`Checkout QA`, `Docs Audit`) while scratch tabs auto-clean when done. |
-| **Hand off logins & CAPTCHAs safely** | Never tries to bypass security checks — the agent pauses on login/2FA screens and leaves the live tab open for you to sign in manually. |
 
 ## How it works
 
-### 1. Everything runs locally on your machine
+### 1. Everything stays on your computer
 
-<img src="docs/assets/how-it-works-architecture.png" alt="4-layer local architecture: AI Agent to MCP Server to Local Bridge to Chrome Tab" width="100%" />
+Your agent talks to a local MCP server, which sends commands straight into your running Chrome browser through a lightweight extension. There is no cloud service, no Playwright browser download, and no hidden background server.
 
-[Open full-size figure](docs/assets/how-it-works-architecture.png).
+<img src="docs/assets/how-it-works-architecture.png" alt="4-layer local flow from AI Agent to MCP Server to Local Bridge to Chrome Tab" width="100%" />
 
-Your agent talks to a local MCP server, which sends fast commands over a local Unix socket and Chrome Native Messaging straight into a lightweight Chrome extension. Nothing passes through an external browser cloud or Playwright wrapper — every click and page read stays on your laptop.
+[Open the full-size figure](docs/assets/how-it-works-architecture.png).
 
-### 2. Fast actions, tiny token usage
+### 2. One turn, tiny token usage, zero wasted waiting
 
-<img src="docs/assets/how-it-works-workflow.png" alt="Workflow: run multi-step scripts in one call, read diff-first accessibility trees, and act without polling" width="100%" />
+Instead of taking one tiny step per AI message, your agent can run a whole multi-step flow (and even multiple tabs at once) in a single call. When reading a page, it gets a clean numbered list of buttons and inputs, and on the next step it only sees what changed — keeping token usage tiny.
 
-[Open full-size figure](docs/assets/how-it-works-workflow.png).
+<img src="docs/assets/how-it-works-workflow.png" alt="One-call workflow: run script, read only what changed, and act without timer polling" width="100%" />
 
-- **Multi-step scripts in one call**: Instead of burning an LLM turn per click, `browser_run` (or `browser_batch`) runs full multi-step flows and parallel tabs in a single tool call while remembering variables across turns.
-- **Diff-first `<ax_state>`**: Instead of re-sending huge HTML pages or Retina screenshots every step, the server strips noisy decorative nodes and only sends what actually changed (`+` added, `~` modified, `-` removed). Screenshots are optional and scaled down to crisp 1x JPEG when needed.
-- **Zero-polling waiting**: Page loads wake directly on Chrome events, and element waits observe live DOM mutations inside the page instead of hammering Chrome with timer loops.
+[Open the full-size figure](docs/assets/how-it-works-workflow.png).
 
 <details>
-<summary><strong>Example: what a 1-shot <code>browser_run</code> workflow looks like</strong></summary>
+<summary><strong>Example: run two tabs in one call and group them in Chrome</strong></summary>
 
 ```json
 {
@@ -127,48 +119,59 @@ Your agent talks to a local MCP server, which sends fast commands over a local U
 }
 ```
 
-Or use `browser_batch` for linear steps (`goto`, `set_viewport`, `locator_fill`, `locator_click`, `wait`) in one call.
+Or pass a simple list of steps (`goto`, `set_viewport`, `locator_fill`, `locator_click`, `wait`) to `browser_batch`.
 
 </details>
 
-### 3. Your personal tabs stay untouched
+### 3. Your personal tabs stay completely separate
 
-<img src="docs/assets/how-it-works-isolation.png" alt="Chrome Tab Groups isolating Personal Tabs from Agent A and Agent B sessions" width="100%" />
+The extension only touches tabs it opened for the current agent session. Your personal tabs, logins, and open windows are never visible to the agent. If multiple agents work at the same time, each one gets its own isolated tabs and its own colored Chrome Tab Group, and temporary tabs close automatically when the task finishes.
 
-[Open full-size figure](docs/assets/how-it-works-isolation.png).
+<img src="docs/assets/how-it-works-isolation.png" alt="Chrome Tab Groups keeping Personal Tabs untouched while isolating Agent A and Agent B" width="100%" />
 
-The Chrome extension keeps a strict list of tabs it created for each agent session. Pre-existing personal tabs, cookies, and windows are off-limits to agents. When multiple agents run at the same time, each gets its own isolated tabs (and optional named Chrome Tab Group), and scratch tabs close automatically when a turn ends unless kept as a `handoff` (for user login) or `deliverable` (final result).
+[Open the full-size figure](docs/assets/how-it-works-isolation.png).
+
+## What you can do
+
+| What you want to do | How it helps |
+| --- | --- |
+| **Test your web app** | Fill out forms, click buttons, test phone and desktop screen sizes, and catch page errors or broken API calls right after editing code. |
+| **Check multiple pages at once** | Open several tabs side by side in a single turn, read clean page outlines, and pull out structured data safely. |
+| **Click tricky UIs** | Works inside modern components, embedded iframes (like payment forms), file upload pickers, and file downloads. |
+| **Keep Chrome neat** | Group an agent's tabs under a named, colored Chrome tab label while temporary tabs clean themselves up automatically. |
+| **Handle logins & CAPTCHAs safely** | Never tries to bypass security checks — the agent pauses and leaves the tab open so you can sign in yourself. |
 
 ## Why it's better
 
 | Feature | Playwright / Screenshot MCPs | Codex Built-in Browser Use | `codex-browser-use` |
 | --- | :---: | :---: | :---: |
-| Works with any coding agent | ✅ | ❌ Codex only | ✅ Any MCP client |
-| Zero Playwright / closed binaries | ❌ | ❌ | ✅ Pure MIT JS + MV3 |
-| 1-call scripting + parallel tabs | ❌ Turn-by-turn | ✅ | ✅ + `browser.tabs.new` |
-| Diff-first `<ax_state>` + YAML ARIA | ❌ Raw DOM / PNG spam | ✅ | ✅ Structural diffs |
-| Named Chrome Tab Groups | ❌ | ❌ | ✅ Color-coded groups |
-| Concurrent socket & DOM-observer speed | ❌ Sequential / timer polls | Partial | ✅ Up to 6.8x faster |
+| Works with any coding agent | ✅ | ❌ Codex only | ✅ Any MCP agent |
+| Uses your real Chrome (no extra browser) | ❌ Heavy extra browser | ✅ | ✅ |
+| 100% open-source MIT (no closed binary) | ✅ | ❌ Closed runtime | ✅ Pure Node.js + MV3 |
+| Multi-step scripts & parallel tabs in 1 call | ❌ One step per turn | ✅ | ✅ + `browser.tabs.new` |
+| Short numbered outlines (not raw HTML) | ❌ Huge DOM / PNGs | ✅ | ✅ Only sends changes |
+| Named Chrome Tab Groups | ❌ | ✅ | ✅ |
+| Fast local speed without timer polling | ❌ Slow per-step wait | ✅ | ✅ Up to 6.8x faster in parallel |
 
-Even better, v4.5.1 removes the hidden bottlenecks that slow local browser bridges down: **6.83x faster** parallel multi-tab workflows, **2.9x–3.1x faster** full page + iframe + Retina screenshot reads, and **zero** wasted polling requests while pages load.
+Under the hood, commands run in parallel over the local bridge and wait directly on Chrome page events instead of polling on timers — making 4-tab parallel runs **6.83x faster** and full page + iframe + screenshot reads **~3x faster**.
 
 <details>
-<summary><strong>See full benchmark numbers &amp; reproduce locally</strong></summary>
+<summary><strong>See full benchmark numbers &amp; run it yourself</strong></summary>
 
-Measured on Node `v26.13.0` with [perf-benchmark.mjs](mcp-server/bench/perf-benchmark.mjs) using real Unix sockets, Native Messaging streams running `extension/background.js`, and a DOM VM with live `MutationObserver` (holding simulated CDP latencies constant before vs. after optimization):
+Measured on Node `v26.13.0` with [perf-benchmark.mjs](mcp-server/bench/perf-benchmark.mjs) using real local sockets, Native Messaging streams, and simulated page latencies held identical before vs. after optimization:
 
-| Scenario | Before | After | Speedup |
+| What was measured | Before | After | Speedup |
 | --- | --- | --- | --- |
-| **4 Parallel Tabs** (`goto` + `getState`) | `606.79 ms` | **`88.86 ms`** | **6.83x faster** (`-85.4%`) |
-| **`getState` + 4 Child Iframes + Screenshot** | `267.63 ms` / `226.38 ms` | **`90.88 ms`** / **`72.59 ms`** | **2.94x** cold / **3.12x** warm |
-| **`goto(..., waitUntil: "load")`** (+ assets) | `130.54 ms` (`10` polls) | **`113.58 ms`** (**`0`** polls) | **`-100%` polling RPCs** |
-| **Wait for DOM Elements & Text** (`90ms` delay) | `406.74 ms` (`8` RPCs) | **`289.37 ms`** (`3` RPCs) | **1.41x faster** / `-62.5%` calls |
-| **`setValue` Sequential** (`10` fields) | `399.85 ms` (`40` CDPs) | **`187.89 ms`** (`20` CDPs) | **2.13x faster** (`50%` fewer CDPs) |
-| **Cross-Origin Iframe Clicks** (`10` clicks) | `494.31 ms` (`51` CDPs) | **`151.28 ms`** (`15` CDPs) | **3.27x faster** (`-70.6%` CDPs) |
-| **Extension 2,000 Events & 40 Large Replies** | `34.18 ms` / `120` msgs | **`26.57 ms`** / **`40` msgs** | `-22.3%` CPU / **`-66.7%` wire msgs** |
-| **Fragmented 1 MB Frames (`40 MB` IPC)** | `263.01 ms` (`152.1 MB/s`) | **`132.20 ms`** (**`302.6 MB/s`**) | **~2.0x throughput** |
+| **4 Parallel Tabs** (`goto` + read page) | `606.79 ms` | **`88.86 ms`** | **6.83x faster** (`-85.4%`) |
+| **Page + 4 Iframes + Screenshot** | `267.63 ms` / `226.38 ms` | **`90.88 ms`** / **`72.59 ms`** | **2.94x** cold / **3.12x** warm |
+| **Wait for Page Load** (+ assets) | `130.54 ms` (`10` polls) | **`113.58 ms`** (**`0`** polls) | **Zero polling checks** |
+| **Wait for Element & Text** (`90ms` delay) | `406.74 ms` (`8` checks) | **`289.37 ms`** (`3` checks) | **1.41x faster** / `-62.5%` calls |
+| **Fill 10 Fields in a Row** | `399.85 ms` (`40` calls) | **`187.89 ms`** (`20` calls) | **2.13x faster** (half the calls) |
+| **Click 10 Times Inside an Iframe** | `494.31 ms` (`51` calls) | **`151.28 ms`** (`15` calls) | **3.27x faster** (`-70.6%` calls) |
+| **Extension Stream & 40 Large Replies** | `34.18 ms` / `120` msgs | **`26.57 ms`** / **`40` msgs** | `-22.3%` CPU / **`-66.7%` msgs** |
+| **40 MB Over Local Socket** | `263.01 ms` (`152.1 MB/s`) | **`132.20 ms`** (**`302.6 MB/s`**) | **~2.0x throughput** |
 
-Run it yourself:
+Run the benchmark locally:
 
 ```sh
 npm --prefix mcp-server run bench
@@ -181,12 +184,12 @@ npm --prefix mcp-server run bench
 
 | Group | Tools |
 | --- | --- |
-| **1-Shot, Batch & Status** (`3`) | `browser_run`, `browser_batch`, `browser_status` |
+| **Multi-step & Status** (`3`) | `browser_run`, `browser_batch`, `browser_status` |
 | **Read & Debug** (`8`) | `browser_get_state`, `browser_screenshot`, `browser_get_content`, `browser_dom_snapshot`, `browser_inspect_element`, `browser_console_logs`, `browser_network_logs`, `browser_evaluate` |
-| **Actions** (`9`) | `browser_click`, `browser_set_value`, `browser_type_text`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_drag`, `browser_scroll`, `browser_upload_files` |
-| **Locators, Waits & Viewport** (`4`) | `browser_locator_click`, `browser_locator_fill`, `browser_wait_for`, `browser_set_viewport` |
+| **Click, Type & Files** (`9`) | `browser_click`, `browser_set_value`, `browser_type_text`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_drag`, `browser_scroll`, `browser_upload_files` |
+| **Smart Locators, Waits & Screen Size** (`4`) | `browser_locator_click`, `browser_locator_fill`, `browser_wait_for`, `browser_set_viewport` |
 | **Navigation, Tabs & Groups** (`9`) | `browser_goto`, `browser_back`, `browser_forward`, `browser_reload`, `browser_list_tabs`, `browser_new_tab`, `browser_select_tab`, `browser_close_tab`, `browser_name_session` |
-| **Dialogs & Turn Lifecycle** (`3`) | `browser_handle_dialog`, `browser_end_turn`, `browser_reset` |
+| **Popups & Cleanup** (`3`) | `browser_handle_dialog`, `browser_end_turn`, `browser_reset` |
 
 </details>
 
@@ -195,35 +198,35 @@ npm --prefix mcp-server run bench
 <details>
 <summary><strong>Which coding agents work with this?</strong></summary>
 
-Any tool that speaks local MCP stdio: Antigravity, Claude Code, Codex CLI, Cursor, Windsurf, GitHub Copilot CLI, Command Code, OpenCode, or custom agent harnesses.
+Any agent that supports local MCP tools: Antigravity, Claude Code, Codex CLI, Cursor, Windsurf, GitHub Copilot CLI, Command Code, OpenCode, or custom setups.
 
 </details>
 
 <details>
-<summary><strong>Can the agent see my personal Chrome tabs or passwords?</strong></summary>
+<summary><strong>Can the agent see my personal tabs or saved passwords?</strong></summary>
 
-No. The extension only attaches to blank tabs it created for that MCP session. Your existing tabs, bookmarks, and unrelated windows cannot be read or closed. Read-only JavaScript inspection (`browser_evaluate`) is also AST-checked to block DOM writes, navigation, storage writes, and network calls.
+No. The extension only accesses blank tabs it created for that agent session. Your personal tabs, bookmarks, and unrelated windows stay private. Read-only page checks (`browser_evaluate`) also block page edits, storage writes, and network calls.
 
 </details>
 
 <details>
 <summary><strong>Why not just use Playwright MCP?</strong></summary>
 
-Playwright spawns separate heavy browser binaries, lacks your everyday Chrome environment, and typically sends verbose DOM snapshots or full PNGs per action. `codex-browser-use` connects straight to your running Chrome over CDP with diff-first `<ax_state>`, named Tab Groups, and 1-shot script execution — zero extra browsers to install.
+Playwright installs heavy separate browsers, starts cold every time, and often sends large DOM dumps or full PNGs per action. `codex-browser-use` connects straight to your everyday Chrome with short page outlines, named Tab Groups, and 1-call scripts — nothing extra to download.
 
 </details>
 
 <details>
-<summary><strong>What happens on login screens, 2FA, or CAPTCHAs?</strong></summary>
+<summary><strong>What happens on login pages, 2FA, or CAPTCHAs?</strong></summary>
 
-Agents are instructed never to bypass login walls or CAPTCHAs. Instead, the agent marks the tab `handoff`, tells you it is waiting, and lets you log in or solve the prompt directly in Chrome before continuing.
+Agents are told never to bypass logins or CAPTCHAs. When a page needs you to sign in, the agent pauses (`handoff`) and asks you to complete it in Chrome yourself, then picks right back up.
 
 </details>
 
 <details>
-<summary><strong>How do I verify my setup or update the extension?</strong></summary>
+<summary><strong>How do I update or check if everything is working?</strong></summary>
 
-Pull the latest code, re-run `node mcp-server/bin/browser-use.js install --client <your-client> --skill`, click **Reload** on **Portable Browser Bridge** in `chrome://extensions`, and run `node mcp-server/bin/browser-use.js doctor --json`.
+Pull the latest code, run `node mcp-server/bin/browser-use.js install --client <your-client> --skill`, click **Reload** on **Portable Browser Bridge** in `chrome://extensions`, and run `node mcp-server/bin/browser-use.js doctor --json`.
 
 </details>
 
@@ -238,9 +241,16 @@ npm --prefix mcp-server run bench
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-- [Agent Skill Instructions](skill/SKILL.md) — workflow guidance installed into your coding agent
-- [Browser Policy Rule](rules/browser_use.md) — always-on safety & tool selection rule template
-- [Compatibility & Engine Modes](docs/compatibility.md) — standalone vs. optional comparison mode details
-- [Transport & IPC Notes](docs/transport-investigation.md) — Unix socket and Native Messaging internals
-- [Legacy v1 Notes](docs/legacy-v1.md) — archived v1 architecture reference
-- [MIT License](LICENSE)
+- [Agent Skill Instructions](skill/SKILL.md) — workflow guide installed for your coding agent
+- [Browser Policy Rule](rules/browser_use.md) — safety and tool-usage rules
+- [Compatibility & Engine Modes](docs/compatibility.md) — standalone setup details
+- [Transport & IPC Notes](docs/transport-investigation.md) — how the local socket and native bridge work
+- [Legacy v1 Notes](docs/legacy-v1.md) — older v1 architecture reference
+
+## Contributing
+
+Issues and pull requests are welcome at [khanhle1406/codex-browser-use](https://github.com/khanhle1406/codex-browser-use).
+
+## License
+
+[MIT](LICENSE)
