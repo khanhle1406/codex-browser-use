@@ -77,8 +77,15 @@ test("provider configuration uses absolute paths and the OpenCode V2 schema", ()
   });
   assert.deepEqual(buildConfig("antigravity", opts).mcpServers["browser-use"], {
     ...generic,
-    tools: { browser_get_state: { eager: true }, browser_end_turn: { eager: true } },
+    tools: {
+      browser_run: { eager: true },
+      browser_batch: { eager: true },
+      browser_get_state: { eager: true },
+      browser_end_turn: { eager: true },
+    },
   });
+  assert.deepEqual(buildConfig("cursor", opts).mcpServers["browser-use"], generic);
+  assert.deepEqual(buildConfig("windsurf", opts).mcpServers["browser-use"], generic);
   const opencode = buildConfig("opencode", opts).mcp.servers["browser-use"];
   assert.deepEqual(opencode.command, [opts.nodePath, opts.serverPath]);
   assert.equal(opencode.disabled, false);

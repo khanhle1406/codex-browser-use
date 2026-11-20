@@ -27,7 +27,8 @@
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test test/*.test.js",
-    "lint": "eslint src/server.js src/portable-server.js src/repl-*.js src/official-runtime.js src/engine-discovery.js src/bridge-*.js src/read-only.js src/install.js src/config.js src/extension.js src/backend-*.js bin test"
+    "lint": "eslint src/*.js bin test",
+    "bench": "node bench/perf-benchmark.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",

@@ -1,12 +1,14 @@
 import {validateNetworkPolicy, validatePageCommand} from "./backend-page-commands.js";
 
 /** @typedef {{id:number, title?:string, url?:string, active?:boolean}} BrowserTab */
-/** @typedef {{createBlankTab:()=>Promise<BrowserTab>, readTab:(id:number)=>Promise<BrowserTab|null>, closeTab:(id:number)=>Promise<void>, releaseTab?:(id:number)=>Promise<void>, attach?:(id:number)=>Promise<void>, detach?:(id:number)=>Promise<void>, navigate?:(id:number,url:string)=>Promise<void>, execute?:(id:number,method:string,params:RpcParams,childSession?:string)=>Promise<unknown>, onEvent?:(listener:(method:string, id:number, params:RpcParams)=>void)=>void}} TabDriver */
+/** @typedef {{createBlankTab:()=>Promise<BrowserTab>, readTab:(id:number)=>Promise<BrowserTab|null>, closeTab:(id:number)=>Promise<void>, releaseTab?:(id:number)=>Promise<void>, attach?:(id:number)=>Promise<void>, detach?:(id:number)=>Promise<void>, navigate?:(id:number,url:string)=>Promise<void>, watchDownloads?:(id:number)=>Promise<void>, unwatchDownloads?:(id:number)=>Promise<void>, groupTabs?:(tabIds:number[],options:{title?:string,color?:string,groupId?:number|null})=>Promise<{groupId:number|null,supported?:boolean}>, execute?:(id:number,method:string,params:RpcParams,childSession?:string)=>Promise<unknown>, onEvent?:(listener:(method:string, id:number, params:RpcParams)=>void)=>void}} TabDriver */
 /** @typedef {"handoff"|"deliverable"} TabMark */
-/** @typedef {{id:string, turn:string|null, ended:Set<string>, tabs:Map<number,TabMark|null>, attached:Set<number>, notify:Notify, cleanup?:Promise<void>}} TabSession */
+/** @typedef {{id:string, turn:string|null, ended:Set<string>, tabs:Map<number,TabMark|null>, attached:Set<number>, group:null|{title:string,color:string,groupId:number|null}, groupLock:Promise<void>, notify:Notify, cleanup?:Promise<void>}} TabSession */
 /** @typedef {Record<string,unknown>} RpcParams */
 /** @typedef {(method:string,params:RpcParams)=>void} Notify */
 /** @typedef {(params:RpcParams,signal:AbortSignal,notify:Notify)=>unknown|Promise<unknown>} RpcHandler */
+
+const TAB_GROUP_COLORS = new Set(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
 
 /** @param {unknown} value @param {string} field @returns {string} */
 function identity(value, field) {
@@ -58,6 +60,35 @@ export function createTabHandlers(driver, options) {
     owners.delete(id);
   }
 
+  /** @param {TabSession} session @param {number[]} tabIds */
+  function applySessionGroup(session, tabIds) {
+    const run = async () => {
+      if (!session.group || !driver.groupTabs) {
+        return { groupId: session.group?.groupId ?? null, supported: false };
+      }
+      const ownedIds = tabIds.filter((id) => session.tabs.has(id));
+      if (ownedIds.length === 0) {
+        return { groupId: session.group.groupId, supported: true };
+      }
+      try {
+        const res = await driver.groupTabs(ownedIds, session.group);
+        if (Number.isSafeInteger(res?.groupId)) {
+          session.group.groupId = res.groupId;
+        }
+        return { groupId: session.group.groupId, supported: res?.supported !== false };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/Unknown Chrome bridge request/i.test(message)) {
+          return { groupId: null, supported: false };
+        }
+        throw error;
+      }
+    };
+    const next = (session.groupLock ?? Promise.resolve()).then(run, run);
+    session.groupLock = next.catch(() => {});
+    return next;
+  }
+
   /** @param {TabSession} session @param {boolean} disconnected @returns {Promise<void>} */
   async function cleanTabs(session, disconnected) {
     const results = await Promise.allSettled([...session.tabs].map(async ([id, status]) => {
@@ -70,6 +101,9 @@ export function createTabHandlers(driver, options) {
       else await driver.releaseTab?.(id);
       release(session, id);
     }));
+    if (session.tabs.size === 0 && session.group) {
+      session.group.groupId = null;
+    }
     const errors = results.filter((result) => result.status === "rejected");
     if (errors.length) throw new AggregateError(errors.map((error) => error.reason), "Browser tab cleanup failed");
   }
@@ -119,7 +153,16 @@ export function createTabHandlers(driver, options) {
       if (sessions.has(signal)) getSession(params, signal);
       else {
         /** @type {TabSession} */
-        const session = {id, turn: null, ended: new Set(), tabs: new Map(), attached: new Set(), notify};
+        const session = {
+          id,
+          turn: null,
+          ended: new Set(),
+          tabs: new Map(),
+          attached: new Set(),
+          group: null,
+          groupLock: Promise.resolve(),
+          notify,
+        };
         sessions.set(signal, session);
         connections.set(id, signal);
         signal.addEventListener("abort", () => {
@@ -131,6 +174,29 @@ export function createTabHandlers(driver, options) {
       }
       return {type: "extension", family: "chrome", name: options.name, version: options.version,
         capabilities: {browser: [], tab: []}, apiSupportOverrides: {"Tab.ax": false}};
+    }],
+    ["nameSession", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      const rawName = typeof params.name === "string" ? params.name.trim() : "";
+      if (!rawName) throw new Error("Session name must be a non-empty string");
+      const title = rawName.slice(0, 80);
+      const color = params.color === undefined ? "blue" : String(params.color);
+      if (!TAB_GROUP_COLORS.has(color)) {
+        throw new Error(`Invalid tab group color: ${color}`);
+      }
+      session.group = { title, color, groupId: session.group?.groupId ?? null };
+      let supported = Boolean(driver.groupTabs);
+      if (session.tabs.size > 0 && driver.groupTabs) {
+        const applied = await applySessionGroup(session, [...session.tabs.keys()]);
+        supported = applied.supported;
+      }
+      return {
+        title,
+        color,
+        groupId: session.group.groupId,
+        groupedTabs: session.tabs.size,
+        supported,
+      };
     }],
     ["createTab", async (params, signal) => {
       const session = activateTurn(params, signal);
@@ -144,6 +210,9 @@ export function createTabHandlers(driver, options) {
       }
       owners.set(tab.id, session);
       session.tabs.set(tab.id, null);
+      if (session.group && driver.groupTabs) {
+        await applySessionGroup(session, [tab.id]).catch(() => {});
+      }
       return tab;
     }],
     ["getTabs", async (params, signal) => {
@@ -225,6 +294,18 @@ export function createTabHandlers(driver, options) {
       }
       validatePageCommand(params.method, params.commandParams);
       return await driver.execute(id, params.method, params.commandParams, childSession);
+    });
+  }
+  if (driver.watchDownloads && driver.unwatchDownloads) {
+    handlers.set("watchDownloads", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      const id = requireOwnedTab(session, params.tabId);
+      await driver.watchDownloads(id);
+    });
+    handlers.set("unwatchDownloads", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      const id = requireOwnedTab(session, params.tabId);
+      await driver.unwatchDownloads(id);
     });
   }
   return handlers;

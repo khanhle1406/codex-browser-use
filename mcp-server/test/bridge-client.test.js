@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { listenBackend } from "../src/backend-transport.js";
-import { publishBackend } from "../src/backend-discovery.js";
+import { publishBackend, readBackend } from "../src/backend-discovery.js";
 import { createTabHandlers } from "../src/backend-tabs.js";
 import { BridgeBrowser } from "../src/bridge-browser.js";
 
@@ -119,6 +119,81 @@ test("BridgeBrowser rejects a descriptor that does not exist", async () => {
       /ENOENT|no such file/i,
     );
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("publishBackend recovers from a stale descriptor without clobbering newer inodes", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "browser-use-stale-"));
+  const descriptor = path.join(root, "bridge.json");
+  const handlers = createTabHandlers({
+    createBlankTab: async () => ({ id: 1 }),
+    readTab: async () => null,
+    closeTab: async () => {},
+    releaseTab: async () => {},
+    attach: async () => {},
+    detach: async () => {},
+    execute: async () => ({}),
+    onEvent: () => {},
+  }, { name: "Stale fixture", version: "1", childFrames: false });
+  const backend1 = await listenBackend(handlers);
+  const backend2 = await listenBackend(handlers);
+  try {
+    await writeFile(descriptor, JSON.stringify({
+      version: 1,
+      socketPath: path.join(root, "dead-socket", "rpc.sock"),
+    }), { mode: 0o600 });
+    const unpublish1 = await publishBackend(descriptor, backend1.socketPath);
+    assert.equal(await readBackend(descriptor), backend1.socketPath);
+
+    await backend1.close();
+    const unpublish2 = await publishBackend(descriptor, backend2.socketPath);
+    assert.equal(await readBackend(descriptor), backend2.socketPath);
+
+    await unpublish1();
+    assert.equal(await readBackend(descriptor), backend2.socketPath);
+    await unpublish2();
+  } finally {
+    await backend1.close().catch(() => {});
+    await backend2.close().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("publishBackend refuses symlink descriptors and active listening hosts", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "browser-use-live-"));
+  const handlers = createTabHandlers({
+    createBlankTab: async () => ({ id: 1 }),
+    readTab: async () => null,
+    closeTab: async () => {},
+    releaseTab: async () => {},
+    attach: async () => {},
+    detach: async () => {},
+    execute: async () => ({}),
+    onEvent: () => {},
+  }, { name: "Live fixture", version: "1", childFrames: false });
+  const backend1 = await listenBackend(handlers);
+  const backend2 = await listenBackend(handlers);
+  try {
+    const symlinkTarget = path.join(root, "target.json");
+    const symlinkDescriptor = path.join(root, "symlink-bridge.json");
+    await writeFile(symlinkTarget, "{}", { mode: 0o600 });
+    await symlink(symlinkTarget, symlinkDescriptor);
+    await assert.rejects(
+      () => publishBackend(symlinkDescriptor, backend1.socketPath),
+      /Refusing to replace non-regular or foreign browser bridge descriptor/,
+    );
+
+    const liveDescriptor = path.join(root, "live-bridge.json");
+    const unpublish1 = await publishBackend(liveDescriptor, backend1.socketPath);
+    await assert.rejects(
+      () => publishBackend(liveDescriptor, backend2.socketPath),
+      /Another live browser bridge host is already active/,
+    );
+    await unpublish1();
+  } finally {
+    await backend1.close().catch(() => {});
+    await backend2.close().catch(() => {});
     await rm(root, { recursive: true, force: true });
   }
 });

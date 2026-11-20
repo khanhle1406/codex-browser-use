@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { configureClient, installExtension } from "../src/install.js";
-import { EXTENSION_ID, EXTENSION_VERSION } from "../src/extension.js";
+import { configureClient, installExtension, installSkill } from "../src/install.js";
+import { EXTENSION_ID, EXTENSION_VERSION, extensionSource } from "../src/extension.js";
 
 async function extensionFixture(root, version = EXTENSION_VERSION) {
   const source = path.join(root, "source");
@@ -79,4 +79,36 @@ test("configureClient prints instead of writing when write is false or the clien
     () => configureClient({ client: "invented", bridgeFile: "/bridge.json", write: true, home }),
     /Unknown client/,
   );
+});
+
+test("installSkill writes SKILL.md into each client directory with backup on overwrite", async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), "browser-skill-home-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  const agy = await installSkill({ client: "antigravity", home });
+  assert.equal(agy.written, true);
+  assert.equal(agy.file, path.join(home, ".gemini", "config", "skills", "codex-browser-use", "SKILL.md"));
+  assert.equal(agy.backup, null);
+  assert.match(await readFile(agy.file, "utf8"), /browser_batch/);
+
+  await writeFile(agy.file, "old skill\n");
+  const updated = await installSkill({ client: "agy", home });
+  assert.equal(updated.backup, `${agy.file}.bak`);
+  assert.equal(await readFile(updated.backup, "utf8"), "old skill\n");
+
+  const cursor = await installSkill({ client: "cursor", home });
+  assert.equal(cursor.file, path.join(home, ".cursor", "skills", "codex-browser-use", "SKILL.md"));
+  const windsurf = await installSkill({ client: "windsurf", home });
+  assert.equal(windsurf.file, path.join(home, ".codeium", "windsurf", "skills", "codex-browser-use", "SKILL.md"));
+});
+
+test("bundled extension manifest bundles 16/32/48/128 PNG icons matching EXTENSION_VERSION", async () => {
+  const manifest = JSON.parse(await readFile(path.join(extensionSource, "manifest.json"), "utf8"));
+  assert.equal(manifest.version, EXTENSION_VERSION);
+  for (const size of ["16", "32", "48", "128"]) {
+    assert.equal(manifest.icons?.[size], `icons/icon-${size}.png`);
+    assert.equal(manifest.action?.default_icon?.[size], `icons/icon-${size}.png`);
+    const bytes = await readFile(path.join(extensionSource, manifest.icons[size]));
+    assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  }
 });

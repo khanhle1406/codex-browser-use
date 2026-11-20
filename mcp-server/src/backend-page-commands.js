@@ -1,14 +1,21 @@
+import path from "node:path";
+
 const pageCommands = new Set([
   "Accessibility.enable", "Accessibility.getFullAXTree", "Accessibility.getPartialAXTree",
-  "DOM.describeNode", "DOM.enable", "DOM.focus", "DOM.getBoxModel", "DOM.getContentQuads", "DOM.getDocument", "DOM.getFrameOwner",
-  "DOM.resolveNode", "DOM.scrollIntoViewIfNeeded",
+  "DOM.describeNode", "DOM.enable", "DOM.focus", "DOM.getBoxModel", "DOM.getContentQuads", "DOM.getDocument",
+  "DOM.getFrameOwner", "DOM.getNodeForLocation", "DOM.querySelector", "DOM.resolveNode",
+  "DOM.scrollIntoViewIfNeeded", "DOM.setFileInputFiles",
+  "DOMSnapshot.captureSnapshot",
+  "Emulation.clearDeviceMetricsOverride", "Emulation.setDeviceMetricsOverride",
   "Emulation.setFocusEmulationEnabled",
   "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Input.dispatchTouchEvent",
   "Input.insertText", "Input.synthesizeScrollGesture",
+  "Network.disable", "Network.enable",
   "Page.addScriptToEvaluateOnNewDocument", "Page.removeScriptToEvaluateOnNewDocument",
   "Page.bringToFront", "Page.captureScreenshot", "Page.createIsolatedWorld", "Page.enable", "Page.getFrameTree",
   "Page.getLayoutMetrics", "Page.getNavigationHistory", "Page.handleJavaScriptDialog",
   "Page.navigate", "Page.navigateToHistoryEntry", "Page.reload",
+  "Page.setInterceptFileChooserDialog", "Page.setLifecycleEventsEnabled",
   "Runtime.addBinding", "Runtime.callFunctionOn", "Runtime.enable", "Runtime.evaluate",
   "Runtime.releaseObject", "Runtime.releaseObjectGroup", "Runtime.removeBinding",
   "Target.setAutoAttach",
@@ -39,6 +46,24 @@ export function validatePageCommand(method, params) {
       (typeof params.accept !== "boolean" ||
         (params.promptText !== undefined && typeof params.promptText !== "string"))) {
     throw new Error("Invalid browser dialog response parameters");
+  }
+  if (method === "Page.setInterceptFileChooserDialog" && typeof params.enabled !== "boolean") {
+    throw new Error("Page.setInterceptFileChooserDialog requires a boolean enabled flag");
+  }
+  if (method === "Emulation.setDeviceMetricsOverride") {
+    const validSize = (value) => Number.isSafeInteger(value) && value >= 100 && value <= 4096;
+    if (!validSize(params.width) || !validSize(params.height) ||
+        typeof params.deviceScaleFactor !== "number" || !Number.isFinite(params.deviceScaleFactor) ||
+        params.deviceScaleFactor < 0 || params.deviceScaleFactor > 8 ||
+        typeof params.mobile !== "boolean") {
+      throw new Error("Invalid Emulation.setDeviceMetricsOverride viewport parameters");
+    }
+  }
+  if (method === "DOM.setFileInputFiles") {
+    if (!Array.isArray(params.files) || params.files.length === 0 ||
+        params.files.some((file) => typeof file !== "string" || file.length === 0 || !path.isAbsolute(file))) {
+      throw new Error("DOM.setFileInputFiles requires non-empty absolute file paths");
+    }
   }
   if (method === "Page.navigate") {
     if (typeof params.url === "string" && params.url.startsWith("about:blank")) return;

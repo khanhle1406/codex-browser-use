@@ -6,7 +6,7 @@ import { discoverEngine } from "../src/engine-discovery.js";
 import { defaultBridgeFile, readBackend } from "../src/backend-discovery.js";
 import { buildConfig, codexToml, normalizeClient } from "../src/config.js";
 import { EXTENSION_ID } from "../src/extension.js";
-import { configureClient, installExtension, installNativeHost } from "../src/install.js";
+import { configureClient, installExtension, installNativeHost, installSkill } from "../src/install.js";
 
 export { buildConfig };
 
@@ -53,10 +53,10 @@ export async function setupWorkspace(workspace, bridgeFile) {
 
 /**
  * @param {string[]} argv
- * @returns {{command:string, client?:string, enginePath?:string, bridgeFile?:string, workspace?:string, extensionId?:string, write:boolean, json:boolean, help:boolean}}
+ * @returns {{command:string, client?:string, enginePath?:string, bridgeFile?:string, workspace?:string, extensionId?:string, write:boolean, skill:boolean, json:boolean, help:boolean}}
  */
 function parseArgs(argv) {
-  const options = { command: argv[0] ?? "help", json: false, help: false, write: false };
+  const options = { command: argv[0] ?? "help", json: false, help: false, write: false, skill: false };
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i];
     if (["--client", "--engine", "--bridge", "--workspace", "--extension-id"].includes(arg)) {
@@ -68,6 +68,7 @@ function parseArgs(argv) {
       else if (arg === "--extension-id") options.extensionId = value;
       else options.workspace = value;
     } else if (arg === "--write") options.write = true;
+    else if (arg === "--skill") options.skill = true;
     else if (arg === "--json") options.json = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
     else throw new Error(`Unknown option: ${arg}`);
@@ -81,12 +82,12 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.help || ["help", "--help", "-h"].includes(options.command)) {
     process.stdout.write([
       "Usage:",
-      "  browser-use install [--client NAME] [--write] [--bridge FILE] [--extension-id ID] [--json]",
+      "  browser-use install [--client NAME] [--write] [--skill] [--bridge FILE] [--extension-id ID] [--json]",
       "  browser-use doctor [--bridge FILE] [--engine PATH] [--json]",
       "  browser-use config --client NAME [--bridge FILE]",
       "  browser-use setup --workspace DIR [--bridge FILE] [--json]",
       "",
-      "Clients: generic, claude_code, commandcode, copilot, antigravity, opencode, codex",
+      "Clients: generic, claude_code, commandcode, copilot, antigravity, cursor, windsurf, opencode, codex",
       "",
     ].join("\n"));
     return 0;
@@ -103,12 +104,16 @@ export async function main(argv = process.argv.slice(2)) {
     const client = options.client
       ? await configureClient({ client: options.client, bridgeFile, write: options.write })
       : null;
+    const skill = options.skill
+      ? await installSkill({ client: options.client ?? "generic" })
+      : null;
     const report = {
       ok: true,
       extension: { ...extension, loadUnpackedPath: extension.path },
       nativeHost,
       bridgeFile,
       client,
+      skill,
       next: [
         `Open chrome://extensions, enable Developer mode, and Load unpacked from ${extension.path}.`,
         "Click the Portable Browser Bridge toolbar action once; the badge shows ON.",
@@ -123,6 +128,7 @@ export async function main(argv = process.argv.slice(2)) {
       process.stdout.write(`Extension ${extension.version} at ${extension.path} (id ${extension.id})\n`);
       process.stdout.write(`Native host launcher: ${nativeHost.launcher}\n`);
       for (const manifest of nativeHost.manifests) process.stdout.write(`Native host manifest: ${manifest.file}\n`);
+      if (skill?.written) process.stdout.write(`Installed skill at ${skill.file}\n`);
       if (client) {
         if (client.written) process.stdout.write(`Updated ${client.file}\n`);
         else {

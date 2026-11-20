@@ -1,6 +1,7 @@
 import { createConnection } from "node:net";
 import { endianness } from "node:os";
 import { readBackend } from "./backend-discovery.js";
+import { FrameReader, encodeFrame } from "./frame-reader.js";
 
 const littleEndian = endianness() === "LE";
 const maxFrameBytes = 16 * 1024 * 1024;
@@ -25,7 +26,13 @@ export class BridgeClient {
     /** @type {Map<number,{resolve:(value:unknown)=>void, reject:(error:Error)=>void, timer:NodeJS.Timeout}>} */
     this.pending = new Map();
     this.nextId = 1;
-    this.buffer = Buffer.alloc(0);
+    this.reader = new FrameReader({
+      littleEndian,
+      maxFrameBytes,
+      maxBufferedBytes: 2 * (maxFrameBytes + 4),
+      overflowError: "Browser bridge input buffer exceeds limit",
+      lengthError: "Invalid browser bridge frame length",
+    });
     this.closed = false;
     this.connecting = null;
     /** @type {Set<(method:string, params:unknown)=>void>} */
@@ -90,7 +97,11 @@ export class BridgeClient {
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try {
-        socket.write(frame({ jsonrpc: "2.0", id, method, params }));
+        socket.write(encodeFrame({ jsonrpc: "2.0", id, method, params }, {
+          littleEndian,
+          maxFrameBytes,
+          overflowError: "Browser bridge request exceeds frame limit",
+        }));
       } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -101,24 +112,21 @@ export class BridgeClient {
 
   /** @param {Buffer} chunk @returns {void} */
   #onData(chunk) {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-    while (this.buffer.length >= 4) {
-      const length = littleEndian ? this.buffer.readUInt32LE() : this.buffer.readUInt32BE();
-      if (length < 1 || length > maxFrameBytes) {
-        this.#fail(new Error("Invalid browser bridge frame length"));
-        return;
+    try {
+      this.reader.push(chunk);
+      let body;
+      while ((body = this.reader.nextFrame()) !== null) {
+        let message;
+        try {
+          message = JSON.parse(body.toString("utf8"));
+        } catch (error) {
+          this.#fail(new Error(`Invalid browser bridge response: ${error.message}`));
+          return;
+        }
+        this.#dispatch(message);
       }
-      if (this.buffer.length < length + 4) return;
-      const body = this.buffer.subarray(4, length + 4);
-      this.buffer = this.buffer.subarray(length + 4);
-      let message;
-      try {
-        message = JSON.parse(body.toString("utf8"));
-      } catch (error) {
-        this.#fail(new Error(`Invalid browser bridge response: ${error.message}`));
-        return;
-      }
-      this.#dispatch(message);
+    } catch (error) {
+      this.#fail(error instanceof Error ? error : new Error(String(error)));
     }
   }
 
@@ -170,14 +178,4 @@ export class BridgeClient {
       setTimeout(() => socket.destroy(), 1_000).unref();
     });
   }
-}
-
-/** @param {Record<string, unknown>} message @returns {Buffer} */
-function frame(message) {
-  const body = Buffer.from(JSON.stringify(message));
-  if (body.length > maxFrameBytes) throw new Error("Browser bridge request exceeds frame limit");
-  const header = Buffer.alloc(4);
-  if (littleEndian) header.writeUInt32LE(body.length);
-  else header.writeUInt32BE(body.length);
-  return Buffer.concat([header, body]);
 }

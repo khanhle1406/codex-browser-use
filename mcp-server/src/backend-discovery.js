@@ -1,6 +1,7 @@
-import { lstat, mkdir, open, link, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, link, rename, unlink } from "node:fs/promises";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
+import net from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -20,19 +21,82 @@ async function privateDirectory(file, create) {
   }
 }
 
+/** @param {string} socketPath @returns {Promise<boolean>} */
+function isSocketAlive(socketPath) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = net.createConnection({path: socketPath});
+    const finish = (alive) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(alive);
+    };
+    const timer = setTimeout(() => finish(false), 300);
+    timer.unref?.();
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+/** @param {string} file @returns {Promise<boolean>} */
+async function isDescriptorLive(file) {
+  let info;
+  try {
+    info = await lstat(file);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!info.isFile() || info.uid !== process.getuid?.()) {
+    throw new Error("Refusing to replace non-regular or foreign browser bridge descriptor");
+  }
+  try {
+    const existingSocket = await readBackend(file);
+    return await isSocketAlive(existingSocket);
+  } catch {
+    return false;
+  }
+}
+
 /** @param {string} file @param {string} socketPath @returns {Promise<()=>Promise<void>>} */
 export async function publishBackend(file, socketPath) {
   await privateDirectory(file, true);
   const temporary = path.join(path.dirname(file), `.bridge-${randomUUID()}`);
   const handle = await open(temporary, "wx", 0o600);
+  let publishedIno;
+  let renamed = false;
   try {
     await handle.writeFile(JSON.stringify({version: 1, socketPath}));
-    await link(temporary, file);
+    publishedIno = (await handle.stat()).ino;
+    try {
+      await link(temporary, file);
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let live = await isDescriptorLive(file);
+      for (let attempt = 0; attempt < 4 && live; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        live = await isDescriptorLive(file);
+      }
+      if (live) {
+        throw new Error("Another live browser bridge host is already active");
+      }
+      await rename(temporary, file);
+      renamed = true;
+    }
   } finally {
     await handle.close();
-    await unlink(temporary);
+    if (!renamed) await unlink(temporary).catch(() => {});
   }
-  return async () => { await unlink(file); };
+  return async () => {
+    try {
+      const current = await lstat(file);
+      if (current.ino === publishedIno) await unlink(file);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  };
 }
 
 /** @param {string} file @returns {Promise<string>} */

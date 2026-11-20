@@ -1,10 +1,24 @@
 {
   "manifest_version": 3,
   "name": "Portable Browser Bridge",
-  "version": "0.2.0",
+  "version": "0.5.2",
   "description": "Connect the local Browser Use adapter to tabs created by this extension.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAndsDSeracZtACjaqft8oQdoYjz6RoOgdRBtxkFEjEXU360H9JMUP1V6+V0QwvvpktvBV0sIByD3BpzcnTRrAq+f/673hymrxQuWPpviCSm4ij7ZW7AOjoncX1g31jXbya7ot0bJIaZXS6NGqndnIlAODYOGAxwZkoLr/6nW4nL5wRXQL+OOy3N1YzCHjueH8P9Pt8TYbsez81CZ9BZPSUf12xM8eVO8ipMDfdNZzmVxBkUjHFRHq8Y4RqOhoA1zvvlpLCtGM0vrLWyeZ//TI8k7EW9K+TvBm1mqEb5SCxXeSsqsyQanG5iM3KjoJR93VduElvLE24SWTaTgRhdN8OwIDAQAB",
-  "permissions": ["nativeMessaging", "tabs", "debugger"],
+  "permissions": ["nativeMessaging", "tabs", "debugger", "downloads", "tabGroups"],
   "background": {"service_worker": "background.js"},
-  "action": {"default_title": "Connect or disconnect Portable Browser Bridge"}
+  "action": {
+    "default_title": "Connect or disconnect Portable Browser Bridge",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  }
 }

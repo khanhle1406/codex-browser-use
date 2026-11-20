@@ -2,9 +2,12 @@ import { createServer } from "node:net";
 import { mkdtemp, rmdir } from "node:fs/promises";
 import { endianness, tmpdir } from "node:os";
 import path from "node:path";
+import { FrameReader, encodeFrame } from "./frame-reader.js";
 
 const littleEndian = endianness() === "LE";
 const maxFrameBytes = 16 * 1024 * 1024;
+const maxInFlightRequests = 32;
+const barrierMethods = new Set(["turnEnded", "finalizeTabs"]);
 
 /** @typedef {Record<string, unknown>} RpcParams */
 /** @typedef {(method:string,params:RpcParams)=>void} Notify */
@@ -18,75 +21,101 @@ function isRecord(value) {
 /** @param {import("node:net").Socket} socket @param {ReadonlyMap<string,RpcHandler>} handlers @returns {void} */
 function serveConnection(socket, handlers) {
   const lifetime = new AbortController();
-  let buffered = Buffer.alloc(0);
-  let busy = false;
+  const reader = new FrameReader({
+    littleEndian,
+    maxFrameBytes,
+    maxBufferedBytes: 2 * (maxFrameBytes + 4),
+    overflowError: "Browser backend input queue exceeds limit",
+    lengthError: "Invalid browser backend frame length",
+  });
+  /** @type {Set<Promise<void>>} */
+  const inFlight = new Set();
+  let draining = false;
+  let barrierActive = false;
 
   /** @param {object} response @returns {void} */
   function reply(response) {
     if (socket.destroyed) return;
-    const body = Buffer.from(JSON.stringify({jsonrpc: "2.0", ...response}));
-    if (body.length > maxFrameBytes) throw new Error("Browser backend response exceeds frame limit");
-    if (socket.writableLength + body.length + 4 > 2 * (maxFrameBytes + 4)) {
+    const packet = encodeFrame({ jsonrpc: "2.0", ...response }, {
+      littleEndian,
+      maxFrameBytes,
+      overflowError: "Browser backend response exceeds frame limit",
+    });
+    if (socket.writableLength + packet.length > 2 * (maxFrameBytes + 4)) {
       throw new Error("Browser backend output queue exceeds limit");
     }
-    const header = Buffer.alloc(4);
-    if (littleEndian) header.writeUInt32LE(body.length);
-    else header.writeUInt32BE(body.length);
-    socket.write(Buffer.concat([header, body]));
-  }
-
-  /** @param {Buffer} body @returns {Promise<void>} */
-  async function dispatch(body) {
-    const request = JSON.parse(body.toString("utf8"));
-    if (!isRecord(request) || request.jsonrpc !== "2.0" || !Number.isSafeInteger(request.id) ||
-        typeof request.method !== "string" || !isRecord(request.params)) {
-      throw new Error("Invalid browser backend request");
-    }
-    const handler = handlers.get(request.method);
-    if (!handler) {
-      reply({id: request.id, error: {code: -32601, message: `No handler registered for method: ${request.method}`}});
-      return;
-    }
-    try {
-      const result = await handler(request.params, lifetime.signal, notify);
-      reply({id: request.id, result: result ?? null});
-    } catch (error) {
-      reply({id: request.id, error: {code: -32000, message: error instanceof Error ? error.message : String(error)}});
-    }
+    socket.write(packet);
   }
 
   /** @type {Notify} */
   function notify(method, params) {
-    try { reply({method, params}); }
+    try { reply({ method, params }); }
     catch (error) { socket.destroy(error); }
+  }
+
+  /** @param {{id:number,method:string,params:RpcParams}} request @returns {Promise<void>} */
+  async function dispatchRequest(request) {
+    const handler = handlers.get(request.method);
+    if (!handler) {
+      // Yield one microtask so an immediately-preceding async handler isn't overtaken on the same tick.
+      await Promise.resolve();
+      reply({ id: request.id, error: { code: -32601, message: `No handler registered for method: ${request.method}` } });
+      return;
+    }
+    try {
+      const result = await handler(request.params, lifetime.signal, notify);
+      reply({ id: request.id, result: result ?? null });
+    } catch (error) {
+      reply({ id: request.id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } });
+    }
   }
 
   /** @returns {Promise<void>} */
   async function drain() {
-    busy = true;
+    if (draining || barrierActive || socket.destroyed) return;
+    draining = true;
     try {
-      while (!socket.destroyed && buffered.length >= 4) {
-        const length = littleEndian ? buffered.readUInt32LE() : buffered.readUInt32BE();
-        if (length < 1 || length > maxFrameBytes) throw new Error("Invalid browser backend frame length");
-        if (buffered.length < length + 4) break;
-        const body = buffered.subarray(4, length + 4);
-        buffered = buffered.subarray(length + 4);
-        await dispatch(body);
+      while (!socket.destroyed && !barrierActive && inFlight.size < maxInFlightRequests) {
+        const body = reader.nextFrame();
+        if (!body) break;
+        const request = JSON.parse(body.toString("utf8"));
+        if (!isRecord(request) || request.jsonrpc !== "2.0" || !Number.isSafeInteger(request.id) ||
+            typeof request.method !== "string" || !isRecord(request.params)) {
+          throw new Error("Invalid browser backend request");
+        }
+        if (barrierMethods.has(request.method)) {
+          barrierActive = true;
+          try {
+            if (inFlight.size > 0) await Promise.allSettled([...inFlight]);
+            await dispatchRequest(request);
+          } finally {
+            barrierActive = false;
+          }
+          continue;
+        }
+        const task = dispatchRequest(request)
+          .catch((error) => { socket.destroy(error); })
+          .finally(() => {
+            inFlight.delete(task);
+            if (!draining && !socket.destroyed && !barrierActive) void drain();
+          });
+        inFlight.add(task);
       }
     } catch (error) {
       socket.destroy(error);
     } finally {
-      busy = false;
+      draining = false;
     }
   }
 
   socket.on("data", (chunk) => {
-    if (buffered.length + chunk.length > 2 * (maxFrameBytes + 4)) {
-      socket.destroy(new Error("Browser backend input queue exceeds limit"));
+    try {
+      reader.push(chunk);
+    } catch (error) {
+      socket.destroy(error);
       return;
     }
-    buffered = Buffer.concat([buffered, chunk]);
-    if (!busy) void drain();
+    if (!draining && !barrierActive) void drain();
   });
   socket.on("error", (error) => lifetime.abort(error));
   socket.on("close", () => lifetime.abort());

@@ -48,6 +48,81 @@ test("private backend handles split frames and rejects unsupported methods", { t
   assert.deepEqual(denied, {jsonrpc: "2.0", id: 1, error: {code: -32601, message: "No handler registered for method: unsupported"}});
 });
 
+test("private backend pipelines concurrent RPCs without HoL blocking, enforces turn barrier, and decodes fragmented large frames", { timeout: 3000 }, async (t) => {
+  const order = [];
+  let fastStartedWhileSlowPending = false;
+  let releaseSlow;
+  const slowGate = new Promise((resolve) => { releaseSlow = resolve; });
+
+  const backend = await listenBackend(new Map([
+    ["slow", async () => {
+      order.push("slow:start");
+      await slowGate;
+      order.push("slow:end");
+      return { ok: "slow" };
+    }],
+    ["fast", async (params) => {
+      order.push(`fast:${params.n ?? 0}`);
+      if (!order.includes("slow:end")) fastStartedWhileSlowPending = true;
+      return { ok: "fast", len: typeof params.payload === "string" ? params.payload.length : 0 };
+    }],
+    ["turnEnded", async () => {
+      order.push("turnEnded");
+      return null;
+    }],
+  ]));
+  t.after(() => backend.close());
+
+  const socket = createConnection(backend.socketPath);
+  await once(socket, "connect");
+  const replies = [];
+  const waitForReply = new Map();
+  let rx = Buffer.alloc(0);
+  socket.on("data", (chunk) => {
+    rx = Buffer.concat([rx, chunk]);
+    while (rx.length >= 4) {
+      const length = endianness() === "LE" ? rx.readUInt32LE() : rx.readUInt32BE();
+      if (rx.length < length + 4) break;
+      const msg = JSON.parse(rx.subarray(4, length + 4).toString("utf8"));
+      rx = rx.subarray(length + 4);
+      replies.push(msg);
+      waitForReply.get(msg.id)?.(msg);
+    }
+  });
+  const awaitId = (id) => new Promise((resolve) => {
+    const existing = replies.find((r) => r.id === id);
+    if (existing) { resolve(existing); return; }
+    waitForReply.set(id, resolve);
+  });
+
+  // 1. Slow request starts, then fast request completes before slow finishes (no HoL blocking).
+  socket.write(Buffer.concat([
+    frame({ jsonrpc: "2.0", id: 10, method: "slow", params: {} }),
+    frame({ jsonrpc: "2.0", id: 11, method: "fast", params: { n: 1 } }),
+    frame({ jsonrpc: "2.0", id: 12, method: "turnEnded", params: {} }),
+  ]));
+  const fastReply = await awaitId(11);
+  assert.deepEqual(fastReply.result, { ok: "fast", len: 0 });
+  assert.equal(fastStartedWhileSlowPending, true);
+  assert.equal(replies.some((r) => r.id === 12), false, "turnEnded must wait for slow in-flight RPC");
+
+  releaseSlow();
+  const [slowReply, turnReply] = await Promise.all([awaitId(10), awaitId(12)]);
+  assert.deepEqual(slowReply.result, { ok: "slow" });
+  assert.equal(turnReply.result, null);
+  assert.equal(order.indexOf("turnEnded") > order.indexOf("slow:end"), true);
+
+  // 2. Fragmented 200KB request split across arbitrary tiny chunks.
+  const largePayload = "Z".repeat(200_000);
+  const largeFrame = frame({ jsonrpc: "2.0", id: 13, method: "fast", params: { payload: largePayload } });
+  for (let off = 0; off < largeFrame.length; off += 4_096) {
+    socket.write(largeFrame.subarray(off, off + 4_096));
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  const largeReply = await awaitId(13);
+  assert.equal(largeReply.result.len, 200_000);
+});
+
 test("original browser engine discovers the project-owned fixture via framed RPC", {
   skip: !process.env.BROWSER_USE_TEST_ENGINE,
   timeout: 15000,

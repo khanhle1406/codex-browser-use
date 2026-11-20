@@ -15,10 +15,6 @@ const mutatingMethods = new Set([
   "writeln",
 ]);
 
-const mutatingObjects = new Set([
-  "classList", "dataset", "style",
-]);
-
 const mutatingNamespaces = new Map([
   ["localStorage", new Set(["clear", "removeItem", "setItem"])],
   ["sessionStorage", new Set(["clear", "removeItem", "setItem"])],
@@ -28,6 +24,10 @@ const mutatingNamespaces = new Map([
   ["clipboard", new Set(["write", "writeText"])],
   ["indexedDB", new Set(["deleteDatabase", "open"])],
   ["caches", new Set(["delete", "open"])],
+  ["classList", new Set(["add", "remove", "toggle", "replace"])],
+  ["style", new Set(["setProperty", "removeProperty"])],
+  ["Object", new Set(["assign", "defineProperty", "defineProperties", "setPrototypeOf"])],
+  ["Reflect", new Set(["set", "deleteProperty", "defineProperty", "setPrototypeOf"])],
 ]);
 
 const forbiddenCalls = new Set(["eval", "fetch", "import", "require"]);
@@ -52,22 +52,140 @@ export function assertReadOnly(source) {
       throw new Error(`Browser evaluate could not parse the expression: ${error.message}`);
     }
   }
-  const violation = findViolation(ast);
+  const violation = findViolation(ast, []);
   if (violation) throw new Error(`Browser evaluate is read-only: ${violation}`);
   return source;
 }
 
+const SCOPE_CREATORS = new Set([
+  "Program", "BlockStatement", "FunctionDeclaration", "FunctionExpression",
+  "ArrowFunctionExpression", "ForStatement", "ForInStatement", "ForOfStatement",
+  "CatchClause",
+]);
+
+/** @param {any} pattern @param {Set<string>} out */
+function collectPatternIdentifiers(pattern, out) {
+  if (!pattern || typeof pattern !== "object") return;
+  switch (pattern.type) {
+    case "Identifier":
+      out.add(pattern.name);
+      break;
+    case "ObjectPattern":
+      for (const prop of pattern.properties ?? []) {
+        collectPatternIdentifiers(prop?.type === "Property" ? prop.value : prop, out);
+      }
+      break;
+    case "ArrayPattern":
+      for (const elem of pattern.elements ?? []) {
+        if (elem) collectPatternIdentifiers(elem, out);
+      }
+      break;
+    case "RestElement":
+      collectPatternIdentifiers(pattern.argument, out);
+      break;
+    case "AssignmentPattern":
+      collectPatternIdentifiers(pattern.left, out);
+      break;
+    default:
+      break;
+  }
+}
+
+/** @param {any} node @param {Set<string>} out */
+function collectHoistedVars(node, out) {
+  if (!node || typeof node !== "object") return;
+  if (["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"].includes(node.type)) return;
+  if (node.type === "VariableDeclaration" && node.kind === "var") {
+    for (const decl of node.declarations ?? []) collectPatternIdentifiers(decl.id, out);
+    return;
+  }
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) {
+      for (const child of value) collectHoistedVars(child, out);
+    } else if (value && typeof value === "object") {
+      collectHoistedVars(value, out);
+    }
+  }
+}
+
+/** @param {any} statements @param {Set<string>} scope */
+function collectDirectDeclarations(statements, scope) {
+  for (const stmt of Array.isArray(statements) ? statements : []) {
+    if (!stmt || typeof stmt !== "object") continue;
+    if (stmt.type === "VariableDeclaration") {
+      for (const decl of stmt.declarations ?? []) collectPatternIdentifiers(decl.id, scope);
+    } else if ((stmt.type === "FunctionDeclaration" || stmt.type === "ClassDeclaration") && stmt.id?.name) {
+      scope.add(stmt.id.name);
+    }
+  }
+}
+
+/** @param {any} node @returns {Set<string>} */
+function createScopeForNode(node) {
+  const scope = new Set();
+  const type = node.type;
+  if (type === "Program" || type === "BlockStatement") {
+    collectDirectDeclarations(node.body, scope);
+    if (type === "Program") {
+      for (const stmt of node.body ?? []) collectHoistedVars(stmt, scope);
+    }
+  } else if (type === "FunctionDeclaration" || type === "FunctionExpression" || type === "ArrowFunctionExpression") {
+    if (node.id?.name) scope.add(node.id.name);
+    for (const param of node.params ?? []) collectPatternIdentifiers(param, scope);
+    if (node.body?.type === "BlockStatement") {
+      collectDirectDeclarations(node.body.body, scope);
+      for (const stmt of node.body.body ?? []) collectHoistedVars(stmt, scope);
+    }
+  } else if (type === "ForStatement") {
+    if (node.init?.type === "VariableDeclaration") {
+      for (const decl of node.init.declarations ?? []) collectPatternIdentifiers(decl.id, scope);
+    }
+  } else if (type === "ForInStatement" || type === "ForOfStatement") {
+    if (node.left?.type === "VariableDeclaration") {
+      for (const decl of node.left.declarations ?? []) collectPatternIdentifiers(decl.id, scope);
+    }
+  } else if (type === "CatchClause" && node.param) {
+    collectPatternIdentifiers(node.param, scope);
+  }
+  return scope;
+}
+
+/** @param {string} name @param {Array<Set<string>>} scopes @returns {boolean} */
+function isLocalIdentifier(name, scopes) {
+  for (let i = scopes.length - 1; i >= 0; i--) {
+    if (scopes[i].has(name)) return true;
+  }
+  return false;
+}
+
 /**
  * @param {unknown} node
+ * @param {Array<Set<string>>} scopes
  * @returns {string|null}
  */
-function findViolation(node) {
+function findViolation(node, scopes = []) {
   if (!node || typeof node !== "object") return null;
   const record = /** @type {Record<string, unknown>} */ (node);
   const type = record.type;
 
-  if (type === "AssignmentExpression") return "assignment is not allowed";
-  if (type === "UpdateExpression") return "increment and decrement are not allowed";
+  const activeScopes = SCOPE_CREATORS.has(String(type))
+    ? [...scopes, createScopeForNode(record)]
+    : scopes;
+
+  if (type === "AssignmentExpression") {
+    const left = /** @type {any} */ (record.left);
+    if (left?.type !== "Identifier" || !isLocalIdentifier(left.name, activeScopes)) {
+      return "assignment is not allowed";
+    }
+    return findViolation(record.right, activeScopes);
+  }
+  if (type === "UpdateExpression") {
+    const arg = /** @type {any} */ (record.argument);
+    if (arg?.type !== "Identifier" || !isLocalIdentifier(arg.name, activeScopes)) {
+      return "increment and decrement are not allowed";
+    }
+    return null;
+  }
   if (type === "UnaryExpression" && record.operator === "delete") return "delete is not allowed";
   if (type === "ImportExpression") return "dynamic import is not allowed";
   if (type === "NewExpression" && record.callee && /** @type {any} */ (record.callee).name === "Function") {
@@ -92,21 +210,14 @@ function findViolation(node) {
     }
   }
 
-  if (type === "MemberExpression" && !record.computed) {
-    const property = /** @type {any} */ (record.property)?.name;
-    if (typeof property === "string" && mutatingObjects.has(property)) {
-      return `${property} access is not allowed`;
-    }
-  }
-
   for (const value of Object.values(record)) {
     if (Array.isArray(value)) {
       for (const child of value) {
-        const violation = findViolation(child);
+        const violation = findViolation(child, activeScopes);
         if (violation) return violation;
       }
     } else if (value && typeof value === "object") {
-      const violation = findViolation(value);
+      const violation = findViolation(value, activeScopes);
       if (violation) return violation;
     }
   }

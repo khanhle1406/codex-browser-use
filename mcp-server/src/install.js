@@ -1,4 +1,4 @@
-import { cp, copyFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { cp, copyFile, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { homedir } from "node:os";
@@ -12,9 +12,24 @@ import {
   installedExtensionDir,
   nativeHostLauncher,
 } from "./extension.js";
-import { buildConfig, clientTarget, normalizeClient } from "./config.js";
+import { buildConfig, clientSkillTarget, clientTarget, normalizeClient, stableNodePath } from "./config.js";
 
 const nativeHostEntry = fileURLToPath(new URL("../bin/chrome-native-host.js", import.meta.url));
+const repoSkillSource = fileURLToPath(new URL("../../skill/SKILL.md", import.meta.url));
+const localSkillSource = fileURLToPath(new URL("../skill/SKILL.md", import.meta.url));
+
+/** @returns {Promise<string>} */
+async function resolveDefaultSkillSource() {
+  for (const candidate of [repoSkillSource, localSkillSource]) {
+    try {
+      const info = await stat(candidate);
+      if (info.isFile()) return candidate;
+    } catch {
+      // Try next location.
+    }
+  }
+  throw new Error("Bundled Browser Use skill (skill/SKILL.md) was not found");
+}
 
 /** @param {string} value */
 function shellQuote(value) {
@@ -89,7 +104,7 @@ async function backupDirectory(destination) {
     throw error;
   }
   const backup = `${destination}.bak`;
-  await unlink(backup).catch(() => {});
+  await rm(backup, { recursive: true, force: true });
   await rename(destination, backup);
   return backup;
 }
@@ -123,7 +138,7 @@ export function nativeMessagingDirs() {
  */
 export async function installNativeHost({ extensionId = EXTENSION_ID, bridgeFile = defaultBridgeFile() } = {}) {
   const launcher = nativeHostLauncher();
-  const script = `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(nativeHostEntry)} ${shellQuote(path.resolve(bridgeFile))}\n`;
+  const script = `#!/bin/sh\nexec ${shellQuote(stableNodePath())} ${shellQuote(nativeHostEntry)} ${shellQuote(path.resolve(bridgeFile))}\n`;
   await writeAtomic(launcher, script, 0o700);
   const manifest = {
     name: HOST_NAME,
@@ -177,4 +192,19 @@ export async function configureClient({ client, bridgeFile = defaultBridgeFile()
   const backup = await backupOnce(target.file);
   await writeAtomic(target.file, `${JSON.stringify(merged, null, 2)}\n`, 0o600);
   return { written: true, file: target.file, backup, config };
+}
+
+/**
+ * Install the Browser Use skill markdown into a client's standard skills directory.
+ * @param {{client?:string, home?:string, source?:string}} [options]
+ * @returns {Promise<{written:boolean, client:string, file:string, backup:string|null}>}
+ */
+export async function installSkill({ client = "generic", home = homedir(), source } = {}) {
+  const name = normalizeClient(client);
+  const target = clientSkillTarget(name, home);
+  const src = source ? path.resolve(source) : await resolveDefaultSkillSource();
+  const content = await readFile(src, "utf8");
+  const backup = await backupOnce(target);
+  await writeAtomic(target, content, 0o644);
+  return { written: true, client: name, file: target, backup };
 }

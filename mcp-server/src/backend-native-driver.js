@@ -1,7 +1,9 @@
 import { endianness } from "node:os";
+import { FrameReader, encodeFrame } from "./frame-reader.js";
 
 const littleEndian = endianness() === "LE";
-const maxMessage = 1024 * 1024;
+const maxMessage = 2 * 1024 * 1024;
+const maxChunkChars = 512 * 1024;
 const maxUnacknowledged = 128;
 /** @typedef {{id:number,title?:string,url?:string,active?:boolean}} BrowserTab */
 /** @typedef {Record<string,unknown>} Params */
@@ -12,7 +14,7 @@ const maxUnacknowledged = 128;
  * @param {import("node:stream").Readable} input
  * @param {import("node:stream").Writable} output
  * @param {{timeoutMs?:number}} [options]
- * @returns {{createBlankTab:()=>Promise<BrowserTab>,readTab:(id:number)=>Promise<BrowserTab|null>,closeTab:(id:number)=>Promise<void>,releaseTab:(id:number)=>Promise<void>,attach:(id:number)=>Promise<void>,detach:(id:number)=>Promise<void>,execute:(id:number,method:string,params:Params,childSession?:string)=>Promise<unknown>,onEvent:(listener:EventListener)=>void,closed:Promise<Error>,close:()=>void}}
+ * @returns {{createBlankTab:()=>Promise<BrowserTab>,readTab:(id:number)=>Promise<BrowserTab|null>,closeTab:(id:number)=>Promise<void>,releaseTab?:(id:number)=>Promise<void>,attach:(id:number)=>Promise<void>,detach:(id:number)=>Promise<void>,execute:(id:number,method:string,params:Params,childSession?:string)=>Promise<unknown>,navigate:(id:number,url:string)=>Promise<void>,watchDownloads:(id:number)=>Promise<void>,unwatchDownloads:(id:number)=>Promise<void>,groupTabs:(tabIds:number[],groupOptions?:{title?:string,color?:string,groupId?:number|null})=>Promise<{groupId:number|null,supported?:boolean}>,onEvent:(listener:EventListener)=>void,closed:Promise<Error>,close:()=>void}}
  */
 export function createNativeTabDriver(input, output, options = {}) {
   /** @type {Map<number,{resolve:(result:unknown)=>void,reject:(error:Error)=>void,timer:ReturnType<typeof setTimeout>,parts:string[]}>} */
@@ -25,7 +27,13 @@ export function createNativeTabDriver(input, output, options = {}) {
   let onEvent;
   const closed = Promise.withResolvers();
   let nextId = 0;
-  let buffer = Buffer.alloc(0);
+  const reader = new FrameReader({
+    littleEndian,
+    maxFrameBytes: maxMessage,
+    maxBufferedBytes: 4 * maxMessage,
+    overflowError: "Invalid Chrome native message size",
+    lengthError: "Invalid Chrome native message size",
+  });
   /** @type {Error | undefined} */
   let failure;
 
@@ -45,14 +53,11 @@ export function createNativeTabDriver(input, output, options = {}) {
 
   input.on("data", (chunk) => {
     if (failure) return;
-    buffer = Buffer.concat([buffer, chunk]);
     try {
-      while (buffer.length >= 4) {
-        const length = littleEndian ? buffer.readUInt32LE() : buffer.readUInt32BE();
-        if (length < 1 || length > maxMessage) throw new Error("Invalid Chrome native message size");
-        if (buffer.length < length + 4) return;
-        const reply = JSON.parse(buffer.subarray(4, length + 4));
-        buffer = buffer.subarray(length + 4);
+      reader.push(chunk);
+      let raw;
+      while ((raw = reader.nextFrame()) !== null) {
+        const reply = JSON.parse(raw.toString("utf8"));
         if (["onCDPEvent", "onCDPDetach"].includes(reply?.event) && Number.isSafeInteger(reply.tabId)) {
           onEvent?.(reply.event, reply.tabId, reply.params);
           continue;
@@ -70,7 +75,7 @@ export function createNativeTabDriver(input, output, options = {}) {
         }
         if (!item) throw new Error("Invalid Chrome native response ID");
         if (typeof reply.chunk === "string") {
-          if (reply.index !== item.parts.length || item.parts.length >= 64 || reply.chunk.length > 128 * 1024 ||
+          if (reply.index !== item.parts.length || item.parts.length >= 64 || reply.chunk.length > maxChunkChars ||
               typeof reply.final !== "boolean") throw new Error("Invalid Chrome native chunk");
           item.parts.push(reply.chunk);
           if (!reply.final) continue;
@@ -105,10 +110,11 @@ export function createNativeTabDriver(input, output, options = {}) {
       }
     }
     const id = ++nextId;
-    const body = Buffer.from(JSON.stringify({id, method, tabId, details}));
-    const header = Buffer.alloc(4);
-    if (littleEndian) header.writeUInt32LE(body.length);
-    else header.writeUInt32BE(body.length);
+    const packet = encodeFrame({ id, method, tabId, details }, {
+      littleEndian,
+      maxFrameBytes: maxMessage,
+      overflowError: "Invalid Chrome native message size",
+    });
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const operation = typeof details?.method === "string" ? details.method : method;
@@ -121,8 +127,8 @@ export function createNativeTabDriver(input, output, options = {}) {
         expiredCountsByTab.set(tabId, (expiredCountsByTab.get(tabId) ?? 0) + 1);
         reject(new Error(`Chrome native operation timed out: ${operation}. Chrome may still complete it.`));
       }, options.timeoutMs ?? 10000);
-      pending.set(id, {resolve, reject, timer, parts: []});
-      output.write(Buffer.concat([header, body]), (error) => {
+      pending.set(id, { resolve, reject, timer, parts: [] });
+      output.write(packet, (error) => {
         if (error) fail(error);
       });
     });
@@ -156,6 +162,19 @@ export function createNativeTabDriver(input, output, options = {}) {
     async execute(id, method, params, childSession) { return await request("execute", id, {method, params, childSession}); },
     /** @param {number} id @param {string} url @returns {Promise<void>} */
     async navigate(id, url) { await request("navigate", id, {url}); },
+    /** @param {number} id @returns {Promise<void>} */
+    async watchDownloads(id) { await request("watchDownloads", id); },
+    /** @param {number} id @returns {Promise<void>} */
+    async unwatchDownloads(id) { await request("unwatchDownloads", id); },
+    /** @param {number[]} tabIds @param {{title?:string,color?:string,groupId?:number|null}} [groupOptions] @returns {Promise<{groupId:number|null,supported?:boolean}>} */
+    async groupTabs(tabIds, groupOptions = {}) {
+      return await request("groupTabs", undefined, {
+        tabIds,
+        title: groupOptions.title,
+        color: groupOptions.color,
+        groupId: groupOptions.groupId ?? null,
+      });
+    },
     /** @param {EventListener} listener @returns {void} */
     onEvent(listener) { onEvent = listener; },
     closed: closed.promise,
