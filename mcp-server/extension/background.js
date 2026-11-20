@@ -21,6 +21,10 @@ const COMPACT_EVENTS = new Set([
 ]);
 /** @type {(() => void) | null} */
 let disconnectActive = null;
+let manualDisconnect = false;
+/** @type {ReturnType<typeof setTimeout> | null} */
+let reconnectTimer = null;
+let reconnectAttempts = 0;
 
 /** @param {chrome.tabs.Tab} tab @returns {{id:number,url?:string,title?:string,active:boolean}} */
 function serializeTab(tab) {
@@ -309,10 +313,20 @@ function connect() {
         if (result.status === "rejected") console.warn("Portable Browser Bridge tab cleanup:", result.reason);
       }
     });
+    if (!manualDisconnect && chrome.runtime?.id && typeof setTimeout === "function" && reconnectAttempts < 5) {
+      const delayMs = Math.min(10_000, 1_500 * (2 ** reconnectAttempts));
+      reconnectAttempts += 1;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!disconnectActive && !manualDisconnect) connect();
+      }, delayMs);
+    }
   }
 
   port.onMessage.addListener(async (request) => {
     if (!Number.isSafeInteger(request?.id)) return;
+    reconnectAttempts = 0;
     let reply;
     try { reply = {id: request.id, ok: true, value: await handle(request)}; }
     catch (error) { reply = {id: request.id, ok: false, error: error.message}; }
@@ -343,13 +357,36 @@ function connect() {
 }
 
 chrome.action.onClicked.addListener(() => {
-  if (disconnectActive) disconnectActive();
-  else connect();
+  if (disconnectActive) {
+    manualDisconnect = true;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    disconnectActive();
+  } else {
+    manualDisconnect = false;
+    reconnectAttempts = 0;
+    connect();
+  }
 });
 
 const autoConnect = () => {
-  if (!disconnectActive) connect();
+  if (!disconnectActive && !manualDisconnect) {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    connect();
+  }
 };
 
-chrome.runtime.onInstalled?.addListener(autoConnect);
-chrome.runtime.onStartup?.addListener(autoConnect);
+const resetAndAutoConnect = () => {
+  manualDisconnect = false;
+  reconnectAttempts = 0;
+  autoConnect();
+};
+
+chrome.runtime.onInstalled?.addListener(resetAndAutoConnect);
+chrome.runtime.onStartup?.addListener(resetAndAutoConnect);
+if (chrome.runtime?.id) autoConnect();

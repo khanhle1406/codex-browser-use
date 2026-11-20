@@ -187,3 +187,48 @@ test("extension forwards compact CDP events and chunks large replies at 512KB", 
   assert.equal(sent[1].final, true);
   assert.equal(JSON.parse(sent[0].chunk + sent[1].chunk).data.length, 600_000);
 });
+
+test("extension auto-connects on service worker wake-up and skips reconnect after manual disconnect", async () => {
+  const onEvent = event();
+  const onMessage = event();
+  const onDisconnect = event();
+  const onClicked = event();
+  const onInstalled = event();
+  const onStartup = event();
+  let connectCount = 0;
+  let disconnectCalls = 0;
+  const chrome = {
+    runtime: {
+      id: "ehooacpcolldccnemjebdnmfgmgekghn",
+      onInstalled,
+      onStartup,
+      connectNative() {
+        connectCount += 1;
+        return {
+          onMessage,
+          onDisconnect,
+          postMessage() {},
+          disconnect() { disconnectCalls += 1; },
+        };
+      },
+    },
+    tabs: { onRemoved: event() },
+    action: { onClicked, async setBadgeText() {} },
+    downloads: { onCreated: event(), onChanged: event() },
+    debugger: { onEvent, onDetach: event() },
+  };
+  const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
+  runInNewContext(source, { chrome, console, setTimeout, clearTimeout });
+  assert.equal(connectCount, 1);
+
+  // Manual click disconnects and prevents auto-reconnect
+  await onClicked.emit();
+  assert.equal(disconnectCalls, 1);
+  await onClicked.emit();
+  assert.equal(connectCount, 2);
+
+  // Startup / Installed hooks are idempotent while connected
+  await onInstalled.emit();
+  await onStartup.emit();
+  assert.equal(connectCount, 2);
+});
