@@ -428,6 +428,13 @@ export function locatorExpression(selector, options = {}) {
     ${SHARED_LOCATOR_RESOLVER}
 
     const isDisabledEl = (el) => !!(el.matches?.(":disabled") || el.getAttribute?.("aria-disabled") === "true");
+    const cursorPt = (el) => {
+      if (!el || typeof el.getBoundingClientRect !== "function") return {};
+      const r = el.getBoundingClientRect();
+      return r && r.width > 0 && r.height > 0
+        ? { x: r.left + r.width / 2, y: r.top + r.height / 2, __cursorMove: true }
+        : {};
+    };
 ${bodyPrefix}
     let targetRoot = document;
     try {
@@ -518,7 +525,7 @@ ${bodyPrefix}
       if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
       element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
       element.focus();
-      return { count: 1, focused: true };
+      return { count: 1, focused: true, ...cursorPt(element) };
     }
     if (mutation === "check" || mutation === "uncheck") {
       if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
@@ -528,12 +535,12 @@ ${bodyPrefix}
         ? !!element.checked
         : element.getAttribute("aria-checked") === "true";
       if (isChecked === want) {
-        return { count: 1, changed: false, checked: isChecked };
+        return { count: 1, changed: false, checked: isChecked, ...cursorPt(element) };
       }
       if (crossOriginDirect) {
         element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
         element.click();
-        return { count: 1, changed: true, clicked: true, checked: want };
+        return { count: 1, changed: true, clicked: true, checked: want, ...cursorPt(element) };
       }
     }
     if (mutation === "click") {
@@ -541,14 +548,14 @@ ${bodyPrefix}
       if (!force && isDisabledEl(element)) return fail("Element is disabled: " + raw, "disabled", true);
       element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
       element.click();
-      return { count: 1, clicked: true };
+      return { count: 1, clicked: true, ...cursorPt(element) };
     }
     if (mutation === "hover") {
       if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
       element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
       const rect = element.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) return fail("Locator matched an element with no visible box: " + raw, "not_visible", true);
-      return { count: 1, hovered: true, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+      return { count: 1, hovered: true, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, __cursorMove: true };
     }
     if (mutation === "fill" || mutation === "clear") {
       if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
@@ -564,7 +571,7 @@ ${bodyPrefix}
         element.textContent = assigned;
         element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: assigned, inputType }));
         element.dispatchEvent(new Event("change", { bubbles: true }));
-        return { count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }) };
+        return { count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }), ...cursorPt(element) };
       }
       element.focus();
       const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value");
@@ -573,7 +580,7 @@ ${bodyPrefix}
         ? new InputEvent("input", { bubbles: true, composed: true, data: assigned, inputType })
         : new Event("input", { bubbles: true, composed: true }));
       element.dispatchEvent(new Event("change", { bubbles: true }));
-      return { count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }) };
+      return { count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }), ...cursorPt(element) };
     }
     if (mutation === "select") {
       if (!(element instanceof HTMLSelectElement)) return fail("Locator did not match a <select> element: " + raw, "invalid", false);
@@ -601,7 +608,7 @@ ${bodyPrefix}
       }
       element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
       element.dispatchEvent(new Event("change", { bubbles: true }));
-      return { count: 1, selected: selected.map((o) => o.value) };
+      return { count: 1, selected: selected.map((o) => o.value), ...cursorPt(element) };
     }
 
     if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);

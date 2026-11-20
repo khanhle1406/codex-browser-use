@@ -191,8 +191,10 @@ export class BridgeBrowser {
     this.info = info;
     this.frameSessions = frameSessions;
     this.autoAttached = new Set();
-    /** @type {Map<number,{id:number,url?:string,title?:string}>} */
+    /** @type {Map<number,{id:number,url?:string,title?:string,owned?:boolean,origin?:string}>} */
     this.tabs = new Map();
+    /** @type {Set<number>} */
+    this.ownedTabs = new Set();
     this.activeTabId = null;
     /** @type {Set<number>} */
     this.attached = new Set();
@@ -684,47 +686,118 @@ export class BridgeBrowser {
     this.autoAttached.add(tabId);
   }
 
-  /** @returns {Promise<Array<{tab_id:string,title:string,url:string,active:boolean}>>} */
-  async listTabs() {
+  /** @returns {boolean} */
+  #supportsUserTabs() {
+    return Boolean(
+      this.info?.apiSupportOverrides?.["BrowserUser.openTabs"] ||
+      this.info?.apiSupportOverrides?.["BrowserUser.claimTab"],
+    );
+  }
+
+  /**
+   * Claim an already-open user tab in Chrome so this session can inspect and control it.
+   * Claimed user tabs are released (never closed) when the turn or session ends.
+   * @param {unknown} tabId
+   * @returns {Promise<{tab_id:string,title:string,url:string,active:boolean,owned:boolean,origin:string}>}
+   */
+  async claimTab(tabId) {
     this.#assertOpen();
-    const tabs = await this.#rpc("getTabs");
+    const id = Number(tabId);
+    if (!Number.isSafeInteger(id)) throw new Error("A numeric tab_id is required");
+    let tab;
+    try {
+      tab = await this.#rpc("claimUserTab", { tabId: id });
+    } catch {
+      throw new Error("Browser tab is unavailable to this session");
+    }
+    if (!Number.isSafeInteger(tab?.id)) throw new Error("Browser tab is unavailable to this session");
+    this.ownedTabs.add(tab.id);
+    this.tabs.set(tab.id, { ...tab, owned: true, origin: tab.origin || "user" });
+    this.activeTabId = tab.id;
+    await this.attach(tab.id);
+    return {
+      tab_id: String(tab.id),
+      title: tab.title || "Untitled",
+      url: tab.url || "",
+      active: true,
+      owned: true,
+      origin: tab.origin || "user",
+    };
+  }
+
+  /**
+   * @param {{includeUserTabs?:boolean|"force"}} [options]
+   * @returns {Promise<Array<{tab_id:string,title:string,url:string,active:boolean,owned?:boolean,origin?:string,browser_active?:boolean}>>}
+   */
+  async listTabs({ includeUserTabs = true } = {}) {
+    this.#assertOpen();
+    const fetchUserTabs = includeUserTabs === "force" || (includeUserTabs !== false && this.#supportsUserTabs());
+    const [tabs, userTabs] = await Promise.all([
+      this.#rpc("getTabs"),
+      fetchUserTabs ? this.#rpc("getUserTabs").catch(() => []) : Promise.resolve([]),
+    ]);
     this.tabs.clear();
+    this.ownedTabs.clear();
     const result = [];
     for (const tab of Array.isArray(tabs) ? tabs : []) {
       if (!Number.isSafeInteger(tab?.id)) continue;
+      this.ownedTabs.add(tab.id);
       this.tabs.set(tab.id, tab);
       result.push({
         tab_id: String(tab.id),
         title: tab.title || "Untitled",
         url: tab.url || "",
         active: tab.id === this.activeTabId,
+        ...(fetchUserTabs ? { owned: true, origin: tab.origin || "agent" } : {}),
       });
     }
-    if (this.activeTabId !== null && !this.tabs.has(this.activeTabId)) this.activeTabId = null;
-    if (this.activeTabId === null && result.length > 0) this.activeTabId = this.tabs.keys().next().value ?? null;
+    if (this.activeTabId !== null && !this.ownedTabs.has(this.activeTabId)) this.activeTabId = null;
+    if (this.activeTabId === null && this.ownedTabs.size > 0) {
+      this.activeTabId = this.ownedTabs.values().next().value ?? null;
+    }
+    for (const tab of Array.isArray(userTabs) ? userTabs : []) {
+      if (!Number.isSafeInteger(tab?.id) || this.ownedTabs.has(tab.id)) continue;
+      this.tabs.set(tab.id, { ...tab, owned: false, origin: "user" });
+      result.push({
+        tab_id: String(tab.id),
+        title: tab.title || "Untitled",
+        url: tab.url || "",
+        active: false,
+        browser_active: Boolean(tab.active),
+        owned: false,
+        origin: "user",
+      });
+    }
     for (const entry of result) entry.active = Number(entry.tab_id) === this.activeTabId;
     return result;
   }
 
   /** @param {unknown} [tabId] @param {{autoCreate?:boolean}} [options] @returns {Promise<number>} */
   async #resolveTab(tabId, { autoCreate = false } = {}) {
-    const candidate = tabId === undefined || tabId === null || tabId === "" ? this.activeTabId : Number(tabId);
-    if (Number.isSafeInteger(candidate) && this.tabs.has(candidate)) return candidate;
-    const tabs = await this.listTabs();
-    if (candidate !== null && Number.isSafeInteger(candidate)) {
-      const found = tabs.find((tab) => Number(tab.tab_id) === candidate);
-      if (!found) throw new Error("Browser tab is unavailable to this session");
-      this.activeTabId = candidate;
-      return candidate;
+    const hasExplicit = tabId !== undefined && tabId !== null && tabId !== "";
+    const candidate = hasExplicit ? Number(tabId) : this.activeTabId;
+    if (Number.isSafeInteger(candidate) && this.ownedTabs.has(candidate)) return candidate;
+    await this.listTabs({ includeUserTabs: false });
+    if (hasExplicit) {
+      if (!Number.isSafeInteger(candidate)) throw new Error("A numeric tab_id is required");
+      if (this.ownedTabs.has(candidate)) {
+        this.activeTabId = candidate;
+        return candidate;
+      }
+      if (this.#supportsUserTabs()) {
+        await this.claimTab(candidate);
+        return candidate;
+      }
+      throw new Error("Browser tab is unavailable to this session");
     }
-    if (tabs.length === 0) {
+    if (this.ownedTabs.size === 0) {
       if (autoCreate) {
         const created = await this.newTab();
         return Number(created.tab_id);
       }
       throw new Error("No browser tab exists in this session; call browser_new_tab first");
     }
-    this.activeTabId = Number(tabs[0].tab_id);
+    this.activeTabId = this.ownedTabs.values().next().value ?? null;
     return this.activeTabId;
   }
 
@@ -787,11 +860,13 @@ export class BridgeBrowser {
     this.#assertOpen();
     const tab = await this.#rpc("createTab");
     if (!Number.isSafeInteger(tab?.id)) throw new Error("Browser bridge returned a tab without an ID");
+    this.ownedTabs.add(tab.id);
     this.tabs.set(tab.id, tab);
     this.activeTabId = tab.id;
     await this.attach(tab.id);
     if (url && normalizeUrl(url) !== "about:blank") await this.goto(url, tab.id);
     const current = (await this.#rpc("getTabs"))?.find((entry) => entry?.id === tab.id) ?? tab;
+    this.ownedTabs.add(tab.id);
     this.tabs.set(tab.id, current);
     return { tab_id: String(tab.id), title: current.title || "Untitled", url: current.url || "", active: true };
   }
@@ -800,11 +875,10 @@ export class BridgeBrowser {
   async selectTab(tabId) {
     const id = Number(tabId);
     if (!Number.isSafeInteger(id)) throw new Error("A numeric tab_id is required");
-    const tabs = await this.listTabs();
-    if (!tabs.some((tab) => Number(tab.tab_id) === id)) throw new Error("Browser tab is unavailable to this session");
-    this.activeTabId = id;
-    await this.attach(id);
-    return { tab_id: String(id), ok: true };
+    const resolved = await this.#resolveTab(id);
+    this.activeTabId = resolved;
+    await this.attach(resolved);
+    return { tab_id: String(resolved), ok: true };
   }
 
   /** @param {unknown} tabId @returns {Promise<{tab_id:string,closed:boolean}>} */
@@ -813,13 +887,14 @@ export class BridgeBrowser {
     await this.attach(id);
     await this.#cdp(id, "Page.close");
     this.tabs.delete(id);
+    this.ownedTabs.delete(id);
     this.attached.delete(id);
     this.axCache.delete(id);
     this.lastAxSnapshots.delete(id);
     this.tabStates.delete(id);
     this.#clearTabCaches(id);
     this.autoAttached.delete(id);
-    if (this.activeTabId === id) this.activeTabId = this.tabs.keys().next().value ?? null;
+    if (this.activeTabId === id) this.activeTabId = this.ownedTabs.values().next().value ?? null;
     return { tab_id: String(id), closed: true };
   }
 

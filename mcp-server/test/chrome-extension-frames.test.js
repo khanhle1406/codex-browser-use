@@ -232,3 +232,167 @@ test("extension auto-connects on service worker wake-up and skips reconnect afte
   await onStartup.emit();
   assert.equal(connectCount, 2);
 });
+
+test("extension lists and claims existing user tabs, renders virtual cursor and favicon badges, and preserves user tabs on disconnect", async () => {
+  const onEvent = event();
+  const onMessage = event();
+  const onDisconnect = event();
+  const onClicked = event();
+  const onRuntimeMessage = event();
+  const replies = [];
+  const tabMessages = [];
+  const removedTabs = [];
+  const detachedTabs = [];
+  const scriptsInjected = [];
+  let pingReady = false;
+  let nextReq = 1;
+
+  const openTabs = new Map([
+    [10, { id: 10, url: "https://congnghieptot.vn/new_admin/addnew_group/132", title: "Admin Form", active: true }],
+    [11, { id: 11, url: "chrome://extensions", title: "Extensions", active: false }],
+    [12, { id: 12, url: "https://secret.example", title: "Incognito", active: false, incognito: true }],
+  ]);
+
+  const port = {
+    onMessage,
+    onDisconnect,
+    postMessage: (msg) => replies.push(msg),
+    disconnect() {},
+  };
+
+  const chrome = {
+    runtime: {
+      connectNative: () => port,
+      onMessage: onRuntimeMessage,
+      getURL: (p) => `chrome-extension://ehooacpcolldccnemjebdnmfgmgekghn/${p}`,
+    },
+    tabs: {
+      onRemoved: event(),
+      onUpdated: event(),
+      onActivated: event(),
+      async create(opts) {
+        const t = { id: 20, url: opts.url || "about:blank", title: "New Tab", active: false };
+        openTabs.set(t.id, t);
+        return t;
+      },
+      async query() {
+        return [...openTabs.values()];
+      },
+      async get(id) {
+        return openTabs.get(id) ?? null;
+      },
+      async remove(id) {
+        removedTabs.push(id);
+        openTabs.delete(id);
+      },
+      async sendMessage(tabId, msg) {
+        tabMessages.push({ tabId, msg });
+        if (msg?.type === "CONTENT_PING") {
+          return pingReady ? { ok: true } : null;
+        }
+        return { ok: true };
+      },
+    },
+    scripting: {
+      async executeScript(opts) {
+        scriptsInjected.push(opts);
+        pingReady = true;
+        return [{ result: true }];
+      },
+    },
+    action: { onClicked, async setBadgeText() {}, async setTitle() {} },
+    downloads: { onCreated: event(), onChanged: event() },
+    debugger: {
+      onEvent,
+      onDetach: event(),
+      async attach() {},
+      async detach({ tabId }) { detachedTabs.push(tabId); },
+      async sendCommand(_target, method) {
+        if (method === "DOM.getBoxModel") {
+          return { model: { border: [100, 200, 180, 200, 180, 240, 100, 240] } };
+        }
+        if (method === "Runtime.evaluate") {
+          return { result: { value: { count: 1, filled: true, x: 320, y: 440, __cursorMove: true } } };
+        }
+        return {};
+      },
+    },
+  };
+
+  const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
+  runInNewContext(source, { chrome, console });
+  await onClicked.emit();
+
+  async function request(args) {
+    const id = nextReq++;
+    await onMessage.emit({ id, ...args });
+    return replies.find((r) => r.id === id);
+  }
+
+  // 1. listTabs exposes normal user tabs (10) while excluding chrome:// (11) and incognito (12)
+  const listed = await request({ method: "listTabs" });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.value.length, 1);
+  assert.equal(listed.value[0].id, 10);
+  assert.equal(listed.value[0].owned, false);
+  assert.equal(listed.value[0].origin, "user");
+
+  // 2. claimTab rejects internal chrome:// tabs and claims user tab 10
+  const badClaim = await request({ method: "claimTab", tabId: 11 });
+  assert.equal(badClaim.ok, false);
+  const claimed = await request({ method: "claimTab", tabId: 10 });
+  assert.equal(claimed.ok, true);
+  assert.equal(claimed.value.id, 10);
+  assert.equal(claimed.value.origin, "user");
+
+  // 3. attach dynamically injects content-script.js on CONTENT_PING miss and sends TAB_FAVICON_BADGE + AGENT_CURSOR_STATE
+  assert.equal((await request({ method: "attach", tabId: 10 })).ok, true);
+  assert.equal(scriptsInjected.length, 1);
+  assert.ok(tabMessages.some((m) => m.tabId === 10 && m.msg.type === "TAB_FAVICON_BADGE" && m.msg.badge === "active"));
+  assert.ok(tabMessages.some((m) => m.tabId === 10 && m.msg.type === "AGENT_CURSOR_STATE" && m.msg.state.isVisible === true));
+
+  // 4. Input.dispatchMouseEvent, Runtime.callFunctionOn, and Runtime.evaluate move the virtual cursor
+  tabMessages.length = 0;
+  await request({
+    method: "execute",
+    tabId: 10,
+    details: { method: "Input.dispatchMouseEvent", params: { type: "mouseMoved", x: 250, y: 180, buttons: 0 } },
+  });
+  const mouseMoveCursor = tabMessages.find((m) => m.msg.type === "AGENT_CURSOR_STATE")?.msg?.state?.cursor;
+  assert.equal(mouseMoveCursor.x, 250);
+  assert.equal(mouseMoveCursor.y, 180);
+
+  tabMessages.length = 0;
+  await request({
+    method: "execute",
+    tabId: 10,
+    details: { method: "Runtime.callFunctionOn", params: { objectId: "obj-1", functionDeclaration: "function(){}" } },
+  });
+  const callFnCursor = tabMessages.find((m) => m.msg.type === "AGENT_CURSOR_STATE")?.msg?.state?.cursor;
+  assert.equal(callFnCursor.x, 140);
+  assert.equal(callFnCursor.y, 220);
+
+  tabMessages.length = 0;
+  await request({
+    method: "execute",
+    tabId: 10,
+    details: { method: "Runtime.evaluate", params: { expression: "fill()" } },
+  });
+  const evalCursor = tabMessages.find((m) => m.msg.type === "AGENT_CURSOR_STATE")?.msg?.state?.cursor;
+  assert.equal(evalCursor.x, 320);
+  assert.equal(evalCursor.y, 440);
+
+  // 5. Creating & attaching a second tab clears the "active" badge on tab 10 so only 1 tab is active-badged at a time
+  const created = await request({ method: "createBlankTab" });
+  assert.equal(created.ok, true);
+  tabMessages.length = 0;
+  assert.equal((await request({ method: "attach", tabId: 20 })).ok, true);
+  assert.ok(tabMessages.some((m) => m.tabId === 10 && m.msg.type === "TAB_FAVICON_BADGE" && m.msg.badge === null));
+  assert.ok(tabMessages.some((m) => m.tabId === 20 && m.msg.type === "TAB_FAVICON_BADGE" && m.msg.badge === "active"));
+
+  // 6. Disconnecting closes ONLY agent tab 20 while preserving user tab 10!
+  await onClicked.emit();
+  assert.deepEqual(removedTabs, [20]);
+  assert.equal(openTabs.has(10), true);
+  assert.ok(detachedTabs.includes(10));
+});

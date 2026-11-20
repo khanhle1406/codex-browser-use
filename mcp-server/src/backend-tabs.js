@@ -1,9 +1,9 @@
 import {validateNetworkPolicy, validatePageCommand} from "./backend-page-commands.js";
 
-/** @typedef {{id:number, title?:string, url?:string, active?:boolean}} BrowserTab */
-/** @typedef {{createBlankTab:()=>Promise<BrowserTab>, readTab:(id:number)=>Promise<BrowserTab|null>, closeTab:(id:number)=>Promise<void>, releaseTab?:(id:number)=>Promise<void>, attach?:(id:number)=>Promise<void>, detach?:(id:number)=>Promise<void>, navigate?:(id:number,url:string)=>Promise<void>, watchDownloads?:(id:number)=>Promise<void>, unwatchDownloads?:(id:number)=>Promise<void>, groupTabs?:(tabIds:number[],options:{title?:string,color?:string,groupId?:number|null})=>Promise<{groupId:number|null,supported?:boolean}>, execute?:(id:number,method:string,params:RpcParams,childSession?:string)=>Promise<unknown>, onEvent?:(listener:(method:string, id:number, params:RpcParams)=>void)=>void}} TabDriver */
+/** @typedef {{id:number, title?:string, url?:string, active?:boolean, owned?:boolean, origin?:"agent"|"user"}} BrowserTab */
+/** @typedef {{createBlankTab:()=>Promise<BrowserTab>, listTabs?:()=>Promise<BrowserTab[]>, claimTab?:(id:number)=>Promise<BrowserTab>, readTab:(id:number)=>Promise<BrowserTab|null>, closeTab:(id:number)=>Promise<void>, releaseTab?:(id:number)=>Promise<void>, markTab?:(id:number,status:TabMark)=>Promise<void>, moveCursor?:(id:number,x:number,y:number,waitForArrival?:boolean)=>Promise<void>, attach?:(id:number)=>Promise<void>, detach?:(id:number)=>Promise<void>, navigate?:(id:number,url:string)=>Promise<void>, watchDownloads?:(id:number)=>Promise<void>, unwatchDownloads?:(id:number)=>Promise<void>, groupTabs?:(tabIds:number[],options:{title?:string,color?:string,groupId?:number|null})=>Promise<{groupId:number|null,supported?:boolean}>, execute?:(id:number,method:string,params:RpcParams,childSession?:string)=>Promise<unknown>, onEvent?:(listener:(method:string, id:number, params:RpcParams)=>void)=>void}} TabDriver */
 /** @typedef {"handoff"|"deliverable"} TabMark */
-/** @typedef {{id:string, turn:string|null, ended:Set<string>, tabs:Map<number,TabMark|null>, attached:Set<number>, group:null|{title:string,color:string,groupId:number|null}, groupLock:Promise<void>, notify:Notify, cleanup?:Promise<void>}} TabSession */
+/** @typedef {{id:string, turn:string|null, ended:Set<string>, tabs:Map<number,TabMark|null>, userTabs:Set<number>, attached:Set<number>, group:null|{title:string,color:string,groupId:number|null}, groupLock:Promise<void>, notify:Notify, cleanup?:Promise<void>}} TabSession */
 /** @typedef {Record<string,unknown>} RpcParams */
 /** @typedef {(method:string,params:RpcParams)=>void} Notify */
 /** @typedef {(params:RpcParams,signal:AbortSignal,notify:Notify)=>unknown|Promise<unknown>} RpcHandler */
@@ -56,6 +56,7 @@ export function createTabHandlers(driver, options) {
   /** @param {TabSession} session @param {number} id @returns {void} */
   function release(session, id) {
     session.tabs.delete(id);
+    session.userTabs.delete(id);
     session.attached.delete(id);
     owners.delete(id);
   }
@@ -66,7 +67,7 @@ export function createTabHandlers(driver, options) {
       if (!session.group || !driver.groupTabs) {
         return { groupId: session.group?.groupId ?? null, supported: false };
       }
-      const ownedIds = tabIds.filter((id) => session.tabs.has(id));
+      const ownedIds = tabIds.filter((id) => session.tabs.has(id) && !session.userTabs.has(id));
       if (ownedIds.length === 0) {
         return { groupId: session.group.groupId, supported: true };
       }
@@ -92,12 +93,13 @@ export function createTabHandlers(driver, options) {
   /** @param {TabSession} session @param {boolean} disconnected @returns {Promise<void>} */
   async function cleanTabs(session, disconnected) {
     const results = await Promise.allSettled([...session.tabs].map(async ([id, status]) => {
+      const isUserTab = session.userTabs.has(id);
       if (session.attached.has(id)) {
         await driver.detach?.(id);
         session.attached.delete(id);
       }
       if (status === "handoff" && !disconnected) return;
-      if (status === null) await driver.closeTab(id);
+      if (status === null && !isUserTab) await driver.closeTab(id);
       else await driver.releaseTab?.(id);
       release(session, id);
     }));
@@ -158,6 +160,7 @@ export function createTabHandlers(driver, options) {
           turn: null,
           ended: new Set(),
           tabs: new Map(),
+          userTabs: new Set(),
           attached: new Set(),
           group: null,
           groupLock: Promise.resolve(),
@@ -172,8 +175,17 @@ export function createTabHandlers(driver, options) {
           }).finally(() => connections.delete(id));
         }, {once: true});
       }
-      return {type: "extension", family: "chrome", name: options.name, version: options.version,
-        capabilities: {browser: [], tab: []}, apiSupportOverrides: {"Tab.ax": false}};
+      return {
+        type: "extension",
+        family: "chrome",
+        name: options.name,
+        version: options.version,
+        capabilities: {browser: [], tab: []},
+        apiSupportOverrides: {
+          "Tab.ax": false,
+          ...(typeof driver.listTabs === "function" ? {"BrowserUser.openTabs": true, "BrowserUser.claimTab": true} : {}),
+        },
+      };
     }],
     ["nameSession", async (params, signal) => {
       const session = activateTurn(params, signal);
@@ -221,6 +233,62 @@ export function createTabHandlers(driver, options) {
       signal.throwIfAborted();
       return entries.filter((tab) => tab && session.tabs.has(tab.id));
     }],
+    ["getUserTabs", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      if (typeof driver.listTabs !== "function") return [];
+      const all = await driver.listTabs();
+      signal.throwIfAborted();
+      return (Array.isArray(all) ? all : []).filter((tab) => {
+        if (!tab || !Number.isSafeInteger(tab.id)) return false;
+        const owner = owners.get(tab.id);
+        return !owner || owner === session;
+      }).map((tab) => ({
+        ...tab,
+        owned: session.tabs.has(tab.id),
+        origin: session.tabs.has(tab.id) && !session.userTabs.has(tab.id) ? "agent" : "user",
+      }));
+    }],
+    ["claimUserTab", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      const rawId = Number(params.tabId);
+      if (!Number.isSafeInteger(rawId) || rawId < 0) {
+        throw new Error("Browser tab is unavailable to this session");
+      }
+      const existingOwner = owners.get(rawId);
+      if (existingOwner && existingOwner !== session) {
+        throw new Error("Browser tab is unavailable to this session");
+      }
+      if (session.tabs.has(rawId)) {
+        const current = await driver.readTab(rawId);
+        signal.throwIfAborted();
+        if (!current) throw new Error("Browser tab is unavailable to this session");
+        return {
+          ...current,
+          owned: true,
+          origin: session.userTabs.has(rawId) ? "user" : "agent",
+        };
+      }
+      if (typeof driver.claimTab !== "function") {
+        throw new Error("Browser tab is unavailable to this session");
+      }
+      let tab;
+      try {
+        tab = await driver.claimTab(rawId);
+      } catch {
+        throw new Error("Browser tab is unavailable to this session");
+      }
+      if (!tab || !Number.isSafeInteger(tab.id) || tab.id !== rawId) {
+        throw new Error("Browser tab is unavailable to this session");
+      }
+      if (signal.aborted) {
+        await driver.releaseTab?.(tab.id).catch(() => {});
+        signal.throwIfAborted();
+      }
+      owners.set(tab.id, session);
+      session.tabs.set(tab.id, null);
+      session.userTabs.add(tab.id);
+      return {...tab, owned: true, origin: "user"};
+    }],
     ["getCommittedTabUrl", async (params, signal) => {
       const session = activateTurn(params, signal);
       const tab = await driver.readTab(requireOwnedTab(session, params.tabId));
@@ -230,7 +298,10 @@ export function createTabHandlers(driver, options) {
     }],
     ["markTab", (params, signal) => {
       const session = activateTurn(params, signal);
-      session.tabs.set(requireOwnedTab(session, params.tabId), mark(params.status));
+      const id = requireOwnedTab(session, params.tabId);
+      const status = mark(params.status);
+      session.tabs.set(id, status);
+      void driver.markTab?.(id, status)?.catch?.(() => {});
     }],
     ["finalizeTabs", async (params, signal) => {
       const session = activateTurn(params, signal);
@@ -242,7 +313,11 @@ export function createTabHandlers(driver, options) {
         if (marks.has(id)) throw new Error("finalizeTabs contains a duplicate tab");
         marks.set(id, mark(entry.status));
       }
-      for (const id of session.tabs.keys()) session.tabs.set(id, marks.get(id) ?? null);
+      for (const id of session.tabs.keys()) {
+        const st = marks.get(id) ?? null;
+        session.tabs.set(id, st);
+        if (st) void driver.markTab?.(id, st)?.catch?.(() => {});
+      }
       await endTurn(params, signal);
     }],
     ["turnEnded", endTurn],
@@ -306,6 +381,15 @@ export function createTabHandlers(driver, options) {
       const session = activateTurn(params, signal);
       const id = requireOwnedTab(session, params.tabId);
       await driver.unwatchDownloads(id);
+    });
+  }
+  if (driver.moveCursor) {
+    handlers.set("moveCursor", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      const id = requireOwnedTab(session, params.tabId);
+      if (!Number.isFinite(params.x) || !Number.isFinite(params.y)) return null;
+      await driver.moveCursor(id, Number(params.x), Number(params.y), params.waitForArrival !== false);
+      return null;
     });
   }
   return handlers;

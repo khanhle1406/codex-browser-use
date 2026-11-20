@@ -964,12 +964,22 @@ export class BrowserScriptSession {
         return self.#createTabHandle(info.tab_id);
       },
       get: async (id) => {
-        const wanted = String(id);
+        const raw = isPlainObject(id) ? (id.tab_id ?? id.id) : id;
+        const wanted = String(raw);
         const list = await self.#guard((b) => b.listTabs(), "tabs.get", { trackActiveTab: false });
-        if (!list.some((t) => String(t.tab_id) === wanted)) {
+        const match = list.find((t) => String(t.tab_id) === wanted);
+        if (!match) {
           throw new Error(`Browser tab ${wanted} is unavailable to this session`);
         }
+        if (match.owned === false) {
+          await self.#guard((b) => b.claimTab(wanted), "tabs.claim", { trackActiveTab: false });
+        }
         return self.#createTabHandle(wanted);
+      },
+      claim: async (tabOrId) => {
+        const raw = isPlainObject(tabOrId) ? (tabOrId.tab_id ?? tabOrId.id) : tabOrId;
+        const info = await self.#guard((b) => b.claimTab(raw), "tabs.claim", { trackActiveTab: true });
+        return self.#createTabHandle(info.tab_id);
       },
       list: async () => {
         const list = await self.#guard((b) => b.listTabs(), "tabs.list", { trackActiveTab: false });
@@ -977,8 +987,23 @@ export class BrowserScriptSession {
       },
       selected: async () => {
         const list = await self.#guard((b) => b.listTabs(), "tabs.selected", { trackActiveTab: false });
-        const target = list.find((t) => t.active) || list[0];
-        return target ? self.#createTabHandle(target.tab_id) : undefined;
+        const target = list.find((t) => t.active) || list.find((t) => t.owned !== false) || list[0];
+        if (!target) return undefined;
+        if (target.owned === false) {
+          await self.#guard((b) => b.claimTab(target.tab_id), "tabs.claim", { trackActiveTab: true });
+        }
+        return self.#createTabHandle(target.tab_id);
+      },
+    };
+    api.user = {
+      openTabs: async () => {
+        const list = await self.#guard((b) => b.listTabs({ includeUserTabs: "force" }), "user.openTabs", { trackActiveTab: false });
+        return list.map((t) => ({ id: t.tab_id, providerTabId: t.tab_id, ...t }));
+      },
+      claimTab: async (tabOrId) => {
+        const raw = isPlainObject(tabOrId) ? (tabOrId.tab_id ?? tabOrId.id ?? tabOrId.providerTabId) : tabOrId;
+        const info = await self.#guard((b) => b.claimTab(raw), "user.claimTab", { trackActiveTab: true });
+        return self.#createTabHandle(info.tab_id);
       },
     };
     api.viewport = {

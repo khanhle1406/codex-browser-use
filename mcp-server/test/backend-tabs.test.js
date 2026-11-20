@@ -124,6 +124,76 @@ test("nameSession isolates tab groups per session, auto-groups new tabs, and val
   }
 });
 
+test("getUserTabs and claimUserTab allow claiming open user tabs, enforce session isolation, and release rather than close user tabs on turnEnded", async () => {
+  const tabs = new Map([
+    [50, { id: 50, url: "https://congnghieptot.vn/new_admin/addnew_group/132", title: "Existing User Tab", active: true }],
+  ]);
+  const closed = [];
+  const released = [];
+  const marked = [];
+  const first = new AbortController();
+  const second = new AbortController();
+  const a = { session_id: "sess-a", turn_id: "turn-a1" };
+  const b = { session_id: "sess-b", turn_id: "turn-b1" };
+
+  const handlers = createTabHandlers({
+    async createBlankTab() {
+      const tab = { id: 60, url: "about:blank", title: "Agent Tab" };
+      tabs.set(tab.id, tab);
+      return tab;
+    },
+    async listTabs() {
+      return [...tabs.values()];
+    },
+    async claimTab(id) {
+      const tab = tabs.get(id);
+      if (!tab) throw new Error("No tab");
+      return { ...tab, owned: true, origin: "user" };
+    },
+    async readTab(id) { return tabs.get(id) ?? null; },
+    async closeTab(id) { closed.push(id); tabs.delete(id); },
+    async releaseTab(id) { released.push(id); },
+    async markTab(id, status) { marked.push({ id, status }); },
+    async attach() {},
+    async detach() {},
+    async execute() { return {}; },
+  }, { name: "User tab fixture", version: "0.5.5" });
+
+  try {
+    const infoA = handlers.get("getInfo")(a, first.signal, () => undefined);
+    handlers.get("getInfo")(b, second.signal, () => undefined);
+    assert.equal(infoA.apiSupportOverrides["BrowserUser.openTabs"], true);
+
+    const openForA = await handlers.get("getUserTabs")(a, first.signal);
+    assert.equal(openForA.length, 1);
+    assert.equal(openForA[0].id, 50);
+    assert.equal(openForA[0].owned, false);
+
+    // Session A claims user tab 50
+    const claimed = await handlers.get("claimUserTab")({ ...a, tabId: 50 }, first.signal);
+    assert.equal(claimed.id, 50);
+    assert.equal(claimed.owned, true);
+    assert.equal(claimed.origin, "user");
+
+    // Session B cannot see or claim tab 50 while Session A owns it
+    const openForB = await handlers.get("getUserTabs")(b, second.signal);
+    assert.equal(openForB.length, 0);
+    await assert.rejects(handlers.get("claimUserTab")({ ...b, tabId: 50 }, second.signal), /unavailable/);
+
+    // Session A also creates an ephemeral agent tab 60, then ends turn without marking either tab
+    await handlers.get("createTab")(a, first.signal);
+    await handlers.get("turnEnded")(a, first.signal);
+
+    // Ephemeral agent tab 60 is closed, while claimed user tab 50 is released and left open!
+    assert.deepEqual(closed, [60]);
+    assert.deepEqual(released, [50]);
+    assert.equal(tabs.has(50), true);
+  } finally {
+    first.abort();
+    second.abort();
+  }
+});
+
 /** @returns {{tabs:Map<number,object>,handlers:ReturnType<typeof createTabHandlers>}} */
 function fixture() {
   let next = 1;
@@ -263,65 +333,6 @@ test("navigateTab validates schemes and delegates owned tabs to the driver", asy
     assert.deepEqual(watches, [{op: "watch", id: 1}, {op: "unwatch", id: 1}]);
 
     await handlers.get("turnEnded")(session, first.signal);
-  } finally {
-    first.abort();
-    second.abort();
-  }
-});
-
-test("nameSession isolates tab groups per session, auto-groups new tabs, and validates inputs", async () => {
-  let nextId = 1;
-  let nextGroup = 10;
-  const grouped = [];
-  const tabs = new Map([[99, {id: 99, url: "https://private.example/"}]]);
-  const first = new AbortController();
-  const second = new AbortController();
-  const a = {session_id: "sess-a", turn_id: "turn-a"};
-  const b = {session_id: "sess-b", turn_id: "turn-b"};
-
-  const handlers = createTabHandlers({
-    async createBlankTab() {
-      const tab = {id: nextId++, url: "about:blank", title: "Blank"};
-      tabs.set(tab.id, tab);
-      return tab;
-    },
-    async readTab(id) { return tabs.get(id) ?? null; },
-    async closeTab(id) { tabs.delete(id); },
-    async groupTabs(tabIds, options) {
-      assert.equal(tabIds.includes(99), false);
-      const groupId = options.groupId ?? nextGroup++;
-      grouped.push({tabIds, title: options.title, color: options.color, groupId});
-      return {groupId, supported: true};
-    },
-  }, {name: "Group fixture", version: "0.0.0"});
-
-  try {
-    handlers.get("getInfo")(a, first.signal, () => undefined);
-    handlers.get("getInfo")(b, second.signal, () => undefined);
-
-    // Existing tab in session A gets grouped when nameSession is called after createTab
-    const tabA1 = await handlers.get("createTab")(a, first.signal);
-    const namedA = await handlers.get("nameSession")({...a, name: "Alpha Flow", color: "purple"}, first.signal);
-    assert.equal(namedA.groupId, 10);
-    assert.equal(namedA.groupedTabs, 1);
-    assert.equal(namedA.title, "Alpha Flow");
-
-    // Subsequent tab in session A automatically joins group 10; session B stays isolated in group 11
-    const tabA2 = await handlers.get("createTab")(a, first.signal);
-    await handlers.get("nameSession")({...b, name: "Beta Flow", color: "orange"}, second.signal);
-    const tabB1 = await handlers.get("createTab")(b, second.signal);
-
-    assert.deepEqual(grouped, [
-      {tabIds: [tabA1.id], title: "Alpha Flow", color: "purple", groupId: 10},
-      {tabIds: [tabA2.id], title: "Alpha Flow", color: "purple", groupId: 10},
-      {tabIds: [tabB1.id], title: "Beta Flow", color: "orange", groupId: 11},
-    ]);
-
-    await assert.rejects(handlers.get("nameSession")({...a, name: "   "}, first.signal), /non-empty/);
-    await assert.rejects(handlers.get("nameSession")({...a, name: "Bad Color", color: "neon"}, first.signal), /color/);
-
-    await handlers.get("turnEnded")(a, first.signal);
-    await handlers.get("turnEnded")(b, second.signal);
   } finally {
     first.abort();
     second.abort();

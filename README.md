@@ -11,7 +11,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-26.12.1%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#quick-start)
 [![MCP tools](https://img.shields.io/badge/MCP-36%20tools-5B8DEF?style=flat-square)](#why-its-better)
-[![Extension](https://img.shields.io/badge/Extension-v0.5.4-34D399?style=flat-square)](#quick-start)
+[![Extension](https://img.shields.io/badge/Extension-v0.5.6-34D399?style=flat-square)](#quick-start)
 [![GitHub stars](https://img.shields.io/github/stars/khanhle1406/codex-browser-use?style=flat-square)](https://github.com/khanhle1406/codex-browser-use/stargazers)
 
 [Quick start](#quick-start) · [How it works](#how-it-works) · [What you can do](#what-you-can-do) · [Why it's better](#why-its-better) · [FAQ](#faq) · [Documentation](#documentation)
@@ -50,7 +50,7 @@ node mcp-server/bin/browser-use.js install --client antigravity --write --skill
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-`install` copies the Chrome extension (`v0.5.4`) to your home folder, hooks up Chrome's local bridge, adds the MCP server to your agent (saving a `.bak` backup first), and installs the matching instructions.
+`install` copies the Chrome extension (`v0.5.6`) to your home folder, hooks up Chrome's local bridge, adds the MCP server to your agent (saving a `.bak` backup first), and installs the matching instructions.
 
 <details>
 <summary><strong>Using Claude Code, Codex, Cursor, Windsurf, Copilot, Command Code, or OpenCode?</strong></summary>
@@ -119,9 +119,9 @@ Or pass a simple list of steps (`goto`, `set_viewport`, `locator_fill`, `locator
 
 </details>
 
-### 3. Your personal tabs stay completely separate
+### 3. Control existing open tabs or isolated agent tabs — with live virtual cursor
 
-The extension only touches tabs it opens for the current agent session. Your existing open tabs, windows, and ongoing work stay private and untouched, while new agent tabs still share your Chrome profile's cookies and signed-in sessions so you don't have to log in from scratch. If multiple agents work at the same time, each one gets its own isolated tabs and its own colored Chrome Tab Group, and temporary tabs close automatically when the task finishes.
+Your agent can either open fresh tabs in its own colored Chrome Tab Group or take over a tab you already have open (keeping your unsaved form data, cookies, and signed-in state intact). While your agent works, a smooth glowing virtual cursor and tab badge show you exactly where it is clicking and typing. When the task finishes, temporary agent tabs close automatically while your own tabs are safely released and left open.
 
 <img src="docs/assets/how-it-works-isolation.png" alt="Chrome Tab Groups keeping Personal Tabs untouched while isolating Agent A and Agent B" width="100%" />
 

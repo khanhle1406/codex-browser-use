@@ -145,6 +145,15 @@ export function createNativeTabDriver(input, output, options = {}) {
 
   return {
     async createBlankTab() { return tab(await request("createBlankTab")); },
+    /** @returns {Promise<BrowserTab[]>} */
+    async listTabs() {
+      const value = await request("listTabs");
+      return Array.isArray(value)
+        ? value.filter((entry) => entry && Number.isSafeInteger(entry.id) && entry.id >= 0)
+        : [];
+    },
+    /** @param {number} id @returns {Promise<BrowserTab>} */
+    async claimTab(id) { return tab(await request("claimTab", id), id); },
     /** @param {number} id @returns {Promise<BrowserTab|null>} */
     async readTab(id) {
       const value = await request("readTab", id);
@@ -154,6 +163,12 @@ export function createNativeTabDriver(input, output, options = {}) {
     async closeTab(id) { await request("closeTab", id); },
     /** @param {number} id @returns {Promise<void>} */
     async releaseTab(id) { await request("releaseTab", id); },
+    /** @param {number} id @param {string} status @returns {Promise<void>} */
+    async markTab(id, status) { await request("markTab", id, {status}); },
+    /** @param {number} id @param {number} x @param {number} y @param {boolean} [waitForArrival] @returns {Promise<void>} */
+    async moveCursor(id, x, y, waitForArrival = true) {
+      await request("moveCursor", id, {x, y, waitForArrival});
+    },
     /** @param {number} id @returns {Promise<void>} */
     async attach(id) { await request("attach", id); },
     /** @param {number} id @returns {Promise<void>} */

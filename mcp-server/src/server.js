@@ -347,7 +347,7 @@ export function registerTools(server, deps = {}) {
 
   server.tool(
     "browser_list_tabs",
-    "List tabs owned by this browser session with tab_id, title, url, and active state.",
+    "List all controllable Chrome tabs (both tabs created by this session and existing open user tabs) with tab_id, title, url, active state, owned flag, and origin ('agent' | 'user').",
     {},
     guarded(async () => text(await (await getBrowser()).listTabs())),
   );
@@ -361,8 +361,8 @@ export function registerTools(server, deps = {}) {
 
   server.tool(
     "browser_select_tab",
-    "Make an existing session tab the active tab.",
-    { tab_id: stringOrNumber.describe("Tab ID to activate") },
+    "Select an existing tab by tab_id (automatically claiming already-open user tabs in Chrome into this session) and make it the active tab.",
+    { tab_id: stringOrNumber.describe("Tab ID from browser_list_tabs to activate and control") },
     guarded(async ({ tab_id }) => text(await (await getBrowser()).selectTab(tab_id))),
   );
 
@@ -928,8 +928,8 @@ export function createStandaloneServer(deps = {}) {
     { name: "browser-use", version: "4.5.0" },
     {
       instructions: [
-        "Browser use through a local Chrome bridge. Actions operate only on tabs this session creates.",
-        "Speed & efficiency: Use `browser_run` for persistent multi-turn variables (`const`/`let`/`class`), bound multi-tab handles (`browser.tabs.new()`), `browser.nameSession()` Chrome tab grouping, auto-waiting fluent locators (`getByRole`/`getByText`/`.filter({ has, hasNot, hasNotText })`/`.getAttribute()`/read-only `evaluate(fn, arg)`), diff-first `ax.write()`, filterable `ariaSnapshot()` with child iframes, `setViewport()`/`resetViewport()`, `waitForEvent('filechooser'|'download')`, and inline `end_turn`/`keep`; or `browser_batch` for linear step arrays.",
+        "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.user.claimTab()` in `browser_run`). Claimed user tabs are released (never auto-closed) when a turn ends.",
+        "Speed & efficiency: Use `browser_run` for persistent multi-turn variables (`const`/`let`/`class`), bound multi-tab handles (`browser.tabs.new()` / `browser.tabs.get(tabId)`), `browser.nameSession()` Chrome tab grouping, auto-waiting fluent locators (`getByRole`/`getByText`/`.filter({ has, hasNot, hasNotText })`/`.getAttribute()`/read-only `evaluate(fn, arg)`), diff-first `ax.write()`, filterable `ariaSnapshot()` with child iframes, `setViewport()`/`resetViewport()`, `waitForEvent('filechooser'|'download')`, and inline `end_turn`/`keep`; or `browser_batch` for linear step arrays.",
         "Diff-first: browser_get_state and ax.write() use compact structural diffs and omit screenshots by default; request screenshot=true / ax.write('screenshot') only when visual context or layout checking is needed.",
         "Always inspect with ariaSnapshot() / getState() before guessing CSS selectors; chain >> or getByRole()/getByText() locators across Shadow DOM and iframes.",
         "Pass end_turn/keep to browser_run or browser_batch, or `browser_name_session` / `browser.nameSession()` to group owned tabs visually, and `browser_end_turn` at the end for tabs that must survive cleanup.",

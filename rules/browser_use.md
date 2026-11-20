@@ -13,7 +13,7 @@ description: Use the standalone browser-use MCP server (v4.5: 36 tools, Chrome t
    - `browser_goto` auto-creates a tab when none exists and returns `<ax_state>` directly.
    - Use diff-first `browser_get_state` (`screenshot: false` by default) and `ax.write()`, requesting screenshots (`screenshot: true` or `ax.write("screenshot")`) only when visual inspection is required.
 3. **Read-only evaluate**: Use `browser_evaluate` and `evaluate(fn, arg)` strictly for read-only page inspection (including read-only `classList`/`dataset`/`style` reads); perform mutations via action and locator tools.
-4. **Isolation & approvals**:
-   - The bridge owns only tabs created in its session; never attempt to access unrelated user tabs or accounts.
+4. **Session tabs & existing user tabs**:
+   - Use `browser_list_tabs` (or `browser.tabs.list()` / `browser.user.openTabs()` in `browser_run`) to find an already-open Chrome tab when the user asks to inspect or control an existing tab, then claim/activate it with `browser_select_tab` (or `browser.tabs.get(tab_id)` / `browser.user.claimTab(tab)`). Claimed user tabs are automatically released (never closed) when the turn ends.
    - Respect authentication, CAPTCHA, and site permission boundaries. When user sign-in or approval is needed, mark the tab `handoff` in `browser_end_turn` and ask the user directly.
 5. **Turn cleanup**: End browser workflows with `browser_end_turn` (or inline `end_turn`/`keep` with `handoff` or `deliverable` when a tab must remain open).

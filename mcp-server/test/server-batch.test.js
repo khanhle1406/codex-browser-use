@@ -583,3 +583,79 @@ test("MCP server supports v4.4 multi-tab handles, diff-first ax.write modes, eva
   assert.equal(JSON.parse(runNamed.content[0].text).result.color, "green");
   assert.ok(calls.filter((c) => c.kind === "rpc" && c.method === "nameSession").length >= 3);
 });
+
+test("MCP server lists and auto-claims already-open Chrome user tabs via browser_list_tabs, browser_select_tab, tab_id, and browser.user", async (t) => {
+  const ownedTabs = new Map();
+  const userTabs = new Map([
+    [132, { id: 132, url: "https://congnghieptot.vn/new_admin/addnew_group/132", title: "Admin Group 132", active: true }],
+  ]);
+  const calls = [];
+  const browser = new BridgeBrowser({
+    info: { apiSupportOverrides: { "BrowserUser.openTabs": true, "BrowserUser.claimTab": true } },
+    request: async (method, params = {}) => {
+      calls.push({ method, params });
+      if (method === "getTabs") return [...ownedTabs.values()];
+      if (method === "getUserTabs") return [...userTabs.values()];
+      if (method === "claimUserTab") {
+        const tab = userTabs.get(params.tabId);
+        if (!tab) throw new Error("Browser tab is unavailable");
+        const claimed = { ...tab, owned: true, origin: "user" };
+        ownedTabs.set(tab.id, claimed);
+        return claimed;
+      }
+      if (method === "attach") return null;
+      if (method === "executeCdp") {
+        if (params.method === "Runtime.evaluate") {
+          return { result: { value: "Existing form data from tab 132" } };
+        }
+        return {};
+      }
+      return {};
+    },
+    close: async () => {},
+    sessionId: "s-user-tab",
+    turnId: "t-user-tab",
+  });
+
+  const server = createStandaloneServer({ getBrowser: async () => browser, resetBrowser: async () => {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-user-tab-agent", version: "1.0.0" });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  // 1. browser_list_tabs shows open user tab 132 with owned: false, origin: "user"
+  const listed = JSON.parse((await client.callTool({ name: "browser_list_tabs", arguments: {} })).content[0].text);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].tab_id, "132");
+  assert.equal(listed[0].owned, false);
+  assert.equal(listed[0].origin, "user");
+
+  // 2. Passing tab_id="132" directly to browser_evaluate auto-claims tab 132 and reads its live DOM
+  const evalRes = JSON.parse((await client.callTool({
+    name: "browser_evaluate",
+    arguments: { tab_id: "132", expression: "document.querySelector('form').innerText" },
+  })).content[0].text);
+  assert.equal(evalRes.tab_id, "132");
+  assert.equal(evalRes.value, "Existing form data from tab 132");
+  assert.ok(calls.some((c) => c.method === "claimUserTab" && c.params.tabId === 132));
+
+  // 3. browser_run can also discover and claim user tabs via browser.user.openTabs() / browser.tabs.get()
+  const runRes = JSON.parse((await client.callTool({
+    name: "browser_run",
+    arguments: {
+      return_state: "none",
+      code: `
+        const open = await browser.user.openTabs();
+        const tab = await browser.user.claimTab(open[0]);
+        const val = await tab.evaluate(() => document.body.innerText);
+        return { id: tab.id, val };
+      `,
+    },
+  })).content[0].text);
+  assert.equal(runRes.ok, true);
+  assert.equal(runRes.result.id, "132");
+  assert.equal(runRes.result.val, "Existing form data from tab 132");
+});
