@@ -75,8 +75,8 @@ function parseArgs(argv) {
       else if (arg === "--bridge") options.bridgeFile = value;
       else if (arg === "--extension-id") options.extensionId = value;
       else if (arg === "--profile") {
-        if (!["compact", "standard", "full"].includes(value)) {
-          throw new Error(`Invalid profile ${JSON.stringify(value)}. Choose compact, standard, or full.`);
+        if (!["auto", "compact", "standard", "full"].includes(value)) {
+          throw new Error(`Invalid profile ${JSON.stringify(value)}. Choose auto, compact, standard, or full.`);
         }
         options.profile = value;
       } else options.workspace = value;
@@ -97,9 +97,9 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.help || ["help", "--help", "-h"].includes(options.command)) {
     process.stdout.write([
       "Usage:",
-      "  browser-use install [--client NAME] [--profile compact|standard|full] [--write] [--skill] [--rules] [--no-rules] [--bridge FILE] [--extension-id ID] [--json]",
+      "  browser-use install [--client NAME] [--profile auto|compact|standard|full] [--write] [--skill] [--rules] [--no-rules] [--bridge FILE] [--extension-id ID] [--json]",
       "  browser-use doctor [--bridge FILE] [--engine PATH] [--json]",
-      "  browser-use config --client NAME [--profile compact|standard|full] [--bridge FILE]",
+      "  browser-use config --client NAME [--profile auto|compact|standard|full] [--bridge FILE]",
       "  browser-use setup --workspace DIR [--bridge FILE] [--json]",
       "",
       "Clients: generic, claude_code, commandcode, copilot, antigravity, cursor, windsurf, opencode, codex",

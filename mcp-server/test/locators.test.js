@@ -506,3 +506,68 @@ test("tryFillRichEditor supports CKEditor 4 (including async setData + textarea 
   assert.equal(asyncFillRes.filled, true);
   assert.equal(ckeAsyncArea.value, "<p>Tiếng Việt</p>&nbsp;");
 });
+
+test("getByLabel matches only form controls and never matches <label> or nested spans", () => {
+  const rect = () => ({ left: 10, top: 10, right: 110, bottom: 40, x: 10, y: 10, width: 100, height: 30 });
+  const doc = {
+    body: null,
+    documentElement: null,
+    querySelectorAll: () => [],
+    elementFromPoint: () => null,
+    getElementById: () => null,
+  };
+  const makeNode = (tag, props = {}) => {
+    const attrs = props.attrs ?? {};
+    return {
+      nodeType: 1,
+      tagName: tag.toUpperCase(),
+      id: attrs.id || "",
+      children: [],
+      childNodes: [],
+      labels: [],
+      shadowRoot: null,
+      ownerDocument: doc,
+      parentElement: null,
+      isContentEditable: Boolean(props.isContentEditable),
+      innerText: props.text ?? "",
+      textContent: props.text ?? "",
+      getAttribute: (k) => (k in attrs ? attrs[k] : null),
+      hasAttribute: (k) => k in attrs,
+      matches: () => false,
+      closest: function closest(sel) {
+        if (sel === "label") return this.tagName === "LABEL" ? this : this.parentElement?.closest("label") ?? null;
+        return null;
+      },
+      getBoundingClientRect: rect,
+      ...props,
+    };
+  };
+
+  // Case 1: <label for="team">Team Name</label><input id="team">
+  const teamLabel = makeNode("label", { text: "Team Name", attrs: { for: "team" } });
+  const teamInput = makeNode("input", { attrs: { id: "team", type: "text" }, labels: [teamLabel] });
+
+  // Case 2: <label><span>Certify</span><input type="checkbox"></label>
+  const wrapLabel = makeNode("label", { text: "Certify" });
+  const innerSpan = makeNode("span", { text: "Certify", parentElement: wrapLabel });
+  const checkbox = makeNode("input", { attrs: { type: "checkbox" }, parentElement: wrapLabel });
+  wrapLabel.children = [innerSpan, checkbox];
+
+  const root = makeNode("form", { children: [teamLabel, teamInput, wrapLabel] });
+  doc.body = root;
+  doc.documentElement = root;
+
+  const ctx = vm.createContext({
+    document: doc,
+    window: { innerWidth: 1280, innerHeight: 800, getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) },
+    CSS: { escape: (s) => String(s) },
+  });
+
+  const teamRes = vm.runInNewContext(locatorExpression('label="Team Name"', { mutation: "attr", attrName: "id" }), ctx);
+  assert.equal(teamRes.count, 1);
+  assert.equal(teamRes.value, "team");
+
+  const checkRes = vm.runInNewContext(locatorExpression('label="Certify"', { mutation: "attr", attrName: "type" }), ctx);
+  assert.equal(checkRes.count, 1);
+  assert.equal(checkRes.value, "checkbox");
+});

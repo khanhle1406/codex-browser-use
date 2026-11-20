@@ -285,7 +285,7 @@ export class BrowserScriptSession {
 
   /** @param {string} filePath @param {unknown} data */
   async #saveFile(filePath, data) {
-    this.#requireRun();
+    const run = this.#requireRun();
     const target = this.#assertAbsolutePath(filePath, "saveFile");
     const payload = Buffer.isBuffer(data)
       ? data
@@ -295,6 +295,7 @@ export class BrowserScriptSession {
     }
     await mkdir(path.dirname(target), { recursive: true });
     await fsWriteFile(target, payload);
+    run.savedFiles.set(target, { path: target, bytes: payload.byteLength, kind: "file" });
     return { path: target, bytes: payload.byteLength };
   }
 
@@ -341,6 +342,7 @@ export class BrowserScriptSession {
     const buf = Buffer.from(cap.data, "base64");
     await mkdir(path.dirname(target), { recursive: true });
     await fsWriteFile(target, buf);
+    run.savedFiles.set(target, { path: target, bytes: buf.byteLength, kind: "screenshot", mimeType: cap.mimeType });
     if (opts.emit === true) {
       if (run.images.length >= run.maxImages) {
         throw new Error(`Maximum ${run.maxImages} images per browser_run call exceeded`);
@@ -645,6 +647,13 @@ export class BrowserScriptSession {
           hasArg: parsed.hasArg,
         }), `locator.evaluateAll(${selector})`, guardOpts)).value;
       },
+      ariaSnapshot: async (opts = {}) => (await this.#guard((b) => b.locatorAriaSnapshot(selector, {
+        tabId: tabFor(opts),
+        frame: opts?.frame ?? frame ?? undefined,
+        maxLines: opts?.maxLines ?? opts?.max_lines ?? 2_000,
+        mode: opts?.mode ?? "compact",
+        timeoutMs: timeoutOpt(opts),
+      }), `locator.ariaSnapshot(${selector})`, guardOpts)).text,
     };
     return self;
   }
@@ -727,11 +736,16 @@ export class BrowserScriptSession {
         maxLines: opts?.maxLines ?? opts?.max_lines ?? 2_000,
       }), "getState", guardOpts),
       state: (opts = {}) => tabApi.getState(opts),
-      ariaSnapshot: async (opts = {}) => (await self.#guard((b) => b.ariaSnapshot({
-        tabId: resolveTab(opts),
-        maxLines: opts?.maxLines ?? opts?.max_lines ?? 2_000,
-        mode: opts?.mode ?? "full",
-      }), "ariaSnapshot", guardOpts)).text,
+      ariaSnapshot: async (opts = {}) => {
+        if (opts && typeof opts === "object" && opts.selector) {
+          return tabApi.locator(String(opts.selector)).ariaSnapshot(opts);
+        }
+        return (await self.#guard((b) => b.ariaSnapshot({
+          tabId: resolveTab(opts),
+          maxLines: opts?.maxLines ?? opts?.max_lines ?? 2_000,
+          mode: opts?.mode ?? "compact",
+        }), "ariaSnapshot", guardOpts)).text;
+      },
       screenshot: (opts = {}) => self.#guard((b) => b.screenshot(resolveTab(opts), {
         fullPage: opts?.fullPage ?? opts?.full_page ?? false,
         format: opts?.format ?? "jpeg",
@@ -951,6 +965,25 @@ export class BrowserScriptSession {
         frame: opts?.frame,
         timeoutMs: opts?.timeoutMs ?? opts?.timeout_ms,
       }), "uploadFiles", guardOpts),
+      innerText: (selector, opts = {}) => {
+        if (selector === undefined || selector === null || isPlainObject(selector)) {
+          return tabApi.locator("css=body").innerText(isPlainObject(selector) ? selector : opts);
+        }
+        return tabApi.locator(selector).innerText(opts);
+      },
+      textContent: (selector, opts = {}) => {
+        if (selector === undefined || selector === null || isPlainObject(selector)) {
+          return tabApi.locator("css=body").textContent(isPlainObject(selector) ? selector : opts);
+        }
+        return tabApi.locator(selector).textContent(opts);
+      },
+      inputValue: (selector, opts = {}) => tabApi.locator(selector).inputValue(opts),
+      getAttribute: (selector, name, opts = {}) => tabApi.locator(selector).getAttribute(name, opts),
+      isVisible: (selector, opts = {}) => tabApi.locator(selector).isVisible(opts),
+      isEnabled: (selector, opts = {}) => tabApi.locator(selector).isEnabled(opts),
+      isChecked: (selector, opts = {}) => tabApi.locator(selector).isChecked(opts),
+      check: (selector, opts = {}) => tabApi.locator(selector).check(opts),
+      uncheck: (selector, opts = {}) => tabApi.locator(selector).uncheck(opts),
       waitFor: (optsOrMs) => {
         if (typeof optsOrMs === "number") return self.#sleep(optsOrMs);
         if (typeof optsOrMs === "string") {
@@ -1260,6 +1293,7 @@ export class BrowserScriptSession {
       lastAction: null,
       touchedTabs: new Set(this.currentTabId ? [this.currentTabId] : []),
       keptTabs: new Map(),
+      savedFiles: new Map(),
       endTurnRequested: false,
       logs: [],
       logChars: 0,
@@ -1324,6 +1358,7 @@ export class BrowserScriptSession {
         value: boundResult(rawValue, maxResultChars),
         logs: run.logs,
         images: run.images,
+        savedFiles: [...run.savedFiles.values()],
         notifications,
         activeTabId: finalActive,
         keptTabs: [...run.keptTabs.entries()].map(([tab_id, mode]) => ({ tab_id, mode })),

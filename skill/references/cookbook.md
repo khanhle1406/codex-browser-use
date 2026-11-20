@@ -1,4 +1,4 @@
-# codex-browser-use Cookbook (v4.7.1)
+# codex-browser-use Cookbook (v4.8.0)
 
 Copy-paste patterns for `browser_run` and `browser_batch`. All local file paths passed to `saveFile`, `readFile`, and `saveScreenshot` must be **absolute paths**; parent directories are created automatically.
 
@@ -33,7 +33,7 @@ return { count: rows.length, file: saved.path, bytes: saved.bytes, sample: rows.
 
 ## Recipe 2: Probe 1 → Batch Loop Modal/Table Extraction & Multi-Click Chaining
 
-After probing **1 sample row/modal** to learn the fixed DOM/ARIA structure, pack the entire multi-page loop or deterministic multi-click chain into **1 `browser_run` call** (`timeout_ms: 300000`) with zero intermediate screenshots or AX dumps.
+After probing **1 sample row/modal** (for example `await tab.getByRole("dialog").ariaSnapshot()` for scoped modal structure) to learn the fixed DOM/ARIA layout, pack the entire multi-page loop or deterministic multi-click chain into **1 `browser_run` call** (`timeout_ms: 300000`) with zero intermediate screenshots or AX dumps.
 
 ```js
 // Pattern A: 4-click deterministic chain with zero intermediate state reads

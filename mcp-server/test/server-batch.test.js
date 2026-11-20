@@ -374,7 +374,7 @@ test("browser_run executes 1-shot script, viewImage, read-only guards, inline de
   assert.ok(calls.some((c) => c.kind === "cdp" && c.method === "Page.bringToFront"));
   assert.ok(calls.some((c) => c.kind === "rpc" && c.method === "markTab" && c.params.status === "deliverable"));
 
-  // Read-only evaluate rejection + AX state recovery
+  // Read-only evaluate rejection skips noisy <ax_state> dump
   await client.callTool({ name: "browser_goto", arguments: { url: "https://example.com" } });
   const badEval = await client.callTool({
     name: "browser_run",
@@ -384,7 +384,7 @@ test("browser_run executes 1-shot script, viewImage, read-only guards, inline de
   });
   assert.equal(badEval.isError, true);
   assert.match(badEval.content[0].text, /read-only/i);
-  assert.match(badEval.content[0].text, /<ax_state>/);
+  assert.doesNotMatch(badEval.content[0].text, /<ax_state>/);
 
   // Timeout enforcement
   const timedOut = await client.callTool({
@@ -430,22 +430,33 @@ test("browser_run persists variables & locators across turns, supports fluent ch
   assert.equal(d1.result.url, "https://example.com");
   assert.equal(d1.result.title, "App");
 
-  // Turn 2: reuse `saveBtn` and `opts` from Turn 1 and redeclare `const opts`
+  // Turn 2: reuse `saveBtn` and `opts` from Turn 1 and redeclare `const opts`, plus test page.* shorthands
   const r2 = await client.callTool({
     name: "browser_run",
     arguments: {
       code: `
         await saveBtn.click();
         const txt = await saveBtn.textContent();
+        const pageInner = await page.innerText("css=button");
+        const pageText = await page.textContent("css=button");
+        const bodyInner = await page.innerText();
+        const bodyText = await page.textContent();
+        const btnAttr = await page.getAttribute("css=button", "id");
+        await page.check('role=checkbox[name="Agree"]');
         const count = await page.locator("css=input[type=radio]").count();
         const opts = [...opts, "enterprise"];
-        return { txt, count, opts };
+        return { txt, pageInner, pageText, bodyInner, bodyText, btnAttr, count, opts };
       `,
     },
   });
   assert.notEqual(r2.isError, true);
   const d2 = JSON.parse(r2.content[0].text);
   assert.equal(d2.result.txt, "Save");
+  assert.equal(d2.result.pageInner, "Save");
+  assert.equal(d2.result.pageText, "Save");
+  assert.equal(d2.result.bodyInner, "Save");
+  assert.equal(d2.result.bodyText, "Save");
+  assert.equal(d2.result.btnAttr, "btn-save");
   assert.equal(d2.result.count, 2);
   assert.deepEqual(d2.result.opts, ["free", "pro", "enterprise"]);
 
@@ -821,6 +832,16 @@ test("MCP server v4.7.0 supports 300s browser_run, saveFile/readFile/saveScreens
   assert.notEqual(res.isError, true, JSON.stringify(res));
   const body = JSON.parse(res.content[0].text);
   assert.equal(body.ok, true);
+  assert.ok(Array.isArray(body.saved_files));
+  assert.equal(body.saved_files.length, 3);
+  assert.deepEqual(
+    body.saved_files.map((f) => ({ path: f.path, kind: f.kind, positive: f.bytes > 0 })),
+    [
+      { path: dataPath, kind: "file", positive: true },
+      { path: pageShotPath, kind: "screenshot", positive: true },
+      { path: elShotPath, kind: "screenshot", positive: true },
+    ],
+  );
   assert.ok(body.end_turn);
   assert.equal(body.result.scheduledEnd.scheduled, true);
   assert.deepEqual(body.logs, ["repl-msg"]);
@@ -843,4 +864,97 @@ test("MCP server v4.7.0 supports 300s browser_run, saveFile/readFile/saveScreens
   assert.ok(calls.some((c) => c.method === "Network.getResponseBody" && c.params.requestId === "req-42"));
   assert.ok(calls.some((c) => c.method === "Input.insertText" && c.params.text === "pasted-value"));
   assert.ok(calls.filter((c) => c.method === "Page.close").length >= 2);
+});
+
+test("browser_run suppresses <ax_state> on static/read-only errors and attaches compact <ax_state> on locator errors", async (t) => {
+  const { browser, calls } = richMockBridge();
+  const server = createStandaloneServer({ getBrowser: async () => browser, resetBrowser: async () => {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-error-state", version: "1.0.0" });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  await client.callTool({
+    name: "browser_run",
+    arguments: { code: `await page.goto("https://example.com"); return "ready";` },
+  });
+
+  const axBeforeStatic = calls.filter((c) => c.method === "Accessibility.getFullAXTree").length;
+  const readOnlyErr = await client.callTool({
+    name: "browser_run",
+    arguments: { code: `return await page.evaluate(() => { el.value = "x"; });` },
+  });
+  assert.equal(readOnlyErr.isError, true);
+  assert.match(readOnlyErr.content[0].text, /Browser evaluate is read-only/);
+  assert.doesNotMatch(readOnlyErr.content[0].text, /<ax_state>/);
+
+  const syntaxErr = await client.callTool({
+    name: "browser_run",
+    arguments: { code: `const broken = ;` },
+  });
+  assert.equal(syntaxErr.isError, true);
+  assert.doesNotMatch(syntaxErr.content[0].text, /<ax_state>/);
+  assert.equal(calls.filter((c) => c.method === "Accessibility.getFullAXTree").length, axBeforeStatic);
+
+  const locatorErr = await client.callTool({
+    name: "browser_run",
+    arguments: { code: `await page.locator("css=.missing").click({ timeoutMs: 120 });` },
+  });
+  assert.equal(locatorErr.isError, true);
+  assert.match(locatorErr.content[0].text, /<ax_state>/);
+  assert.ok(calls.filter((c) => c.method === "Accessibility.getFullAXTree").length > axBeforeStatic);
+});
+
+test("locator.ariaSnapshot() returns scoped subtree and unindexed ariaSnapshot baseline avoids redundant diff dumps", async (t) => {
+  const { browser, calls } = richMockBridge();
+  const originalRequest = browser.request;
+  let resolveCount = 0;
+  browser.request = async (method, params = {}) => {
+    if (method === "executeCdp" && params.method === "Runtime.evaluate" && params.commandParams?.returnByValue === false) {
+      resolveCount += 1;
+      return { result: { objectId: `remote-${resolveCount}` } };
+    }
+    if (method === "executeCdp" && params.method === "DOM.describeNode") {
+      return { node: { backendNodeId: 30 } };
+    }
+    return originalRequest(method, params);
+  };
+
+  const server = createStandaloneServer({ getBrowser: async () => browser, resetBrowser: async () => {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-scoped-aria", version: "1.0.0" });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  const scoped = await client.callTool({
+    name: "browser_run",
+    arguments: {
+      code: `
+        await page.goto("https://example.com");
+        const btnAria = await page.locator("css=button").ariaSnapshot();
+        await page.ariaSnapshot();
+        return btnAria;
+      `,
+    },
+  });
+  assert.notEqual(scoped.isError, true, JSON.stringify(scoped));
+  const payload = JSON.parse(scoped.content[0].text);
+  assert.equal(payload.result, '- button "Save"');
+  assert.doesNotMatch(payload.result, /textbox "Email"/);
+
+  const errAfterAria = await client.callTool({
+    name: "browser_run",
+    arguments: { code: `await page.locator("css=.missing").click({ timeoutMs: 120 });` },
+  });
+  assert.equal(errAfterAria.isError, true);
+  assert.match(errAfterAria.content[0].text, /No accessibility changes since last ariaSnapshot\(\)\./);
+  assert.doesNotMatch(errAfterAria.content[0].text, /textbox "Email"/);
+  assert.ok(resolveCount >= 1);
+  assert.ok(calls.some((c) => c.method === "Accessibility.getFullAXTree"));
 });

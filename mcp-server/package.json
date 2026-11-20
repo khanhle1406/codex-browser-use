@@ -28,7 +28,8 @@
     "start": "node src/server.js",
     "test": "node --test test/*.test.js",
     "lint": "eslint src/*.js bin test",
-    "bench": "node bench/perf-benchmark.mjs"
+    "bench": "node bench/perf-benchmark.mjs",
+    "bench:agents": "node bench/agent-benchmark.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",

@@ -22,6 +22,17 @@ export function stableNodePath() {
 }
 
 /**
+ * Recommend the most token-efficient tool profile for a client host:
+ * lazy-loading IDE clients can use `full`, while CLI/non-lazy hosts benefit from `compact`.
+ * @param {string} client
+ * @returns {"compact"|"full"}
+ */
+export function recommendedProfileForClient(client) {
+  const name = normalizeClient(client);
+  return ["antigravity", "cursor", "windsurf"].includes(name) ? "full" : "compact";
+}
+
+/**
  * Print a mergeable client fragment; never write a client's configuration.
  * @param {string} client
  * @param {{nodePath?:string, serverPath?:string, bridgeFile?:string, profile?:string}} [options]
@@ -30,8 +41,11 @@ export function stableNodePath() {
 export function buildConfig(client, options = {}) {
   const command = options.nodePath ?? stableNodePath();
   const args = [options.serverPath ?? SERVER_PATH];
-  if (options.profile && options.profile !== "full") {
-    args.push("--profile", options.profile);
+  const effectiveProfile = options.profile === "auto"
+    ? recommendedProfileForClient(client)
+    : options.profile;
+  if (effectiveProfile && effectiveProfile !== "full") {
+    args.push("--profile", effectiveProfile);
   }
   const env = options.bridgeFile ? { BROWSER_USE_BRIDGE_FILE: path.resolve(options.bridgeFile) } : {};
   const name = "browser-use";

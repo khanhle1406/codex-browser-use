@@ -692,10 +692,23 @@ export function formatAriaSnapshot(nodes, {
   baseDepth = 0,
   mode = "full",
   collapseRepeated,
+  rootBackendDOMNodeId,
 } = {}) {
   const effectiveMode = mode === "compact" || mode === "interactive" ? mode : "full";
   const shouldCollapse = collapseRepeated ?? (effectiveMode === "compact");
   const { byId, children, roots } = buildAxTreeGraph(nodes);
+  const scopedRoot = Number.isSafeInteger(rootBackendDOMNodeId)
+    ? (nodes ?? []).find((n) => n.backendDOMNodeId === rootBackendDOMNodeId) ?? null
+    : undefined;
+  if (scopedRoot === null) {
+    return {
+      text: "",
+      lineCount: 0,
+      truncated: false,
+      matched: false,
+    };
+  }
+  const activeRoots = scopedRoot ? [scopedRoot] : roots;
   const isTransparent = (node, role, name, value) => {
     if (node.ignored === true || role === "none" || role === "LineBreak" ||
         role === "InlineTextBox" || role === "RootWebArea") {
@@ -710,7 +723,7 @@ export function formatAriaSnapshot(nodes, {
     return false;
   };
   const interactiveMeta = effectiveMode === "interactive"
-    ? computeInteractiveMetadata(roots, byId, children, isTransparent, maxTextLength)
+    ? computeInteractiveMetadata(activeRoots, byId, children, isTransparent, maxTextLength)
     : null;
   const lines = [];
   let truncated = false;
@@ -803,7 +816,7 @@ export function formatAriaSnapshot(nodes, {
     });
   };
 
-  const effectiveRoots = resolveSequenceNodes(roots, byId, children, isTransparent, maxTextLength, shouldCollapse);
+  const effectiveRoots = resolveSequenceNodes(activeRoots, byId, children, isTransparent, maxTextLength, shouldCollapse);
   visitCollapsibleSequence({
     items: effectiveRoots,
     depth: 0,
@@ -820,6 +833,7 @@ export function formatAriaSnapshot(nodes, {
     text: lines.join("\n"),
     lineCount: lines.length,
     truncated,
+    ...(scopedRoot ? { matched: true } : {}),
   };
 }
 

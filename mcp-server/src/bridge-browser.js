@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { BridgeClient } from "./bridge-client.js";
 import { assertReadOnly } from "./read-only.js";
-import { buildAxDiff, buildAxState, buildDialogAxState, mergeFrameAriaSnapshots, mergeFrameAxStates } from "./ax-tree.js";
+import { buildAxDiff, buildAxState, buildDialogAxState, formatAriaSnapshot, mergeFrameAriaSnapshots, mergeFrameAxStates } from "./ax-tree.js";
 import { extractContentExpression } from "./content-extractor.js";
 import {
   LOCATOR_RUNTIME_VERSION,
@@ -1164,6 +1164,7 @@ export class BridgeBrowser {
       diff = false,
       full = false,
       mode = "full",
+      allowUnindexedBaseline = false,
     } = options ?? {};
 
     const id = await this.#resolveTab(tabId, { autoCreate: true });
@@ -1216,11 +1217,16 @@ export class BridgeBrowser {
 
     const useDiff = diff && !full;
     const prev = this.lastAxSnapshots.get(id);
-    const diffResult = useDiff
+    let diffResult = useDiff
       ? buildAxDiff(prev, { documentKey, lines: merged.lines, entries: merged.entries })
       : { mode: "full", lines: merged.lines };
+    if (useDiff && prev?.hasIndexedBaseline === false && diffResult.mode === "unchanged") {
+      diffResult = allowUnindexedBaseline
+        ? { ...diffResult, lines: ["No accessibility changes since last ariaSnapshot()."] }
+        : { mode: "full", lines: merged.lines };
+    }
 
-    this.lastAxSnapshots.set(id, { documentKey, entries: merged.entries });
+    this.lastAxSnapshots.set(id, { documentKey, entries: merged.entries, hasIndexedBaseline: true });
 
     const image = cap?.data ?? null;
     const screenshotMimeType = cap?.mimeType ?? null;
@@ -1562,6 +1568,80 @@ export class BridgeBrowser {
   }
 
   /**
+   * Resolve a locator selector (with auto-wait + frame routing) to its CDP backendDOMNodeId.
+   * @param {number} id
+   * @param {string} selector
+   * @param {{frame?:string, timeoutMs?:number, fallbackCss?:boolean}} [options]
+   * @returns {Promise<{backendNodeId:number|undefined, sessionId:string|null, sameOriginFrames:string[]|null}>}
+   */
+  async #resolveLocatorBackendNode(id, selector, { frame, timeoutMs, fallbackCss = false } = {}) {
+    let backendNodeId;
+    let sessionId = null;
+    let sameOriginFrames = null;
+    if (frame) {
+      const resolved = await this.#resolveFrameRoute(id, frame);
+      if (resolved.kind === "same-origin") sameOriginFrames = resolved.selectors;
+      else sessionId = resolved.sessionId;
+    }
+    const waitBudget = timeoutMs !== undefined ? Math.max(0, Number(timeoutMs) || 0) : DEFAULT_LOCATOR_TIMEOUT_MS;
+    const deadline = Date.now() + waitBudget;
+    const expr = locatorResolveNodeExpression(selector, { sameOriginFrames });
+    while (true) {
+      const response = await this.#cdpTarget(id, sessionId, "Runtime.evaluate", {
+        expression: expr,
+        returnByValue: false,
+        awaitPromise: false,
+      });
+      const objectId = response?.result?.objectId;
+      if (response?.exceptionDetails) {
+        if (objectId) {
+          await this.#cdpTarget(id, sessionId, "Runtime.releaseObject", { objectId }).catch(() => {});
+        }
+        const msg = response.exceptionDetails.exception?.description || response.exceptionDetails.text || "Locator resolution failed";
+        if (/did not match/i.test(msg) && Date.now() < deadline) {
+          await sleep(Math.min(50, Math.max(1, deadline - Date.now())));
+          continue;
+        }
+        throw new Error(msg);
+      }
+      if (objectId && response?.result?.subtype !== "error") {
+        let shouldRetry = false;
+        try {
+          const described = await this.#cdpTarget(id, sessionId, "DOM.describeNode", { objectId });
+          backendNodeId = described?.node?.backendNodeId;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (/Object id doesn't reference a Node|Could not find node/i.test(msg) && Date.now() < deadline) {
+            shouldRetry = true;
+          } else {
+            throw err;
+          }
+        } finally {
+          await this.#cdpTarget(id, sessionId, "Runtime.releaseObject", { objectId }).catch(() => {});
+        }
+        if (shouldRetry) {
+          await sleep(Math.min(50, Math.max(1, deadline - Date.now())));
+          continue;
+        }
+        break;
+      }
+      break;
+    }
+
+    // Minimal test mock fallback when Runtime.evaluate does not yield remote objectIds.
+    if (!Number.isSafeInteger(backendNodeId) && fallbackCss) {
+      const css = selector.startsWith("css=") ? selector.slice(4) : selector;
+      const frameDoc = await this.#cdpTarget(id, sessionId, "DOM.getDocument", { depth: 0 });
+      const { nodeId } = await this.#cdpTarget(id, sessionId, "DOM.querySelector", { nodeId: frameDoc.root.nodeId, selector: css });
+      if (nodeId) {
+        const described = await this.#cdpTarget(id, sessionId, "DOM.describeNode", { nodeId });
+        backendNodeId = described?.node?.backendNodeId;
+      }
+    }
+    return { backendNodeId, sessionId, sameOriginFrames };
+  }
+
+  /**
    * Set files on a file input (<input type="file">) or pending file chooser.
    * Uses Shadow-DOM/locator node resolution with auto-wait first, falling back to DOM.querySelector on minimal mocks.
    * @param {string|string[]} files
@@ -1582,50 +1662,11 @@ export class BridgeBrowser {
       backendNodeId = node.backendDOMNodeId;
       sessionId = node.sessionId ?? null;
     } else if (selector) {
-      let sameOriginFrames = null;
-      if (frame) {
-        const resolved = await this.#resolveFrameRoute(id, frame);
-        if (resolved.kind === "same-origin") sameOriginFrames = resolved.selectors;
-        else sessionId = resolved.sessionId;
-      }
-      const waitBudget = timeoutMs !== undefined ? Math.max(0, Number(timeoutMs) || 0) : DEFAULT_LOCATOR_TIMEOUT_MS;
-      const deadline = Date.now() + waitBudget;
-      const expr = locatorResolveNodeExpression(selector, { sameOriginFrames });
-      while (true) {
-        const response = await this.#cdpTarget(id, sessionId, "Runtime.evaluate", {
-          expression: expr,
-          returnByValue: false,
-          awaitPromise: false,
-        });
-        const objectId = response?.result?.objectId;
-        if (objectId) {
-          try {
-            const described = await this.#cdpTarget(id, sessionId, "DOM.describeNode", { objectId });
-            backendNodeId = described?.node?.backendNodeId;
-          } finally {
-            await this.#cdpTarget(id, sessionId, "Runtime.releaseObject", { objectId }).catch(() => {});
-          }
-          break;
-        }
-        if (response?.exceptionDetails) {
-          const msg = response.exceptionDetails.exception?.description || response.exceptionDetails.text || "File input resolution failed";
-          if (/did not match/i.test(msg) && Date.now() < deadline) {
-            await sleep(Math.min(50, Math.max(1, deadline - Date.now())));
-            continue;
-          }
-          throw new Error(msg);
-        }
-        break;
-      }
-
-      // Minimal test mock fallback when Runtime.evaluate does not yield remote objectIds.
+      const resolved = await this.#resolveLocatorBackendNode(id, selector, { frame, timeoutMs, fallbackCss: true });
+      backendNodeId = resolved.backendNodeId;
+      sessionId = resolved.sessionId;
       if (!Number.isSafeInteger(backendNodeId)) {
-        const css = selector.startsWith("css=") ? selector.slice(4) : selector;
-        const frameDoc = await this.#cdpTarget(id, sessionId, "DOM.getDocument", { depth: 0 });
-        const { nodeId } = await this.#cdpTarget(id, sessionId, "DOM.querySelector", { nodeId: frameDoc.root.nodeId, selector: css });
-        if (!nodeId) throw new Error(`File input not matched: ${selector}`);
-        const described = await this.#cdpTarget(id, sessionId, "DOM.describeNode", { nodeId });
-        backendNodeId = described?.node?.backendNodeId;
+        throw new Error(`File input not matched: ${selector}`);
       }
     } else {
       const pending = this.#tabState(id).fileChooser;
@@ -2322,9 +2363,10 @@ export class BridgeBrowser {
 
   /**
    * Return a clean Playwright-style YAML ARIA snapshot (with child iframes) without numeric clutter.
+   * Also syncs the AX baseline in-memory so subsequent diff calls recognize unchanged trees.
    * @param {{tabId?:unknown, maxLines?:number, mode?:"full"|"compact"|"interactive"}} [options]
    */
-  async ariaSnapshot({ tabId, maxLines = 2_000, mode = "full" } = {}) {
+  async ariaSnapshot({ tabId, maxLines = 2_000, mode = "compact" } = {}) {
     const id = await this.#resolveTab(tabId, { autoCreate: true });
     await this.attach(id);
     await Promise.all([
@@ -2345,14 +2387,70 @@ export class BridgeBrowser {
       await this.#collectChildFrames(id, frameTreeResp.frameTree, frameTrees);
     }
     const snapshot = mergeFrameAriaSnapshots(frameTrees, { maxLines, mode });
+    const tabState = this.#tabState(id);
+    const url = String(frameTreeResp?.frameTree?.frame?.url || this.tabs.get(id)?.url || tabState.url || "");
+    const documentKey = `${tabState.loaderId ?? ""}:${url}`;
+    const baseline = mergeFrameAxStates(frameTrees, { maxLines, mode });
+    this.axCache.set(id, baseline.index);
+    this.lastAxSnapshots.set(id, { documentKey, entries: baseline.entries, hasIndexedBaseline: false });
     return { tab_id: String(id), ...snapshot };
+  }
+
+  /**
+   * Return a YAML ARIA snapshot scoped strictly to the subtree matched by `selector`.
+   * @param {string} selector
+   * @param {{tabId?:unknown, frame?:string, maxLines?:number, mode?:"full"|"compact"|"interactive", timeoutMs?:number}} [options]
+   */
+  async locatorAriaSnapshot(selector, { tabId, frame, maxLines = 2_000, mode = "compact", timeoutMs } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const { backendNodeId, sessionId } = await this.#resolveLocatorBackendNode(id, selector, {
+      frame,
+      timeoutMs,
+      fallbackCss: true,
+    });
+    if (!Number.isSafeInteger(backendNodeId)) {
+      throw new Error(`Locator did not resolve to a DOM node: ${selector}`);
+    }
+    await this.#cdpTarget(id, sessionId, "Accessibility.enable", {}).catch(() => {});
+    const tree = await this.#cdpTarget(id, sessionId, "Accessibility.getFullAXTree", {});
+    let snapshot = formatAriaSnapshot(tree?.nodes ?? [], {
+      maxLines,
+      mode,
+      rootBackendDOMNodeId: backendNodeId,
+    });
+    if (!snapshot.matched && !sessionId) {
+      const frameTreeResp = await this.#cdp(id, "Page.getFrameTree").catch(() => null);
+      if (frameTreeResp?.frameTree) {
+        const childFrames = [];
+        await this.#collectChildFrames(id, frameTreeResp.frameTree, childFrames);
+        for (const child of childFrames) {
+          const candidate = formatAriaSnapshot(child.nodes ?? [], {
+            maxLines,
+            mode,
+            rootBackendDOMNodeId: backendNodeId,
+          });
+          if (candidate.matched) {
+            snapshot = candidate;
+            break;
+          }
+        }
+      }
+    }
+    return {
+      tab_id: String(id),
+      selector,
+      text: snapshot.text,
+      lineCount: snapshot.lineCount,
+      truncated: snapshot.truncated,
+    };
   }
 
   /**
    * Return a compact visible DOM snapshot (with same-origin iframes) or YAML ARIA snapshot.
    * @param {{tabId?:unknown, maxChars?:number, maxLines?:number, format?:"dom"|"aria", mode?:"full"|"compact"|"interactive"}} [options]
    */
-  async domSnapshot({ tabId, maxChars = 24_000, maxLines = 2_000, format = "dom", mode = "full" } = {}) {
+  async domSnapshot({ tabId, maxChars = 24_000, maxLines = 2_000, format = "dom", mode = "compact" } = {}) {
     if (format === "aria") {
       const aria = await this.ariaSnapshot({ tabId, maxLines, mode });
       return {

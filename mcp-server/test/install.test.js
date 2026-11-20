@@ -91,6 +91,7 @@ test("installSkill writes SKILL.md and companion references/cookbook.md with bac
   assert.equal(agy.backup, null);
   assert.ok(agy.files.includes("SKILL.md"));
   assert.ok(agy.files.includes("references/cookbook.md"));
+  assert.ok(agy.files.includes("references/tools.md"));
   assert.match(await readFile(agy.file, "utf8"), /browser_batch/);
   assert.match(await readFile(path.join(agy.dir, "references", "cookbook.md"), "utf8"), /saveFile/);
 

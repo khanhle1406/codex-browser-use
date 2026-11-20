@@ -110,7 +110,15 @@ const SHARED_DOM_HELPERS = `
     return "";
   };
 
+  const LABELABLE_TAGS = new Set(["input", "textarea", "select", "button", "meter", "output", "progress"]);
+  const LABELABLE_ROLES = new Set([
+    "textbox", "searchbox", "spinbutton", "combobox", "listbox", "checkbox", "radio", "switch", "slider",
+  ]);
+
   const labelTextFor = (el) => {
+    if (!el || !el.tagName) return "";
+    const tag = el.tagName.toLowerCase();
+    if (tag === "label") return "";
     const doc = el.ownerDocument || document;
     const labelledBy = el.getAttribute("aria-labelledby");
     if (labelledBy) {
@@ -121,10 +129,13 @@ const SHARED_DOM_HELPERS = `
       const text = Array.from(el.labels).map((l) => l.innerText || l.textContent || "").join(" ").replace(/\\s+/g, " ").trim();
       if (text) return text;
     }
-    const parentLabel = el.closest("label");
-    if (parentLabel) {
-      const text = (parentLabel.innerText || parentLabel.textContent || "").replace(/\\s+/g, " ").trim();
-      if (text) return text;
+    const isLabelable = LABELABLE_TAGS.has(tag) || Boolean(el.isContentEditable) || LABELABLE_ROLES.has(implicitRoleOf(el));
+    if (isLabelable) {
+      const parentLabel = el.parentElement?.closest("label");
+      if (parentLabel) {
+        const text = (parentLabel.innerText || parentLabel.textContent || "").replace(/\\s+/g, " ").trim();
+        if (text) return text;
+      }
     }
     return "";
   };

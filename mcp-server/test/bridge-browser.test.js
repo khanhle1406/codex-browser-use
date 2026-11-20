@@ -294,16 +294,26 @@ test("endTurn marks kept tabs, ends the turn, and rotates the turn id", async ()
   assert.equal(calls.at(-1).params.turn_id, result.nextTurnId);
 });
 
-test("assertReadOnly allows inspection and local loop state while blocking external writes", () => {
+test("assertReadOnly allows inspection and local loop/container state while blocking external writes", () => {
   assert.equal(assertReadOnly("document.querySelector('.x').innerText"), "document.querySelector('.x').innerText");
   assert.doesNotThrow(() => assertReadOnly("(() => { let sum = 0; for (let i = 0; i < 3; i++) { sum += i; } return sum; })()"));
   assert.doesNotThrow(() => assertReadOnly("(els) => { let c = 0; c += els.length; return c; }"));
   assert.doesNotThrow(() => assertReadOnly("(el) => ({ active: el.classList.contains('active'), id: el.dataset.id, display: el.style.display })"));
   assert.doesNotThrow(() => assertReadOnly("(el) => Object.keys(el.dataset)"));
+  assert.doesNotThrow(() => assertReadOnly("(headings) => { const res = {}; headings.forEach((h, i) => { res.id = h + i; }); return res; }"));
+  assert.doesNotThrow(() => assertReadOnly("(el) => { const arr = []; arr[0] = el.textContent; return arr; }"));
+  assert.doesNotThrow(() => assertReadOnly("(keys) => { const c = {}; for (const k of keys) { c[k] = (c[k] || 0) + 1; c[k]++; } return c; }"));
+  assert.doesNotThrow(() => assertReadOnly("(() => { const m = Object.create(null); m.x = 1; return m; })()"));
   assert.throws(() => assertReadOnly("undeclaredVar = 1"), /assignment is not allowed/);
   assert.throws(() => assertReadOnly("el.value = 'x'"), /assignment is not allowed/);
   assert.throws(() => assertReadOnly("el.style.color = 'red'"), /assignment is not allowed/);
   assert.throws(() => assertReadOnly("el.dataset.id = '1'"), /assignment is not allowed/);
+  assert.throws(() => assertReadOnly("(el) => { const x = {}; ((x) => { x.value = '1'; })(el); }"), /assignment is not allowed/);
+  assert.throws(() => assertReadOnly("(el) => { const r = {}; r.el = el; r.el.value = '1'; }"), /assignment is not allowed/);
+  assert.throws(() => assertReadOnly("(el) => { let a = {}; a = el; a.value = '1'; }"), /assignment is not allowed/);
+  assert.throws(() => assertReadOnly("(() => { const r = {}; r.__proto__ = {}; return r; })()"), /assignment is not allowed/);
+  assert.throws(() => assertReadOnly("(() => { const r = {}; r['constructor'] = 1; return r; })()"), /assignment is not allowed/);
+  assert.throws(() => assertReadOnly("(el) => { const r = {}; r[el.click()] = 1; return r; }"), /click\(\) is not allowed/);
   assert.throws(() => assertReadOnly("localStorage.setItem('a','b')"), /setItem\(\) is not allowed/);
   assert.throws(() => assertReadOnly("history.pushState({}, '', '/x')"), /pushState\(\) is not allowed/);
   assert.throws(() => assertReadOnly("delete document.body.dataset.x"), /delete is not allowed/);
@@ -795,4 +805,96 @@ test("screenshot caps wide viewports at maxWidth and batch supports get_content 
   assert.equal(batchRes.ok, true);
   assert.equal(batchRes.completed_steps[0].result.text, "# Clean");
   assert.equal(batchRes.completed_steps[1].result.value, "Ex Title");
+});
+
+test("unified AX baseline shares unchanged and diff state between ariaSnapshot() and getState()", async () => {
+  let axNodes = [
+    { nodeId: "1", role: { value: "RootWebArea" }, name: { value: "Ex" }, backendDOMNodeId: 1, childIds: ["2"] },
+    { nodeId: "2", parentId: "1", role: { value: "button" }, name: { value: "Save" }, backendDOMNodeId: 20 },
+  ];
+  const browser = new BridgeBrowser({
+    request: async (method, params = {}) => {
+      if (method === "getTabs") return [{ id: 1, url: "https://example.com", title: "Ex" }];
+      if (method === "attach") return null;
+      if (method === "executeCdp") {
+        if (params.method === "Accessibility.getFullAXTree") return { nodes: axNodes };
+        if (params.method === "Page.getFrameTree") return { frameTree: { frame: { id: "f1", url: "https://example.com" }, childFrames: [] } };
+        if (params.method === "Runtime.evaluate") return { result: { value: { title: "Ex", url: "https://example.com" } } };
+      }
+      return {};
+    },
+    close: async () => {},
+    sessionId: "s-unify",
+    turnId: "t-unify",
+  });
+
+  await browser.ariaSnapshot({ tabId: 1 });
+  const unchangedAllowed = await browser.getState(1, { screenshot: false, diff: true, allowUnindexedBaseline: true });
+  assert.equal(unchangedAllowed.mode, "unchanged");
+  assert.match(unchangedAllowed.axText, /No accessibility changes since last ariaSnapshot\(\)\./);
+
+  await browser.ariaSnapshot({ tabId: 1 });
+  const needsIndices = await browser.getState(1, { screenshot: false, diff: true });
+  assert.equal(needsIndices.mode, "full");
+  assert.match(needsIndices.axText, /\d+ button "Save"/);
+
+  await browser.ariaSnapshot({ tabId: 1 });
+  axNodes = [
+    { nodeId: "1", role: { value: "RootWebArea" }, name: { value: "Ex" }, backendDOMNodeId: 1, childIds: ["2", "3"] },
+    { nodeId: "2", parentId: "1", role: { value: "button" }, name: { value: "Save" }, backendDOMNodeId: 20 },
+    { nodeId: "3", parentId: "1", role: { value: "textbox" }, name: { value: "Email" }, backendDOMNodeId: 30 },
+  ];
+  const changedDiff = await browser.getState(1, { screenshot: false, diff: true });
+  assert.equal(changedDiff.mode, "diff");
+  assert.match(changedDiff.axText, /\[added\]/);
+  assert.match(changedDiff.axText, /textbox "Email"/);
+});
+
+test("locatorAriaSnapshot skips error objectIds on missed first attempt and retries cleanly until element mounts", async () => {
+  const rpcCalls = [];
+  let attempts = 0;
+  const browser = new BridgeBrowser({
+    request: async (method, params = {}) => {
+      rpcCalls.push({ method, cdpMethod: params.method, params });
+      if (method === "getTabs") return [{ id: 1, url: "https://example.com", title: "Ex" }];
+      if (method === "attach") return null;
+      if (method === "executeCdp") {
+        if (params.method === "Runtime.evaluate") {
+          attempts += 1;
+          if (attempts === 1) {
+            return {
+              result: { type: "object", subtype: "error", objectId: "err-1" },
+              exceptionDetails: { exception: { description: "Error: Locator did not match any element: role=dialog" } },
+            };
+          }
+          return { result: { type: "object", objectId: "node-1" } };
+        }
+        if (params.method === "DOM.describeNode") {
+          assert.equal(params.commandParams?.objectId, "node-1");
+          return { node: { backendNodeId: 50 } };
+        }
+        if (params.method === "Accessibility.getFullAXTree") {
+          return {
+            nodes: [
+              { nodeId: "root", role: { value: "RootWebArea" }, backendDOMNodeId: 1, childIds: ["dlg"] },
+              { nodeId: "dlg", parentId: "root", role: { value: "dialog" }, name: { value: "Details" }, backendDOMNodeId: 50, childIds: ["close"] },
+              { nodeId: "close", parentId: "dlg", role: { value: "button" }, name: { value: "Close" }, backendDOMNodeId: 51 },
+            ],
+          };
+        }
+      }
+      return {};
+    },
+    close: async () => {},
+    sessionId: "s-retry",
+    turnId: "t-retry",
+  });
+
+  const snap = await browser.locatorAriaSnapshot("role=dialog", { tabId: 1, timeoutMs: 500 });
+  assert.equal(attempts, 2);
+  assert.equal(snap.text, '- dialog "Details"\n  - button "Close"');
+  const releases = rpcCalls
+    .filter((c) => c.cdpMethod === "Runtime.releaseObject")
+    .map((c) => c.params.commandParams?.objectId);
+  assert.deepEqual(releases, ["err-1", "node-1"]);
 });

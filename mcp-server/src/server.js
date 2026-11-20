@@ -46,6 +46,34 @@ function resolveKeepEntries(keep, fallbackTabId, extraKept = []) {
   return [...merged.entries()].map(([tab_id, mode]) => ({ tab_id, mode }));
 }
 
+/**
+ * Return false for static validation, script syntax, or local file-helper errors so
+ * error handling skips dumping an unrelated `<ax_state>` tree into context.
+ * @param {unknown} error
+ * @param {string} msg
+ * @returns {boolean}
+ */
+function shouldAttachErrorState(error, msg) {
+  if (
+    error instanceof SyntaxError ||
+    error instanceof ReferenceError ||
+    error instanceof TypeError ||
+    error instanceof RangeError ||
+    ["SyntaxError", "ReferenceError", "TypeError", "RangeError"].includes(/** @type {any} */ (error)?.name)
+  ) {
+    return false;
+  }
+  if (
+    /^Browser evaluate (is read-only|could not parse|requires a JavaScript expression)/i.test(msg) ||
+    /^(saveFile|readFile|saveScreenshot) (requires|payload exceeds)/i.test(msg) ||
+    /^Maximum \d+ images per browser_run call exceeded/i.test(msg) ||
+    /^No browser tab is active/i.test(msg)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 /** @type {Promise<BridgeBrowser>|null} */
 let browserPromise = null;
 
@@ -297,7 +325,7 @@ export function registerTools(server, deps = {}) {
       tab_id: stringOrNumber.optional().describe("Optional initial tab_id"),
       timeout_ms: z.number().int().min(500).max(300_000).optional().describe("Timeout ms (default 45000, max 300000)"),
       return_state: returnStateEnum.optional().describe("Post-script state (default diff if result undefined, else none)"),
-      mode: axModeEnum.optional().describe("AX compression mode: full (default), compact, or interactive"),
+      mode: axModeEnum.optional().describe("AX compression mode: compact (default), full, or interactive"),
       end_turn: z.boolean().optional().describe("End turn automatically after script succeeds"),
       keep: keepParamSchema.optional().describe('Keep mode ("handoff" | "deliverable") or [{ tab_id, mode }]'),
       max_lines: z.number().int().min(1).max(10_000).optional().describe("Max AX lines (default 1500)"),
@@ -328,7 +356,7 @@ export function registerTools(server, deps = {}) {
             diff: effectiveReturnState === "diff",
             full: effectiveReturnState === "full" || effectiveReturnState === "both",
             maxLines: max_lines ?? 1_500,
-            mode: mode ?? "full",
+            mode: mode ?? "compact",
           }).catch(() => null);
           if (state?.screenshotBase64) {
             images.push({ data: state.screenshotBase64, mimeType: state.screenshotMimeType || "image/jpeg" });
@@ -346,6 +374,7 @@ export function registerTools(server, deps = {}) {
           ok: true,
           tab_id: run.activeTabId,
           ...(run.value !== undefined ? { result: run.value } : {}),
+          ...(run.savedFiles?.length > 0 ? { saved_files: run.savedFiles } : {}),
           ...(run.logs.length > 0 ? { logs: run.logs } : {}),
           ...(endTurnResult ? { end_turn: endTurnResult } : {}),
         };
@@ -363,8 +392,14 @@ export function registerTools(server, deps = {}) {
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         const fallbackTab = run?.activeTabId ?? tab_id ?? browser?.activeTabId;
-        const errState = (browser && fallbackTab != null)
-          ? await browser.getState(fallbackTab, { screenshot: false, diff: true, maxLines: max_lines ?? 1_500 }).catch(() => null)
+        const errState = (browser && fallbackTab != null && shouldAttachErrorState(error, msg))
+          ? await browser.getState(fallbackTab, {
+            screenshot: false,
+            diff: true,
+            mode: mode ?? "compact",
+            maxLines: Math.min(max_lines ?? 250, 250),
+            allowUnindexedBaseline: true,
+          }).catch(() => null)
           : null;
         const parts = [msg];
         if (errState?.notifications?.length) {
@@ -383,7 +418,7 @@ export function registerTools(server, deps = {}) {
       steps: z.array(profile === "compact" ? compactBatchStepSchema : batchStepSchema).min(1).max(50).describe("Ordered action steps"),
       tab_id: stringOrNumber.optional().describe("Optional tab_id"),
       return_state: returnStateEnum.optional().describe("Final state (default diff)"),
-      mode: axModeEnum.optional().describe("AX mode: full, compact, or interactive"),
+      mode: axModeEnum.optional().describe("AX mode: compact (default), full, or interactive"),
       max_lines: z.number().int().min(1).max(10_000).optional().describe("Max AX lines (default 1500)"),
       stop_on_error: z.boolean().optional().describe("Stop on first error (default true)"),
       end_turn: z.boolean().optional().describe("End turn after all steps succeed"),
@@ -394,7 +429,7 @@ export function registerTools(server, deps = {}) {
       const result = await browser.batch(steps, {
         tabId: tab_id,
         returnState: return_state ?? "diff",
-        mode: mode ?? "full",
+        mode: mode ?? "compact",
         maxLines: max_lines ?? 1_500,
         stopOnError: stop_on_error !== false,
       });
@@ -1012,7 +1047,7 @@ export function registerTools(server, deps = {}) {
 export function createStandaloneServer(deps = {}) {
   const profile = deps.profile ?? resolveToolProfile();
   const server = new McpServer(
-    { name: "browser-use", version: "4.7.1" },
+    { name: "browser-use", version: "4.8.0" },
     {
       instructions: [
         "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.tabs.read()` / `browser.user.claimTab()` in `browser_run`). Claimed user tabs join the session Chrome Tab Group and are released (kept open & grouped) when a turn ends.",

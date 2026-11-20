@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { assertRuntime, discoverEngine, validateEngine } from "../src/engine-discovery.js";
 import { defaultBridgeFile } from "../src/backend-discovery.js";
+import { recommendedProfileForClient } from "../src/config.js";
 import { buildConfig } from "../bin/browser-use.js";
 
 /** @param {string} root @param {string} version @returns {Promise<string>} */
@@ -147,4 +148,17 @@ test("one workspace setup pins all three providers to the same bridge without ov
   const doctor = spawnSync(process.execPath, [cli, "doctor", "--engine", enginePath, "--bridge", descriptor, "--json"], {encoding: "utf8"});
   assert.equal(doctor.status, 1);
   assert.equal(JSON.parse(doctor.stdout).ready, false);
+});
+
+test("recommendedProfileForClient and --profile auto select compact for CLI hosts and full for lazy IDE hosts", () => {
+  assert.equal(recommendedProfileForClient("antigravity"), "full");
+  assert.equal(recommendedProfileForClient("agy"), "full");
+  assert.equal(recommendedProfileForClient("cursor"), "full");
+  assert.equal(recommendedProfileForClient("windsurf"), "full");
+  for (const cliClient of ["codex", "claude_code", "commandcode", "copilot", "opencode", "generic"]) {
+    assert.equal(recommendedProfileForClient(cliClient), "compact");
+  }
+  const opts = { nodePath: "/node", serverPath: "/srv.js", bridgeFile: "/b.json", profile: "auto" };
+  assert.deepEqual(buildConfig("codex", opts).mcp_servers["browser-use"].args, ["/srv.js", "--profile", "compact"]);
+  assert.deepEqual(buildConfig("antigravity", opts).mcpServers["browser-use"].args, ["/srv.js"]);
 });

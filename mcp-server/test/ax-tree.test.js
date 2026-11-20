@@ -369,3 +369,28 @@ test("formatAriaSnapshot and mergeFrameAriaSnapshots support compact and interac
   ], { mode: "compact" });
   assert.ok(mergedAxCompact.lines.some((l) => l.includes("... (+3 similar listitem items omitted)")));
 });
+
+test("formatAriaSnapshot supports scoped subtree extraction by rootBackendDOMNodeId", () => {
+  const nodes = [
+    { nodeId: "root", role: { value: "RootWebArea" }, name: { value: "Portal" }, backendDOMNodeId: 1, childIds: ["main", "backdrop"] },
+    { nodeId: "main", parentId: "root", role: { value: "main" }, backendDOMNodeId: 2, childIds: ["unrelatedBtn"] },
+    { nodeId: "unrelatedBtn", parentId: "main", role: { value: "button" }, name: { value: "Outside" }, backendDOMNodeId: 3 },
+    { nodeId: "backdrop", parentId: "root", role: { value: "generic" }, backendDOMNodeId: 40, childIds: ["dlg"] },
+    { nodeId: "dlg", parentId: "backdrop", role: { value: "dialog" }, name: { value: "Case Details" }, backendDOMNodeId: 50, childIds: ["h", "close"] },
+    { nodeId: "h", parentId: "dlg", role: { value: "heading" }, name: { value: "TC-01" }, backendDOMNodeId: 51, properties: [{ name: "level", value: { value: 2 } }] },
+    { nodeId: "close", parentId: "dlg", role: { value: "button" }, name: { value: "Close" }, backendDOMNodeId: 52 },
+  ];
+
+  const scoped = formatAriaSnapshot(nodes, { mode: "compact", rootBackendDOMNodeId: 40 });
+  assert.equal(scoped.matched, true);
+  assert.deepEqual(scoped.text.split("\n"), [
+    '- dialog "Case Details"',
+    '  - heading "TC-01" [level=2]',
+    '  - button "Close"',
+  ]);
+
+  const missing = formatAriaSnapshot(nodes, { mode: "compact", rootBackendDOMNodeId: 999 });
+  assert.equal(missing.matched, false);
+  assert.equal(missing.lineCount, 0);
+  assert.equal(missing.text, "");
+});

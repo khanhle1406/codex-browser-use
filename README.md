@@ -10,7 +10,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-26.12.1%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#quick-start)
-[![Version](https://img.shields.io/badge/MCP-v4.7.0%20%7C%2036%20tools-5B8DEF?style=flat-square)](#why-its-better)
+[![Version](https://img.shields.io/badge/MCP-v4.8.0%20%7C%2036%20tools-5B8DEF?style=flat-square)](#why-its-better)
 [![Extension](https://img.shields.io/badge/Extension-v0.6.0-34D399?style=flat-square)](#quick-start)
 [![GitHub stars](https://img.shields.io/github/stars/khanhle1406/codex-browser-use?style=flat-square)](https://github.com/khanhle1406/codex-browser-use/stargazers)
 
@@ -50,15 +50,15 @@ node mcp-server/bin/browser-use.js install --client antigravity --write --skill
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-`install --skill` copies the Chrome extension (`v0.6.0`), registers the local Chrome Native Messaging host, writes your client's MCP config (saving a `.bak` backup first), installs the full skill bundle (`skill/SKILL.md` + `skill/references/cookbook.md`), and automatically installs the always-on rules file (`rules/browser_use.md`, or `.cursor/rules/browser_use.mdc` for Cursor) when supported (pass `--no-rules` to skip, or `--rules` standalone).
+`install --skill` copies the Chrome extension (`v0.6.0`), registers the local Chrome Native Messaging host, writes your client's MCP config (saving a `.bak` backup first), installs the full skill bundle (`skill/SKILL.md` + `skill/references/cookbook.md` + `skill/references/tools.md`), and automatically installs the always-on rules file (`rules/browser_use.md`, or `.cursor/rules/browser_use.mdc` for Cursor) when supported (pass `--no-rules` to skip, or `--rules` standalone).
 
 <details>
-<summary><strong>Supported clients &amp; compact profile (Command Code, Cursor, Windsurf, Copilot, Claude Code, Codex, OpenCode)</strong></summary>
+<summary><strong>Supported clients &amp; tool profiles (<code>--profile auto | compact | standard | full</code>)</strong></summary>
 
 | Client | MCP Config | Skill Folder | Rules Installed by `--skill` |
 | --- | --- | --- | --- |
 | `antigravity` | `~/.gemini/config/mcp_config.json` | `~/.gemini/config/skills/codex-browser-use/` | `~/.gemini/config/rules/browser_use.md` |
-| `commandcode` | `~/.commandcode/mcp.json` | `~/.agents/skills/codex-browser-use/` | `~/.agents/rules/browser_use.md` *(recommend `--profile compact`)* |
+| `commandcode` | `~/.commandcode/mcp.json` | `~/.agents/skills/codex-browser-use/` | `~/.agents/rules/browser_use.md` *(recommend `--profile compact` or `auto`)* |
 | `cursor` | `~/.cursor/mcp.json` | `~/.cursor/skills/codex-browser-use/` | `~/.cursor/rules/browser_use.mdc` *(with Cursor frontmatter)* |
 | `windsurf` | `~/.codeium/windsurf/mcp_config.json` | `~/.codeium/windsurf/skills/codex-browser-use/` | `~/.codeium/windsurf/rules/browser_use.md` |
 | `copilot` | `~/.copilot/mcp-config.json` | `~/.agents/skills/codex-browser-use/` | `~/.agents/rules/browser_use.md` |
@@ -66,11 +66,11 @@ node mcp-server/bin/browser-use.js doctor --json
 | `codex` | Print TOML via `config` | `~/.codex/skills/codex-browser-use/` | *(skipped)* |
 | `opencode` / `generic` | Print config via `config` | `~/.agents/skills/codex-browser-use/` | `~/.agents/rules/browser_use.md` |
 
-For non-lazy CLI clients (such as Command Code), add `--profile compact` (or set `BROWSER_USE_TOOL_PROFILE=compact`) to register only the 7 core tools and cut fixed tool schema size by **75.7%** (`7,325` bytes / `~1,832` est. tokens vs `30,170` bytes / `~7,543` est. tokens). `full` (36 tools) stays the default for lazy-loading clients like Antigravity, and `standard` (14 tools) is also available:
+For non-lazy CLI clients (Codex, Claude Code, Command Code, Copilot, OpenCode), pass `--profile auto` (auto-picks `"compact"` for CLIs and `"full"` for lazy-loading IDEs) or `--profile compact` / `BROWSER_USE_TOOL_PROFILE=compact` to register only the 7 core tools and cut fixed tool schema size by **75.4%** (`7,457` bytes / `~1,865` est. tokens vs `30,302` bytes / `~7,576` est. tokens):
 
 ```sh
-node mcp-server/bin/browser-use.js install --client commandcode --write --skill --profile compact
-node mcp-server/bin/browser-use.js config --client commandcode --profile compact
+node mcp-server/bin/browser-use.js install --client commandcode --write --skill --profile auto
+node mcp-server/bin/browser-use.js config --client codex --profile auto
 ```
 
 For Codex or OpenCode, print the config snippet and install the skill:
@@ -104,15 +104,15 @@ and leave the final tab open for me to check.
 
 ### 1. Everything stays on your computer
 
-Your agent talks to a local MCP server (`v4.7.0`), which sends commands straight into your running Chrome browser through a lightweight extension (`v0.6.0`). There is no cloud service, no Playwright browser download, and no hidden background server.
+Your agent talks to a local MCP server (`v4.8.0`), which sends commands straight into your running Chrome browser through a lightweight extension (`v0.6.0`). There is no cloud service, no Playwright browser download, and no hidden background server.
 
 <img src="docs/assets/how-it-works-architecture.png" alt="4-layer local flow from AI Agent to MCP Server to Local Bridge to Chrome Tab" width="100%" />
 
 ### 2. One turn, tiny token usage, zero wasted waiting
 
-Instead of taking one tiny step per AI message, your agent can run a whole multi-step flow (up to `300,000` ms / `5` min per `browser_run` call) and even process up to `10` URLs in parallel (`browser.tabs.content()`). When reading a page, it gets a clean numbered list of buttons and inputs with `mode: "full" | "compact" | "interactive"` (collapsing repetitive rows/items and pruning static boilerplate), structured content export (`browser_get_content` & `page.content.export()` / `.tables()` / `.links()` in `markdown`, `tables`, `links`, or `text`), CSS-scaled screenshots (`max_width` default `1280` px, JPEG quality `75`), and diff-only updates — keeping token usage tiny.
+Instead of taking one tiny step per AI message, your agent can run a whole multi-step flow (up to `300,000` ms / `5` min per `browser_run` call) and even process up to `10` URLs in parallel (`browser.tabs.content()`). Page snapshots default to `mode: "compact"` (with `"full"` and `"interactive"` available) across `browser_run`, `browser_batch`, and `ariaSnapshot()`, share a unified AX diff baseline across `ariaSnapshot()` and `getState()`, support scoped `locator.ariaSnapshot()` subtrees (such as a single dialog or card), structured content export (`browser_get_content` & `page.content.export()` / `.tables()` / `.links()`), CSS-scaled screenshots (`max_width` default `1280` px, JPEG quality `75`), and diff-only updates — keeping token usage tiny.
 
-In `v4.7.0`, `browser_run` adds zero-bloat local file helpers (`saveFile`, `readFile`, `saveScreenshot` with `emit: true`, `nodeRepl` alias), tightly clipped `locator.screenshot()` / `page.elementScreenshot()`, `tab.ax.paste()` / `tab.ax.selectText()`, and network response body capture via `tab.dev.enableNetwork({ captureBodies: true })` + `tab.dev.responseBody(requestId)`.
+In `v4.7.0`–`v4.8.0`, `browser_run` adds zero-bloat local file helpers (`saveFile`, `readFile`, `saveScreenshot` with `emit: true`, `nodeRepl` alias) that auto-report `saved_files` metadata, tightly clipped `locator.screenshot()` / `page.elementScreenshot()`, `tab.ax.paste()` / `tab.ax.selectText()`, `page.innerText()` / `page.textContent()` / `page.check()` shorthands, read-only `evaluate()` support for local `{}`/`[]` container builds, network response body capture via `tab.dev.enableNetwork({ captureBodies: true })` + `tab.dev.responseBody(requestId)`, and `--profile auto` client selection.
 
 <img src="docs/assets/how-it-works-workflow.png" alt="One-call workflow: run script, read only what changed, and act without timer polling" width="100%" />
 
@@ -162,10 +162,32 @@ Your agent can open fresh tabs in its own colored Chrome Tab Group (with `target
 | Named Chrome Tab Groups | ❌ | ✅ | ✅ |
 | Fast local speed without timer polling | ❌ Slow per-step wait | ✅ | ✅ Up to 6.83x faster in parallel |
 
-Under the hood, commands run in parallel over the local bridge and wait directly on Chrome page events instead of polling on timers — making 4-tab parallel runs **6.83x faster** and full page + iframe + screenshot reads **~3x faster**. Across `v4.6.0`–`v4.7.0`, the persistent in-page locator runtime cache (`globalThis.__buRt` v2) cuts 10 warm locator payloads from `379,520` bytes to `1,260` bytes (**99.7% reduction**), `compact` AX snapshots shrink output by **81.7%** (`3,812` → `699` chars), `markdown` content extraction shrinks raw text by **94.1%** (`1,524` → `90` chars), and `--profile compact` cuts MCP tool schema size by **75.4%**.
+Under the hood, commands run in parallel over the local bridge and wait directly on Chrome page events instead of polling on timers — making 4-tab parallel runs **6.83x faster** and full page + iframe + screenshot reads **~3x faster**. Across `v4.6.0`–`v4.8.0`, the persistent in-page locator runtime cache (`globalThis.__buRt` v2) cuts 10 warm locator payloads from `379,520` bytes to `1,260` bytes (**99.7% reduction**), `compact` AX snapshots shrink output by **81.7%** (`3,812` → `699` chars), `markdown` content extraction shrinks raw text by **94.1%** (`1,524` → `90` chars), and `--profile compact` cuts MCP tool schema size by **75.4%**. In a live end-to-end Chrome agent benchmark on the exact same model (`gpt-6.1-terra`, medium), `codex-browser-use` (`--profile compact`) completed the 4-task suite **28.8% faster** (`55.79s` vs `78.38s`) with **3.80x faster** browser execution (`3.48s` vs `13.21s`) and **51.9% fewer total input tokens** (`305,934` vs `636,008`) than Codex's built-in Chrome plugin.
 
 <details>
 <summary><strong>See full benchmark numbers &amp; run it yourself</strong></summary>
+
+#### Live Same-Model Agent Benchmark (`gpt-6.1-terra medium`, Real Chrome)
+
+Measured end-to-end with [agent-benchmark.mjs](mcp-server/bench/agent-benchmark.mjs) against a deterministic 4-task Chrome portal (2-page modal scraping, Shadow DOM + `contenteditable` form submission, screenshot Proof of Work, and token audit; both scored **100/100**):
+
+| Metric | Codex Built-in Chrome Plugin (`node_repl:js`) | `codex-browser-use v4.8.0` (`--profile compact`) | Verified Gain |
+| --- | ---: | ---: | --- |
+| **Grade** | `100 / 100` | **`100 / 100`** | Equal accuracy (`8/8` modals, `1` submit) |
+| **Total Wall-Clock** | `78.38s` (`78,380 ms`) | **`55.79s`** (`55,792 ms`) | **28.8% faster** (`-22.59s`) |
+| **Time to First Browser Action (TTFA)** | `28.65s` (`28,646 ms`) | **`12.86s`** (`12,860 ms`) | **55.1% faster** |
+| **Browser Execution Time** | `13.21s` (`13,207 ms`) | **`3.48s`** (`3,476 ms`) | **3.80x faster** (`-73.7%`) |
+| **Browser Tool Calls** | `12` | **`8`** | **33.3% fewer calls** |
+| **Total Input Tokens (incl. cache)** | `636,008` | **`305,934`** | **51.9% fewer tokens** |
+| **Uncached Input Tokens** | `52,584` | **`20,494`** | **61.0% fewer uncached tokens** |
+
+Run the live agent benchmark on Chrome (`same-model`, `head-to-head`, or `all`):
+
+```sh
+npm --prefix mcp-server run bench:agents -- --mode same-model
+```
+
+#### Core IPC &amp; Payload Micro-Benchmarks
 
 Measured on Node `v26.13.0` with [perf-benchmark.mjs](mcp-server/bench/perf-benchmark.mjs) using real local sockets, Native Messaging streams, in-memory MCP transport, and simulated page latencies held identical before vs. after optimization:
 
@@ -252,11 +274,13 @@ Run tests, lint, and health checks anytime:
 npm --prefix mcp-server test
 npm --prefix mcp-server run lint
 npm --prefix mcp-server run bench
+npm --prefix mcp-server run bench:agents -- --mode same-model
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-- [Agent Skill Instructions](skill/SKILL.md) — workflow guide and v4.7.0 API reference installed for your coding agent
+- [Agent Skill Instructions](skill/SKILL.md) — workflow guide and v4.8.0 API reference installed for your coding agent
 - [Workflow Cookbook](skill/references/cookbook.md) — copy-paste recipes for pagination, passive reads, `responseBody()`, and screenshots
+- [Tool Profiles & Inventory](skill/references/tools.md) — `--profile auto|compact|standard|full` comparison and full 36-tool list
 - [Browser Policy Rule](rules/browser_use.md) — always-on safety and token-efficiency rules
 - [Compatibility & Engine Modes](docs/compatibility.md) — standalone setup details
 - [Transport & IPC Notes](docs/transport-investigation.md) — how the local socket and native bridge work
