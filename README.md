@@ -34,7 +34,7 @@ Want your coding agent to open a website, click buttons, fill out forms, and tes
 
 OpenAI Codex solved this cleanly by connecting straight to your real Chrome browser and reading pages as a short numbered list instead of raw HTML. The only catch is that it only works inside Codex. So I cloned the idea from scratch as a free, open-source tool that works with **any coding agent** — and tuned it to run even faster.
 
-Setup takes one command. It installs a small Chrome extension, registers the local bridge, and sets up your agent automatically. Everything stays on your computer, and your personal Chrome tabs stay completely untouched.
+Setup takes one command. It installs a small Chrome extension, registers the local bridge, and sets up your agent automatically. Your agent works right inside your currently open Chrome — keeping your existing cookies and signed-in sessions — while leaving your own open tabs and ongoing work completely untouched.
 
 ## Quick start
 
@@ -121,7 +121,7 @@ Or pass a simple list of steps (`goto`, `set_viewport`, `locator_fill`, `locator
 
 ### 3. Your personal tabs stay completely separate
 
-The extension only touches tabs it opened for the current agent session. Your personal tabs, logins, and open windows are never visible to the agent. If multiple agents work at the same time, each one gets its own isolated tabs and its own colored Chrome Tab Group, and temporary tabs close automatically when the task finishes.
+The extension only touches tabs it opens for the current agent session. Your existing open tabs, windows, and ongoing work stay private and untouched, while new agent tabs still share your Chrome profile's cookies and signed-in sessions so you don't have to log in from scratch. If multiple agents work at the same time, each one gets its own isolated tabs and its own colored Chrome Tab Group, and temporary tabs close automatically when the task finishes.
 
 <img src="docs/assets/how-it-works-isolation.png" alt="Chrome Tab Groups keeping Personal Tabs untouched while isolating Agent A and Agent B" width="100%" />
 
@@ -206,7 +206,7 @@ No. The extension only accesses blank tabs it created for that agent session. Yo
 <details>
 <summary><strong>Why not just use Playwright MCP?</strong></summary>
 
-Playwright installs heavy separate browsers, starts cold every time, and often sends large DOM dumps or full PNGs per action. `codex-browser-use` connects straight to your everyday Chrome with short page outlines, named Tab Groups, and 1-call scripts — nothing extra to download.
+Playwright installs heavy separate browsers, starts cold with no cookies or logins every time, and often sends large DOM dumps or full PNGs per action. `codex-browser-use` connects straight to your running Chrome — keeping your existing cookies, signed-in sessions, and ongoing work untouched — with short page outlines, named Tab Groups, and 1-call scripts.
 
 </details>
 
