@@ -11,6 +11,12 @@ import { createTabHandlers } from "../src/backend-tabs.js";
 import { createNativeTabDriver } from "../src/backend-native-driver.js";
 import { BridgeClient } from "../src/bridge-client.js";
 import { BridgeBrowser } from "../src/bridge-browser.js";
+import { buildAxState } from "../src/ax-tree.js";
+import { extractContentExpression } from "../src/content-extractor.js";
+import { locatorExpression, locatorInvokeExpression, locatorRuntimeInstallExpression } from "../src/locators.js";
+import { createStandaloneServer } from "../src/server.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 const LITTLE_ENDIAN = endianness() === "LE";
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -880,6 +886,140 @@ async function runScenario7FragmentedIpc1Mb() {
   }
 }
 
+async function runScenario8LocatorRuntimeCache10x() {
+  const vmEnv = createDomVmContext();
+  const btn = vmEnv.makeEl("button", { id: "delayed-btn", attrs: { role: "button", "aria-label": "Save" }, text: "Save" });
+  vmEnv.body.appendChild(btn);
+
+  let standaloneBytes = 0;
+  const standaloneStart = performance.now();
+  for (let i = 0; i < 10; i++) {
+    const expr = locatorExpression('role=button[name="Save"]', { mutation: "count" });
+    standaloneBytes += expr.length;
+    vm.runInNewContext(expr, vmEnv.ctx);
+  }
+  const standaloneMs = performance.now() - standaloneStart;
+
+  const statefulCtx = vm.createContext({ ...vmEnv.ctx });
+  const installExpr = locatorRuntimeInstallExpression();
+  vm.runInNewContext(installExpr, statefulCtx);
+
+  let cachedCallBytes = 0;
+  const cachedStart = performance.now();
+  for (let i = 0; i < 10; i++) {
+    const expr = locatorInvokeExpression('role=button[name="Save"]', { mutation: "count" });
+    cachedCallBytes += expr.length;
+    vm.runInNewContext(expr, statefulCtx);
+  }
+  const cachedMs = performance.now() - cachedStart;
+
+  return {
+    standaloneBytes,
+    cachedWarmBytes10x: cachedCallBytes,
+    perCallReductionPct: round((1 - (cachedCallBytes / standaloneBytes)) * 100, 1),
+    standaloneMs: round(standaloneMs),
+    cachedMs: round(cachedMs),
+  };
+}
+
+async function runScenario9McpSchemaProfiles() {
+  const measureProfile = async (profile) => {
+    const server = createStandaloneServer({ profile, resetBrowser: async () => {} });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: `bench-${profile}`, version: "1.0.0" });
+    await Promise.all([server.connect(st), client.connect(ct)]);
+    try {
+      const list = await client.listTools();
+      const bytes = JSON.stringify(list.tools).length;
+      return { count: list.tools.length, bytes, estTokens: Math.ceil(bytes / 4) };
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  };
+
+  const full = await measureProfile("full");
+  const standard = await measureProfile("standard");
+  const compact = await measureProfile("compact");
+  return {
+    fullTools: full.count,
+    fullBytes: full.bytes,
+    fullTokens: full.estTokens,
+    standardTools: standard.count,
+    standardTokens: standard.estTokens,
+    compactTools: compact.count,
+    compactBytes: compact.bytes,
+    compactTokens: compact.estTokens,
+    compactSavingsPct: round((1 - compact.bytes / full.bytes) * 100, 1),
+  };
+}
+
+function runScenario10AxAndContentCompression() {
+  const nodes = [
+    { nodeId: "root", role: { value: "RootWebArea" }, name: { value: "Catalog" }, backendDOMNodeId: 1, childIds: ["nav", "main"] },
+    { nodeId: "nav", parentId: "root", role: { value: "navigation" }, name: { value: "Header" }, childIds: ["n1", "n2"] },
+    { nodeId: "n1", parentId: "nav", role: { value: "StaticText" }, name: { value: "Welcome back to the store catalog portal" } },
+    { nodeId: "n2", parentId: "nav", role: { value: "StaticText" }, name: { value: "Copyright 2026 All rights reserved worldwide" } },
+    { nodeId: "main", parentId: "root", role: { value: "list" }, childIds: [] },
+  ];
+  for (let i = 0; i < 30; i++) {
+    const rowId = `r-${i}`;
+    const btnId = `b-${i}`;
+    const txtId = `t-${i}`;
+    nodes[4].childIds.push(rowId);
+    nodes.push(
+      { nodeId: rowId, parentId: "main", role: { value: "listitem" }, name: { value: `Item ${i}` }, backendDOMNodeId: 100 + i, childIds: [txtId, btnId] },
+      { nodeId: txtId, parentId: rowId, role: { value: "StaticText" }, name: { value: `Industrial pump model P-${100 + i} stock description` } },
+      { nodeId: btnId, parentId: rowId, role: { value: "button" }, name: { value: i === 0 ? "Order" : `Order #${i}` }, backendDOMNodeId: 200 + i },
+    );
+  }
+  const fullAx = buildAxState(nodes, { mode: "full" }).lines.join("\n");
+  const compactAx = buildAxState(nodes, { mode: "compact" }).lines.join("\n");
+  const interactiveAx = buildAxState(nodes, { mode: "interactive" }).lines.join("\n");
+
+  const makeEl = (tag, text, children = [], attrs = {}) => {
+    const el = {
+      nodeType: 1,
+      tagName: tag.toUpperCase(),
+      attrs,
+      children,
+      childNodes: text ? [{ nodeType: 3, textContent: text }, ...children] : children,
+      innerText: text,
+      textContent: text,
+      hidden: false,
+      getAttribute: (k) => attrs[k] ?? null,
+    };
+    return el;
+  };
+  const nav = makeEl("nav", "Home Products About Contact Login Cart Support ".repeat(25));
+  const h1 = makeEl("h1", "Pump Selection Guide");
+  const p = makeEl("p", "Choose efficiency class IE4 motors for continuous industrial duty.");
+  const article = makeEl("article", "", [h1, p]);
+  article.innerText = "Pump Selection Guide Choose efficiency class IE4 motors for continuous industrial duty.".repeat(4);
+  const body = makeEl("body", "", [nav, article]);
+  const rawBodyText = "Home Products About Contact Login Cart Support ".repeat(25) + "\n" + article.innerText;
+  body.innerText = rawBodyText;
+  body.querySelectorAll = (sel) => (sel.includes("article") ? [article] : []);
+
+  const vmCtx = vm.createContext({
+    document: { title: "Guide", body, querySelector: (sel) => (sel === "article" ? article : null), querySelectorAll: body.querySelectorAll },
+    location: { href: "https://shop.example/guide" },
+    window: { getComputedStyle: () => ({ display: "block", visibility: "visible" }) },
+    getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+  });
+  const mdRes = vm.runInNewContext(extractContentExpression({ format: "markdown" }), vmCtx);
+
+  return {
+    axFullChars: fullAx.length,
+    axCompactChars: compactAx.length,
+    axCompactSavingsPct: round((1 - compactAx.length / fullAx.length) * 100, 1),
+    axInteractiveChars: interactiveAx.length,
+    rawTextChars: rawBodyText.length,
+    markdownChars: mdRes.text.length,
+    contentSavingsPct: round((1 - mdRes.text.length / rawBodyText.length) * 100, 1),
+  };
+}
+
 async function main() {
   const results = {
     node: process.version,
@@ -892,6 +1032,9 @@ async function main() {
       setvalue_and_iframe_cache: await runScenario5SetValueAndIframeCache(),
       extension_events_and_large_payloads: await runScenario6ExtensionEventsAndLargePayloads(),
       ipc_fragmented_1mb_frames: await runScenario7FragmentedIpc1Mb(),
+      locator_runtime_cache_10x: await runScenario8LocatorRuntimeCache10x(),
+      mcp_schema_profiles: await runScenario9McpSchemaProfiles(),
+      ax_and_content_compression: runScenario10AxAndContentCompression(),
     },
   };
   if (process.argv.includes("--json")) {

@@ -3,12 +3,16 @@ import path from "node:path";
 import { BridgeClient } from "./bridge-client.js";
 import { assertReadOnly } from "./read-only.js";
 import { buildAxDiff, buildAxState, buildDialogAxState, mergeFrameAriaSnapshots, mergeFrameAxStates } from "./ax-tree.js";
+import { extractContentExpression } from "./content-extractor.js";
 import {
+  LOCATOR_RUNTIME_VERSION,
   domSnapshotExpression,
   hitTestFunctionDeclaration,
   inspectElementAtPointExpression,
   locatorExpression,
+  locatorInvokeExpression,
   locatorResolveNodeExpression,
+  locatorRuntimeInstallExpression,
   selectOptionFunctionDeclaration,
   smartSetValueFunctionDeclaration,
   waitForTextExpression,
@@ -206,6 +210,11 @@ export class BridgeBrowser {
     this.enabledChildAxSessions = new Set();
     /** @type {Map<number, {navRevision:number, routes:Map<string, any>}>} */
     this.frameRouteCache = new Map();
+    /** @type {Map<string, number>} */
+    this.locatorRuntimeInstalled = new Map();
+    /** @type {Set<string>} */
+    this.statelessEvalTabs = new Set();
+    this.supportsPassiveRead = Boolean(info?.apiSupportOverrides?.["BrowserUser.getTabContext"]);
     /** @type {Map<number, Map<string,{backendDOMNodeId:number|null,role:string,name:string,frameId?:string|null,sessionId?:string|null,actions?:string[],dialogControl?:string}>>} */
     this.axCache = new Map();
     /** @type {Map<number, {documentKey:string, entries:Array<any>}>} */
@@ -234,11 +243,39 @@ export class BridgeBrowser {
         browserRef?.#clearTabCaches(tabId);
         browserRef?.attached.delete(tabId);
         browserRef?.autoAttached.delete(tabId);
+      } else if (method === "onTabCreated") {
+        browserRef?.handleTabCreated(params);
       }
     });
     const info = await request("getInfo", { session_id: sessionId, turn_id: turnId });
+    const envCursorMode = process.env.BROWSER_USE_CURSOR_MODE;
+    if (envCursorMode === "fast" || envCursorMode === "smooth" || envCursorMode === "off") {
+      await request("setConfig", { session_id: sessionId, turn_id: turnId, cursorMode: envCursorMode }).catch(() => {});
+    }
     browserRef = new BridgeBrowser({ request, close: () => client.close(), sessionId, turnId, info: info ?? {}, frameSessions });
     return browserRef;
+  }
+
+  /** @param {Record<string, any>} params @returns {void} */
+  handleTabCreated(params) {
+    const tab = params?.tab;
+    const openerTabId = params?.openerTabId;
+    if (!tab || !Number.isSafeInteger(tab.id)) return;
+    this.ownedTabs.add(tab.id);
+    this.tabs.set(tab.id, { ...tab, owned: true, origin: "agent" });
+    if (Number.isSafeInteger(openerTabId)) {
+      const openerState = this.#tabState(openerTabId);
+      openerState.popups.push({
+        tab_id: String(tab.id),
+        url: tab.url || "",
+        title: tab.title || "",
+        opener_tab_id: String(openerTabId),
+        createdAtMs: Date.now(),
+      });
+      if (openerState.popups.length > 50) openerState.popups.shift();
+      this.#pushNotification(openerState, `Popup tab ${tab.id} opened from tab ${openerTabId}.`);
+      this.#notifyWaiters(openerState);
+    }
   }
 
   /**
@@ -272,6 +309,7 @@ export class BridgeBrowser {
       }
       if (typeof event?.sessionId === "string") {
         this.enabledChildAxSessions.delete(event.sessionId);
+        this.#clearLocatorRuntime(tabId, event.sessionId);
       }
       this.frameRouteCache.delete(tabId);
       return;
@@ -457,6 +495,7 @@ export class BridgeBrowser {
           state.domContentLoaded = false;
           state.loaded = false;
           state.navRevision += 1;
+          this.#clearLocatorRuntime(tabId);
           this.#notifyWaiters(state);
         }
         break;
@@ -474,6 +513,7 @@ export class BridgeBrowser {
             state.loaded = true;
           }
           state.navRevision += 1;
+          this.#clearLocatorRuntime(tabId);
           this.#notifyWaiters(state);
         }
         break;
@@ -556,6 +596,7 @@ export class BridgeBrowser {
         downloads: [],
         downloadById: new Map(),
         downloadWatchCount: 0,
+        popups: [],
         viewportOverride: null,
         inFlightRequests: new Set(),
         notifications: [],
@@ -628,11 +669,25 @@ export class BridgeBrowser {
     return sessionId ? this.#cdpIn(tabId, sessionId, method, params) : this.#cdp(tabId, method, params);
   }
 
+  /** @param {number} tabId @param {string|null} [sessionId] @returns {void} */
+  #clearLocatorRuntime(tabId, sessionId = null) {
+    if (sessionId !== null) {
+      this.locatorRuntimeInstalled.delete(`${tabId}:${sessionId}`);
+      return;
+    }
+    const prefix = `${tabId}:`;
+    for (const key of this.locatorRuntimeInstalled.keys()) {
+      if (key.startsWith(prefix)) this.locatorRuntimeInstalled.delete(key);
+    }
+  }
+
   /** @param {number} tabId @returns {void} */
   #clearTabCaches(tabId) {
     this.enabledDomains.delete(tabId);
     this.enablingDomains.delete(tabId);
     this.frameRouteCache.delete(tabId);
+    this.#clearLocatorRuntime(tabId);
+    this.#clearLocatorRuntime(tabId);
     const frameMap = this.frameSessions.get(tabId);
     if (frameMap) {
       for (const sessionId of frameMap.values()) this.enabledChildAxSessions.delete(sessionId);
@@ -810,6 +865,7 @@ export class BridgeBrowser {
     this.enabledDomains.delete(tabId);
     this.enablingDomains.delete(tabId);
     this.frameRouteCache.delete(tabId);
+    this.#clearLocatorRuntime(tabId);
     this.#tabState(tabId);
     await this.#cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
   }
@@ -1014,7 +1070,8 @@ export class BridgeBrowser {
     const {
       fullPage = false,
       format = "jpeg",
-      quality = 80,
+      quality = 75,
+      maxWidth = 1280,
       clip,
       scale = "css",
     } = options ?? {};
@@ -1030,7 +1087,7 @@ export class BridgeBrowser {
     /** @type {Record<string, unknown>} */
     const params = { format: fmt, fromSurface: true };
     if (fmt === "jpeg") {
-      params.quality = Math.max(10, Math.min(100, Number(quality) || 80));
+      params.quality = Math.max(10, Math.min(100, Number(quality) || 75));
       params.optimizeForSpeed = true;
     }
 
@@ -1059,15 +1116,18 @@ export class BridgeBrowser {
           params.clip = { x: 0, y: 0, width: content.width, height: content.height, scale: cssScale };
         }
       }
-    } else if (cssScale < 1) {
+    } else {
       const vp = metrics?.cssVisualViewport ?? metrics?.cssLayoutViewport;
-      if (vp?.clientWidth > 0 && vp?.clientHeight > 0) {
+      const capWidth = Number.isFinite(Number(maxWidth)) && Number(maxWidth) >= 320 ? Number(maxWidth) : 1280;
+      const widthRatio = vp?.clientWidth > capWidth ? capWidth / vp.clientWidth : 1;
+      const effectiveScale = cssScale * widthRatio;
+      if (effectiveScale < 1 && vp?.clientWidth > 0 && vp?.clientHeight > 0) {
         params.clip = {
           x: vp.pageX ?? 0,
           y: vp.pageY ?? 0,
           width: vp.clientWidth,
           height: vp.clientHeight,
-          scale: cssScale,
+          scale: effectiveScale,
         };
       }
     }
@@ -1098,10 +1158,11 @@ export class BridgeBrowser {
       screenshot = true,
       fullPage = false,
       format = "jpeg",
-      quality = 80,
+      quality = 75,
       maxLines = 2_000,
       diff = false,
       full = false,
+      mode = "full",
     } = options ?? {};
 
     const id = await this.#resolveTab(tabId, { autoCreate: true });
@@ -1145,7 +1206,7 @@ export class BridgeBrowser {
       await this.#collectChildFrames(id, frameTreeResp.frameTree, frameTrees);
     }
 
-    const merged = mergeFrameAxStates(frameTrees, { maxLines });
+    const merged = mergeFrameAxStates(frameTrees, { maxLines, mode });
     this.axCache.set(id, merged.index);
 
     const title = String(location?.title || "");
@@ -1284,7 +1345,9 @@ export class BridgeBrowser {
     if (response?.exceptionDetails) {
       throw new Error(response.exceptionDetails.exception?.description || response.exceptionDetails.text || "Failed to set element value");
     }
-    if (response?.result?.value === "needs-click") {
+    const val = response?.result?.value;
+    const status = val && typeof val === "object" ? val.status : val;
+    if (status === "needs-click") {
       await this.#clickNode(id, node, { clickCount: 1, button: "left", modifiers: 0 });
     }
     if (settle) await this.#waitForSettle(id);
@@ -1747,6 +1810,25 @@ export class BridgeBrowser {
       };
     }
 
+    if (eventName === "popup") {
+      const armedAt = Date.now();
+      const seen = new Set(state.popups.map((p) => p.tab_id));
+      const deadline = armedAt + budget;
+      while (Date.now() < deadline) {
+        const matched = state.popups.find((p) => !seen.has(p.tab_id));
+        if (matched) {
+          return {
+            tab_id: matched.tab_id,
+            opener_tab_id: matched.opener_tab_id,
+            url: matched.url,
+            title: matched.title,
+          };
+        }
+        await this.#waitForTabWakeup(id, Math.min(80, Math.max(1, deadline - Date.now())));
+      }
+      throw new Error(`Timed out after ${budget}ms waiting for popup`);
+    }
+
     throw new Error(`Unsupported waitForEvent target: ${String(eventName)}`);
   }
 
@@ -1994,9 +2076,9 @@ export class BridgeBrowser {
 
   /**
    * Return a clean Playwright-style YAML ARIA snapshot (with child iframes) without numeric clutter.
-   * @param {{tabId?:unknown, maxLines?:number}} [options]
+   * @param {{tabId?:unknown, maxLines?:number, mode?:"full"|"compact"|"interactive"}} [options]
    */
-  async ariaSnapshot({ tabId, maxLines = 2_000 } = {}) {
+  async ariaSnapshot({ tabId, maxLines = 2_000, mode = "full" } = {}) {
     const id = await this.#resolveTab(tabId, { autoCreate: true });
     await this.attach(id);
     await Promise.all([
@@ -2016,17 +2098,17 @@ export class BridgeBrowser {
     if (frameTreeResp?.frameTree) {
       await this.#collectChildFrames(id, frameTreeResp.frameTree, frameTrees);
     }
-    const snapshot = mergeFrameAriaSnapshots(frameTrees, { maxLines });
+    const snapshot = mergeFrameAriaSnapshots(frameTrees, { maxLines, mode });
     return { tab_id: String(id), ...snapshot };
   }
 
   /**
    * Return a compact visible DOM snapshot (with same-origin iframes) or YAML ARIA snapshot.
-   * @param {{tabId?:unknown, maxChars?:number, maxLines?:number, format?:"dom"|"aria"}} [options]
+   * @param {{tabId?:unknown, maxChars?:number, maxLines?:number, format?:"dom"|"aria", mode?:"full"|"compact"|"interactive"}} [options]
    */
-  async domSnapshot({ tabId, maxChars = 24_000, maxLines = 2_000, format = "dom" } = {}) {
+  async domSnapshot({ tabId, maxChars = 24_000, maxLines = 2_000, format = "dom", mode = "full" } = {}) {
     if (format === "aria") {
-      const aria = await this.ariaSnapshot({ tabId, maxLines });
+      const aria = await this.ariaSnapshot({ tabId, maxLines, mode });
       return {
         tab_id: aria.tab_id,
         format: "aria",
@@ -2250,10 +2332,62 @@ export class BridgeBrowser {
     return { tab_id: String(id), ok: true, action: sequentially ? "locator_press_sequentially" : "locator_type", selector };
   }
 
-  /** @param {unknown} tabId */
-  async getContent(tabId) {
+  /**
+   * Read an existing Chrome tab's content passively without attaching the Chrome debugger.
+   * @param {unknown} tabId
+   * @param {{format?:"markdown"|"text", maxChars?:number}} [options]
+   */
+  async readTabContext(tabId, { format = "markdown", maxChars = 16_000 } = {}) {
+    this.#assertOpen();
+    const id = Number(tabId ?? this.activeTabId);
+    if (!Number.isSafeInteger(id)) throw new Error("A numeric tab_id is required");
+    const res = await this.#rpc("readTabContext", {
+      tabId: id,
+      format: format === "text" ? "text" : "markdown",
+      maxChars: Number.isFinite(Number(maxChars)) ? Number(maxChars) : 16_000,
+    });
+    return { tab_id: String(id), ...(res ?? {}) };
+  }
+
+  /** @param {unknown} tabId @param {{format?:string, maxChars?:number}} [options] */
+  async getContent(tabId, options = {}) {
+    const hasExplicit = tabId !== undefined && tabId !== null && tabId !== "";
+    const numId = hasExplicit ? Number(tabId) : NaN;
+    if (this.supportsPassiveRead && Number.isSafeInteger(numId) &&
+        !this.attached.has(numId) && !this.ownedTabs.has(numId)) {
+      try {
+        const passive = await this.readTabContext(numId, {
+          format: options?.format === "markdown" ? "markdown" : "text",
+          maxChars: options?.maxChars,
+        });
+        return {
+          tab_id: String(numId),
+          text: String(passive?.text ?? passive?.content ?? ""),
+          ...(passive?.format ? { format: passive.format } : {}),
+          ...(passive?.title !== undefined ? { title: passive.title } : {}),
+          ...(passive?.url !== undefined ? { url: passive.url } : {}),
+          ...(passive?.truncated !== undefined ? { truncated: passive.truncated } : {}),
+          passive: true,
+        };
+      } catch (err) {
+        const msg = String(err?.message || err);
+        if (!/No handler|not supported|Unknown/i.test(msg)) throw err;
+      }
+    }
     const id = await this.#resolveTab(tabId);
     await this.attach(id);
+    if (options && (options.format || options.maxChars !== undefined)) {
+      const fmt = options.format ?? "markdown";
+      const maxChars = options.maxChars ?? 16_000;
+      const extracted = await this.#evaluateRaw(id, extractContentExpression({ format: fmt, maxChars }));
+      if (extracted && typeof extracted === "object") {
+        return {
+          tab_id: String(id),
+          ...extracted,
+          text: String(extracted.text ?? extracted.content ?? ""),
+        };
+      }
+    }
     const text = await this.#evaluateRaw(id, "document.body ? document.body.innerText : ''");
     return { tab_id: String(id), text: String(text ?? "") };
   }
@@ -2267,6 +2401,88 @@ export class BridgeBrowser {
     const expression = hasArg ? `(${checked})(${serializedArg})` : checked;
     const value = await this.#evaluateRaw(id, expression, { awaitPromise: true });
     return { tab_id: String(id), value: value ?? null };
+  }
+
+  /**
+   * Discover WebMCP tools registered via `navigator.modelContext` on the active document.
+   * @param {unknown} [tabId]
+   */
+  async webmcpListTools(tabId) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const expr = `(() => {
+      const ctx = navigator.modelContext || window.__webmcp || null;
+      if (!ctx) return { supported: false, tools: [] };
+      const raw = typeof ctx.listTools === "function" ? ctx.listTools() : (Array.isArray(ctx.tools) ? ctx.tools : []);
+      const tools = Array.isArray(raw) ? raw.map((t) => ({
+        name: String(t?.name || ""),
+        description: t?.description ? String(t.description) : "",
+        inputSchema: t?.inputSchema ?? null,
+      })).filter((t) => t.name) : [];
+      return { supported: true, tools };
+    })()`;
+    const res = await this.#evaluateRaw(id, expr);
+    return { tab_id: String(id), supported: Boolean(res?.supported), tools: Array.isArray(res?.tools) ? res.tools : [] };
+  }
+
+  /**
+   * Invoke a registered WebMCP tool on the active document.
+   * @param {string} name
+   * @param {Record<string, unknown>} [args]
+   * @param {{tabId?:unknown}} [options]
+   */
+  async webmcpInvokeTool(name, args = {}, { tabId } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const expr = `(async () => {
+      const toolName = ${JSON.stringify(String(name))};
+      const payload = ${JSON.stringify(args ?? {})};
+      const ctx = navigator.modelContext || window.__webmcp || null;
+      if (!ctx) throw new Error("WebMCP is not supported on this page");
+      if (typeof ctx.invokeTool === "function") return await ctx.invokeTool(toolName, payload);
+      if (typeof ctx.callTool === "function") return await ctx.callTool(toolName, payload);
+      const raw = typeof ctx.listTools === "function" ? ctx.listTools() : (Array.isArray(ctx.tools) ? ctx.tools : []);
+      const match = Array.isArray(raw) ? raw.find((t) => t?.name === toolName) : null;
+      if (!match || typeof match.execute !== "function") throw new Error("WebMCP tool not found: " + toolName);
+      return await match.execute(payload);
+    })()`;
+    const result = await this.#evaluateRaw(id, expr, { awaitPromise: true, userGesture: true });
+    return { tab_id: String(id), name: String(name), result: result ?? null };
+  }
+
+  /**
+   * Inventory observable page assets (images, stylesheets, scripts, videos, fonts, inline SVGs).
+   * @param {unknown} [tabId]
+   * @param {{limit?:number}} [options]
+   */
+  async listPageAssets(tabId, { limit = 100 } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const cap = Math.max(10, Math.min(500, Number(limit) || 100));
+    const expr = `(() => {
+      const cap = ${cap};
+      const assets = [];
+      const seen = new Set();
+      const add = (kind, url, source) => {
+        if (!url || seen.has(kind + "|" + url) || assets.length >= cap) return;
+        seen.add(kind + "|" + url);
+        assets.push({ kind, url: String(url).slice(0, 500), source });
+      };
+      for (const img of document.querySelectorAll("img[src]")) add("image", img.currentSrc || img.src, "img");
+      for (const link of document.querySelectorAll('link[rel~="stylesheet"][href]')) add("stylesheet", link.href, "link");
+      for (const sc of document.querySelectorAll("script[src]")) add("script", sc.src, "script");
+      for (const vid of document.querySelectorAll("video[src], video source[src]")) add("video", vid.src, vid.tagName.toLowerCase());
+      const fonts = document.fonts ? Array.from(document.fonts).slice(0, 30).map((f) => ({ family: f.family, status: f.status })) : [];
+      const inlineSvgs = Array.from(document.querySelectorAll("svg")).slice(0, 20).map((svg, i) => ({
+        index: i,
+        id: svg.id || null,
+        viewBox: svg.getAttribute("viewBox") || null,
+        markupLength: (svg.outerHTML || "").length,
+      }));
+      return { url: location.href, assets, fonts, inlineSvgCount: document.querySelectorAll("svg").length, inlineSvgs };
+    })()`;
+    const res = await this.#evaluateRaw(id, expr);
+    return { tab_id: String(id), ...(res ?? { assets: [], fonts: [], inlineSvgCount: 0, inlineSvgs: [] }) };
   }
 
   /** @param {{tabId?:unknown, accept:boolean, promptText?:string}} options */
@@ -2286,9 +2502,9 @@ export class BridgeBrowser {
    * Execute a pipeline of browser actions in a single round-trip, settling between
    * navigation/click actions and optionally returning the resulting diff/full state/screenshot.
    * @param {Array<Record<string, any>>} steps
-   * @param {{tabId?:unknown, returnState?:"diff"|"full"|"screenshot"|"both"|"none", maxLines?:number, stopOnError?:boolean}} [options]
+   * @param {{tabId?:unknown, returnState?:"diff"|"full"|"screenshot"|"both"|"none", mode?:"full"|"compact"|"interactive", maxLines?:number, stopOnError?:boolean}} [options]
    */
-  async batch(steps, { tabId, returnState = "diff", maxLines = 1_500, stopOnError = true } = {}) {
+  async batch(steps, { tabId, returnState = "diff", mode = "full", maxLines = 1_500, stopOnError = true } = {}) {
     if (!Array.isArray(steps) || steps.length === 0) {
       throw new Error("batch requires a non-empty array of steps");
     }
@@ -2445,6 +2661,29 @@ export class BridgeBrowser {
           case "name_session":
             result = await this.nameSession(step.name, { color: step.color ?? "blue" });
             break;
+          case "get_state":
+            result = await this.getState(stepTab, {
+              screenshot: false,
+              diff: step.mode ? true : true,
+              mode: step.mode ?? mode,
+              maxLines,
+            });
+            break;
+          case "get_content":
+            result = await this.getContent(stepTab, {
+              ...(step.format ? { format: step.format } : {}),
+              ...(step.max_chars !== undefined ? { maxChars: step.max_chars } : {}),
+            });
+            break;
+          case "read_tab":
+            result = await this.readTabContext(stepTab, {
+              format: step.format === "text" ? "text" : "markdown",
+              maxChars: step.max_chars ?? 16_000,
+            });
+            break;
+          case "evaluate":
+            result = await this.evaluate(step.expression, { tabId: stepTab });
+            break;
           default:
             throw new Error(`Unsupported batch action: ${String(step.action)}`);
         }
@@ -2459,6 +2698,7 @@ export class BridgeBrowser {
               screenshot: returnState === "screenshot" || returnState === "both",
               diff: returnState === "diff",
               full: returnState === "full" || returnState === "both",
+              mode,
               maxLines,
             }).catch(() => null);
           }
@@ -2482,6 +2722,7 @@ export class BridgeBrowser {
           screenshot: wantShot,
           diff: returnState === "diff",
           full: returnState === "full" || returnState === "both",
+          mode,
           maxLines,
         }).catch(() => null);
       } else {
@@ -2513,6 +2754,8 @@ export class BridgeBrowser {
     this.lastAxSnapshots.clear();
     this.frameSessions.clear();
     this.autoAttached.clear();
+    this.locatorRuntimeInstalled.clear();
+    this.statelessEvalTabs.clear();
     return { ok: true, ended: true, nextTurnId: this.turnId };
   }
 
@@ -2669,7 +2912,17 @@ export class BridgeBrowser {
         if (!error?.retryable && !contextLost) throw error;
         const left = deadline - Date.now();
         if (left <= 0) {
-          const wrapped = new Error(`Timed out after ${budget}ms waiting for locator: ${msg}`);
+          let hint = "";
+          if (error?.code === "not_found" && !options.frame && this.locatorRuntimeInstalled.has(`${tabId}:main`)) {
+            const cands = await Promise.race([
+              this.#evaluateRaw(tabId, `(() => globalThis.__buRt?.suggestCandidates?.(${JSON.stringify(selector)}, 4) ?? [])()`).catch(() => []),
+              sleep(250).then(() => []),
+            ]);
+            if (Array.isArray(cands) && cands.length > 0) {
+              hint = ` | Closest visible matches: ${cands.join(", ")}`;
+            }
+          }
+          const wrapped = new Error(`Timed out after ${budget}ms waiting for locator: ${msg}${hint}`);
           wrapped.code = error.code;
           throw wrapped;
         }
@@ -2734,15 +2987,75 @@ export class BridgeBrowser {
     }
   }
 
-  /** @param {number} tabId @param {string} selector @param {Record<string, any>} [options] */
-  async #locator(tabId, selector, options = {}) {
+  /** @param {number} tabId @param {string|null} sessionId @returns {Promise<boolean>} */
+  async #ensureLocatorRuntime(tabId, sessionId = null) {
+    const cacheKey = `${tabId}:${sessionId ?? "main"}`;
+    if (this.statelessEvalTabs.has(cacheKey)) return false;
+    const rev = sessionId ? 0 : this.#tabState(tabId).navRevision;
+    if (this.locatorRuntimeInstalled.get(cacheKey) === rev) return true;
+    const response = await this.#cdpTarget(tabId, sessionId, "Runtime.evaluate", {
+      expression: locatorRuntimeInstallExpression(),
+      returnByValue: true,
+      awaitPromise: false,
+      userGesture: false,
+      includeCommandLineAPI: false,
+    }).catch(() => null);
+    if (response?.exceptionDetails) {
+      this.statelessEvalTabs.add(cacheKey);
+      return false;
+    }
+    const val = response?.result?.value;
+    if (val && typeof val === "object" && val.installed === true && val.v === LOCATOR_RUNTIME_VERSION) {
+      this.locatorRuntimeInstalled.set(cacheKey, rev);
+      return true;
+    }
+    this.statelessEvalTabs.add(cacheKey);
+    return false;
+  }
+
+  /** @param {number} tabId @param {string|null} sessionId @param {string} selector @param {Record<string, any>} [options] */
+  async #evaluateLocator(tabId, sessionId, selector, options = {}) {
     const userGesture = ["fill", "clear", "click", "select", "check", "uncheck"].includes(options.mutation);
-    const result = await this.#evaluateRaw(tabId, locatorExpression(selector, options), {
-      userGesture,
-      awaitPromise: Boolean(options.asyncEval || (options.inPageWaitMs ?? 0) > 0),
-    });
+    const awaitPromise = Boolean(options.asyncEval || (options.inPageWaitMs ?? 0) > 0);
+    const cacheKey = `${tabId}:${sessionId ?? "main"}`;
+    const runExpr = async (expression) => {
+      const response = await this.#cdpTarget(tabId, sessionId, "Runtime.evaluate", {
+        expression,
+        returnByValue: true,
+        awaitPromise,
+        userGesture,
+        includeCommandLineAPI: false,
+      });
+      if (response?.exceptionDetails) {
+        const details = response.exceptionDetails;
+        throw new Error(details.exception?.description || details.text || "Browser locator failed");
+      }
+      return response?.result?.value;
+    };
+
+    let result;
+    if (!this.statelessEvalTabs.has(cacheKey) && await this.#ensureLocatorRuntime(tabId, sessionId)) {
+      result = await runExpr(locatorInvokeExpression(selector, options));
+      if (result && result.__buRtMissing === true) {
+        this.locatorRuntimeInstalled.delete(cacheKey);
+        if (await this.#ensureLocatorRuntime(tabId, sessionId)) {
+          result = await runExpr(locatorInvokeExpression(selector, options));
+        }
+        if (result && result.__buRtMissing === true) {
+          this.statelessEvalTabs.add(cacheKey);
+          result = await runExpr(locatorExpression(selector, options));
+        }
+      }
+    } else {
+      result = await runExpr(locatorExpression(selector, options));
+    }
     if (result?.error) throw this.#locatorError(result);
     return result;
+  }
+
+  /** @param {number} tabId @param {string} selector @param {Record<string, any>} [options] */
+  async #locator(tabId, selector, options = {}) {
+    return await this.#evaluateLocator(tabId, null, selector, options);
   }
 
   /**
@@ -2815,18 +3128,7 @@ export class BridgeBrowser {
 
   /** @param {number} tabId @param {string} sessionId @param {string} selector @param {Record<string, any>} [options] */
   async #locatorInSession(tabId, sessionId, selector, options = {}) {
-    const response = await this.#cdpIn(tabId, sessionId, "Runtime.evaluate", {
-      expression: locatorExpression(selector, options),
-      returnByValue: true,
-      awaitPromise: Boolean(options.asyncEval || (options.inPageWaitMs ?? 0) > 0),
-    });
-    if (response?.exceptionDetails) {
-      const details = response.exceptionDetails;
-      throw new Error(details.exception?.description || details.text || "Browser locator failed");
-    }
-    const value = response?.result?.value;
-    if (value?.error) throw this.#locatorError(value);
-    return value;
+    return await this.#evaluateLocator(tabId, sessionId, selector, options);
   }
 
   /** @param {number} tabId @param {string} expression @param {{awaitPromise?:boolean, userGesture?:boolean}} [options] */

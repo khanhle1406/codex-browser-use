@@ -24,12 +24,15 @@ export function stableNodePath() {
 /**
  * Print a mergeable client fragment; never write a client's configuration.
  * @param {string} client
- * @param {{nodePath?:string, serverPath?:string, bridgeFile?:string}} [options]
+ * @param {{nodePath?:string, serverPath?:string, bridgeFile?:string, profile?:string}} [options]
  * @returns {Record<string, any>}
  */
 export function buildConfig(client, options = {}) {
   const command = options.nodePath ?? stableNodePath();
   const args = [options.serverPath ?? SERVER_PATH];
+  if (options.profile && options.profile !== "full") {
+    args.push("--profile", options.profile);
+  }
   const env = options.bridgeFile ? { BROWSER_USE_BRIDGE_FILE: path.resolve(options.bridgeFile) } : {};
   const name = "browser-use";
   if (client === "opencode" || client === "opencode2") {

@@ -152,6 +152,56 @@ const SHARED_DOM_HELPERS = `
     }
     return hit;
   };
+
+  const tryFillRichEditor = (el, assigned, inputType = "insertText") => {
+    if (!el) return false;
+    const win = el.ownerDocument?.defaultView || window;
+    try {
+      const cke = win?.CKEDITOR?.instances;
+      if (cke && typeof cke === "object") {
+        const ckeRoot = el.closest?.(".cke");
+        for (const inst of Object.values(cke)) {
+          if (inst && (inst.element?.$ === el || (el.id && inst.name === el.id) || (el.name && inst.name === el.name) || (ckeRoot && inst.container?.$ === ckeRoot))) {
+            inst.setData?.(assigned);
+            inst.updateElement?.();
+            return true;
+          }
+        }
+      }
+    } catch (_e) {}
+    try {
+      const ck5 = el.ckeditorInstance || el.closest?.(".ck-editor__editable")?.ckeditorInstance;
+      if (ck5 && typeof ck5.setData === "function") {
+        ck5.setData(assigned);
+        return true;
+      }
+    } catch (_e) {}
+    try {
+      const tiny = el.id ? win?.tinymce?.get?.(el.id) : null;
+      if (tiny && typeof tiny.setContent === "function") {
+        tiny.setContent(assigned);
+        tiny.save?.();
+        return true;
+      }
+    } catch (_e) {}
+    try {
+      const quill = el.__quill || el.closest?.(".ql-container")?.__quill;
+      if (quill && typeof quill.setText === "function") {
+        quill.setText(assigned);
+        return true;
+      }
+    } catch (_e) {}
+    if (el.isContentEditable) {
+      el.focus?.();
+      el.textContent = assigned;
+      el.dispatchEvent?.(typeof InputEvent === "function"
+        ? new InputEvent("input", { bubbles: true, composed: true, data: assigned, inputType })
+        : new Event("input", { bubbles: true, composed: true }));
+      el.dispatchEvent?.(new Event("change", { bubbles: true }));
+      return true;
+    }
+    return false;
+  };
 `;
 
 const SHARED_LOCATOR_RESOLVER = `
@@ -395,8 +445,478 @@ const SHARED_LOCATOR_RESOLVER = `
   };
 `;
 
+export const LOCATOR_RUNTIME_VERSION = 1;
+
+const SHARED_RUNNER_CORE = `
+  const isDisabledEl = (el) => !!(el.matches?.(":disabled") || el.getAttribute?.("aria-disabled") === "true");
+  const cursorPt = (el) => {
+    if (!el || typeof el.getBoundingClientRect !== "function") return {};
+    const r = el.getBoundingClientRect();
+    return r && r.width > 0 && r.height > 0
+      ? { x: r.left + r.width / 2, y: r.top + r.height / 2, __cursorMove: true }
+      : {};
+  };
+  const fail = (message, code = "error", retryable = false) => ({ error: message, code, retryable });
+
+  const describeCandidate = (el) => {
+    const tag = el.tagName.toLowerCase();
+    const role = implicitRoleOf(el);
+    const ariaName = accessibleNameOf(el);
+    const testId = el.getAttribute?.("data-testid") || el.getAttribute?.("data-test-id") || el.getAttribute?.("data-test");
+    if (testId) return "testid=" + JSON.stringify(testId);
+    if (role && ariaName && ariaName.length <= 50) return "role=" + role + "[name=" + JSON.stringify(ariaName) + "]";
+    if (el.id && !/^\\d|:/.test(el.id)) return "css=#" + CSS.escape(el.id);
+    const txt = (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+    if (txt && txt.length <= 45) return "text=" + JSON.stringify(txt);
+    const nameAttr = el.getAttribute?.("name");
+    return "css=" + tag + (nameAttr ? "[name=" + JSON.stringify(nameAttr) + "]" : "");
+  };
+
+  const suggestLocatorCandidates = (raw, limit = 4) => {
+    const rawStr = String(raw || "");
+    const stop = new Set(["role", "name", "css", "text", "exact", "true", "false", "first", "last", "button", "link", "textbox", "testid", "label", "placeholder"]);
+    const words = rawStr.toLowerCase().split(/[^a-z0-9]+/i).filter((w) => w.length >= 2 && !stop.has(w));
+    let candidates = [];
+    try {
+      candidates = querySelectorAllDeep(document, INTERACTIVE_SELECTOR);
+    } catch (_e) {
+      return [];
+    }
+    const scored = [];
+    const seen = new Set();
+    for (const el of candidates) {
+      if (!isVisibleEl(el)) continue;
+      const role = implicitRoleOf(el);
+      const name = accessibleNameOf(el);
+      const hay = (role + " " + name + " " + (el.id || "") + " " + (el.getAttribute?.("data-testid") || "") + " " + (el.getAttribute?.("name") || "")).toLowerCase();
+      let score = 0;
+      for (const w of words) {
+        if (hay.includes(w)) score += 3;
+      }
+      if (rawStr.toLowerCase().includes("role=" + role)) score += 1;
+      if (words.length === 0 || score > 0) {
+        const desc = describeCandidate(el);
+        if (!seen.has(desc)) {
+          seen.add(desc);
+          scored.push({ score, desc });
+        }
+      }
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, limit).map((s) => s.desc);
+  };
+
+  const runLocatorAction = (raw, opts = {}, __userFn = null) => {
+    const mutation = opts.mutation ?? null;
+    const nextValue = opts.value ?? null;
+    const selectSpec = opts.select ?? null;
+    const waitState = opts.state ?? "visible";
+    const sameOriginFrames = opts.sameOriginFrames ?? null;
+    const crossOriginDirect = Boolean(opts.crossOriginDirect);
+    const force = Boolean(opts.force);
+    const attrName = opts.attrName ?? null;
+    const hasEvalArg = Boolean(opts.hasEvalArg);
+    const __evalArg = opts.evalArg;
+    const asyncEval = Boolean(opts.asyncEval);
+    const waitMs = Math.max(0, Math.round(Number(opts.inPageWaitMs) || 0));
+
+    const runOnce = () => {
+      let targetRoot = document;
+      try {
+        const resolvedFrame = resolveSameOriginTargetRoot(sameOriginFrames);
+        if (resolvedFrame.error) return fail(resolvedFrame.error, resolvedFrame.code, resolvedFrame.retryable);
+        targetRoot = resolvedFrame.root;
+      } catch (error) {
+        return fail("Invalid frame locator: " + error.message, "invalid", false);
+      }
+
+      let nodes;
+      try {
+        nodes = resolvePipeline(targetRoot, raw);
+      } catch (error) {
+        return fail("Invalid locator: " + error.message, "invalid", false);
+      }
+
+      if (mutation === "count") return { count: nodes.length };
+      if (mutation === "evalAll") {
+        if (typeof __userFn !== "function") return fail("Missing evaluation function", "invalid", false);
+        const out = hasEvalArg ? __userFn(nodes, __evalArg) : __userFn(nodes);
+        if (asyncEval || (out && typeof out.then === "function")) {
+          return Promise.resolve(out).then((value) => ({ count: nodes.length, value }));
+        }
+        return { count: nodes.length, value: out };
+      }
+      if (mutation === "allTextContents") {
+        return { count: nodes.length, values: nodes.map((el) => el.textContent || "") };
+      }
+      if (mutation === "allInnerTexts") {
+        return { count: nodes.length, values: nodes.map((el) => (el.innerText || "").trim()) };
+      }
+      if (mutation === "isVisible") {
+        return { value: nodes.length > 0 && isVisibleEl(nodes[0]) };
+      }
+      if (mutation === "isEnabled") {
+        return { value: nodes.length > 0 && !isDisabledEl(nodes[0]) };
+      }
+      if (mutation === "isChecked") {
+        const el = nodes[0];
+        const checked = el
+          ? (el instanceof HTMLInputElement ? !!el.checked : el.getAttribute?.("aria-checked") === "true")
+          : false;
+        return { value: checked };
+      }
+      if (mutation === "wait") {
+        if (waitState === "detached") return { count: nodes.length, satisfied: nodes.length === 0 };
+        if (waitState === "attached") return { count: nodes.length, satisfied: nodes.length > 0 };
+        const visibleCount = nodes.filter(isVisibleEl).length;
+        if (waitState === "visible") return { count: nodes.length, visibleCount, satisfied: visibleCount > 0 };
+        if (waitState === "hidden") return { count: nodes.length, visibleCount, satisfied: visibleCount === 0 };
+        return fail("Unsupported wait state: " + waitState, "invalid", false);
+      }
+
+      if (nodes.length === 0) return fail("Locator did not match any element: " + raw, "not_found", true);
+      if (nodes.length > 1) {
+        const previews = nodes.slice(0, 3).map((el, i) => {
+          const tag = el.tagName.toLowerCase();
+          const text = (el.innerText || el.getAttribute("aria-label") || el.id || "").replace(/\\s+/g, " ").trim().slice(0, 40);
+          return "#" + i + " <" + tag + (el.id ? "#" + el.id : "") + ">" + (text ? ' "' + text + '"' : "");
+        }).join(", ");
+        return fail("Locator matched " + nodes.length + " elements; narrow it (e.g. append >> first or >> nth=0): " + raw + " [" + previews + "]", "multiple", false);
+      }
+
+      const element = nodes[0];
+      if (mutation === "eval") {
+        if (typeof __userFn !== "function") return fail("Missing evaluation function", "invalid", false);
+        const out = hasEvalArg ? __userFn(element, __evalArg) : __userFn(element);
+        if (asyncEval || (out && typeof out.then === "function")) {
+          return Promise.resolve(out).then((value) => ({ count: 1, value }));
+        }
+        return { count: 1, value: out };
+      }
+      if (mutation === "attr") {
+        if (!attrName) return fail("Attribute name is required", "invalid", false);
+        return { count: 1, value: element.getAttribute(attrName) };
+      }
+      if (mutation === "inputValue") {
+        if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement)) {
+          return fail("Locator did not match an input, textarea, or select element: " + raw, "invalid", false);
+        }
+        return { count: 1, value: element.value ?? "" };
+      }
+      if (mutation === "text") {
+        return { count: 1, text: (element.innerText || element.textContent || "").trim() };
+      }
+      if (mutation === "textContent") {
+        return { count: 1, text: element.textContent };
+      }
+      if (mutation === "innerText") {
+        return { count: 1, text: (element.innerText || "").trim() };
+      }
+      if (mutation === "focus") {
+        if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
+        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        element.focus();
+        return { count: 1, focused: true, ...cursorPt(element) };
+      }
+      if (mutation === "check" || mutation === "uncheck") {
+        if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
+        if (!force && isDisabledEl(element)) return fail("Element is disabled: " + raw, "disabled", true);
+        const want = mutation === "check";
+        const isChecked = element instanceof HTMLInputElement
+          ? !!element.checked
+          : element.getAttribute("aria-checked") === "true";
+        if (isChecked === want) {
+          return { count: 1, changed: false, checked: isChecked, ...cursorPt(element) };
+        }
+        if (crossOriginDirect) {
+          element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+          element.click();
+          return { count: 1, changed: true, clicked: true, checked: want, ...cursorPt(element) };
+        }
+      }
+      if (mutation === "click") {
+        if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
+        if (!force && isDisabledEl(element)) return fail("Element is disabled: " + raw, "disabled", true);
+        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        element.click();
+        return { count: 1, clicked: true, ...cursorPt(element) };
+      }
+      if (mutation === "hover") {
+        if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
+        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        const rect = element.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return fail("Locator matched an element with no visible box: " + raw, "not_visible", true);
+        return { count: 1, hovered: true, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, __cursorMove: true };
+      }
+      if (mutation === "fill" || mutation === "clear") {
+        if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
+        if (!force && isDisabledEl(element)) return fail("Element is disabled: " + raw, "disabled", true);
+        if ((element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) && element.readOnly) {
+          return fail("Element is read-only: " + raw, "readonly", false);
+        }
+        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        const assigned = mutation === "clear" ? "" : String(nextValue ?? "");
+        const inputType = mutation === "clear" ? "deleteContentBackward" : "insertText";
+        if (tryFillRichEditor(element, assigned, inputType)) {
+          return { count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }), ...cursorPt(element) };
+        }
+        element.focus();
+        const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value");
+        if (descriptor?.set) descriptor.set.call(element, assigned); else element.value = assigned;
+        element.dispatchEvent(typeof InputEvent === "function"
+          ? new InputEvent("input", { bubbles: true, composed: true, data: assigned, inputType })
+          : new Event("input", { bubbles: true, composed: true }));
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+        return { count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }), ...cursorPt(element) };
+      }
+      if (mutation === "select") {
+        if (!(element instanceof HTMLSelectElement)) return fail("Locator did not match a <select> element: " + raw, "invalid", false);
+        if (!force && element.disabled) return fail("Select element is disabled: " + raw, "disabled", true);
+        const wanted = Array.isArray(selectSpec) ? selectSpec : [selectSpec];
+        const options = Array.from(element.options);
+        const selected = [];
+        for (const spec of wanted) {
+          let opt = null;
+          if (typeof spec === "string") {
+            opt = options.find((o) => o.value === spec) || options.find((o) => o.label === spec || o.text.trim() === spec);
+          } else if (spec && typeof spec === "object") {
+            if (spec.index !== undefined) opt = options[spec.index];
+            else if (spec.value !== undefined) opt = options.find((o) => o.value === spec.value);
+            else if (spec.label !== undefined) opt = options.find((o) => o.label === spec.label || o.text.trim() === spec.label);
+          }
+          if (!opt) return fail("Select option not found: " + JSON.stringify(spec), "not_found", true);
+          if (opt.disabled) return fail("Select option is disabled: " + opt.text, "disabled", true);
+          selected.push(opt);
+        }
+        if (!element.multiple) {
+          for (const o of options) o.selected = o === selected[0];
+        } else {
+          for (const o of options) o.selected = selected.includes(o);
+        }
+        element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+        return { count: 1, selected: selected.map((o) => o.value), ...cursorPt(element) };
+      }
+
+      if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
+      if (!force && isDisabledEl(element)) return fail("Element is disabled: " + raw, "disabled", true);
+      element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return fail("Locator matched an element with no visible box: " + raw, "not_visible", true);
+
+      const doc = element.ownerDocument || document;
+      const win = doc.defaultView || window;
+      const vv = win.visualViewport;
+      const ox = vv?.offsetLeft ?? 0;
+      const oy = vv?.offsetTop ?? 0;
+      const vw = vv?.width ?? win.innerWidth;
+      const vh = vv?.height ?? win.innerHeight;
+      const vLeft = Math.max(rect.left, ox);
+      const vRight = Math.min(rect.right, ox + vw);
+      const vTop = Math.max(rect.top, oy);
+      const vBottom = Math.min(rect.bottom, oy + vh);
+      if (!force && (vRight <= vLeft || vBottom <= vTop)) {
+        return fail("Locator element is outside the viewport: " + raw, "not_visible", true);
+      }
+
+      const boxLeft = vRight > vLeft ? vLeft : rect.left;
+      const boxRight = vRight > vLeft ? vRight : rect.right;
+      const boxTop = vBottom > vTop ? vTop : rect.top;
+      const boxBottom = vBottom > vTop ? vBottom : rect.bottom;
+      const cx = (boxLeft + boxRight) / 2;
+      const cy = (boxTop + boxBottom) / 2;
+      const dx = Math.max(1, (boxRight - boxLeft) * 0.25);
+      const dy = Math.max(1, (boxBottom - boxTop) * 0.25);
+
+      const control = element instanceof HTMLInputElement || element instanceof HTMLButtonElement ||
+        element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement ? element : null;
+      const accepted = new Set([element, ...(control?.labels ? Array.from(control.labels) : [])]);
+      const matchesTarget = (node) => {
+        for (let cur = node; cur; cur = cur.parentNode || cur.host) {
+          if (accepted.has(cur)) return true;
+          if (cur.assignedSlot && accepted.has(cur.assignedSlot)) return true;
+        }
+        return false;
+      };
+
+      const points = [
+        { x: cx, y: cy },
+        { x: boxLeft + dx, y: boxTop + dy },
+        { x: boxRight - dx, y: boxTop + dy },
+        { x: boxLeft + dx, y: boxBottom - dy },
+        { x: boxRight - dx, y: boxBottom - dy },
+      ];
+      let chosen = null;
+      let firstHitTag = null;
+      for (const pt of points) {
+        const hit = elementFromPointDeep(doc, pt.x, pt.y);
+        if (firstHitTag === null) firstHitTag = hit?.tagName?.toLowerCase() ?? null;
+        if (hit && matchesTarget(hit)) {
+          chosen = pt;
+          break;
+        }
+      }
+      if (!force && !chosen) {
+        return fail("Locator element is covered by <" + (firstHitTag || "unknown") + ">: " + raw, "covered", true);
+      }
+
+      const pt = chosen || { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+      const sameOriginRect = Array.isArray(sameOriginFrames) && sameOriginFrames.length > 0;
+      let offsetX = 0;
+      let offsetY = 0;
+      if (sameOriginRect) {
+        let fWin = element.ownerDocument.defaultView;
+        while (fWin && fWin !== window) {
+          const frameEl = fWin.frameElement;
+          if (!frameEl) break;
+          const fr = frameEl.getBoundingClientRect();
+          offsetX += fr.left + frameEl.clientLeft;
+          offsetY += fr.top + frameEl.clientTop;
+          fWin = fWin.parent;
+        }
+      }
+      return {
+        count: 1,
+        x: offsetX + pt.x,
+        y: offsetY + pt.y,
+        width: rect.width,
+        height: rect.height,
+        hitTag: firstHitTag,
+        ...(mutation === "check" || mutation === "uncheck"
+          ? { changed: true, checked: mutation === "check" }
+          : {}),
+      };
+    };
+
+    if (waitMs <= 0) return runOnce();
+
+    const isDone = (res) => mutation === "wait"
+      ? Boolean(res?.satisfied || (res?.error && !res.retryable))
+      : Boolean(res && (!res.error || !res.retryable));
+
+    return (async () => {
+      const initial = await runOnce();
+      if (isDone(initial) || typeof MutationObserver !== "function") return initial;
+      return await new Promise((resolve) => {
+        let done = false;
+        let polling = false;
+        const observers = [];
+        const finish = (res) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          clearInterval(interval);
+          for (const obs of observers) {
+            try { obs.disconnect(); } catch (_e) {}
+          }
+          resolve(res);
+        };
+        const check = async () => {
+          if (done || polling) return;
+          polling = true;
+          try {
+            const next = await runOnce();
+            if (isDone(next)) { finish(next); return; }
+            observeFrameRoot();
+          } catch (error) {
+            finish(fail(error?.message || "Locator evaluation failed", "error", false));
+          } finally {
+            polling = false;
+          }
+        };
+        const observeTarget = (root) => {
+          const target = root?.documentElement || root?.body || root;
+          if (!target || typeof target !== "object" || observers.some((o) => o.__target === target)) return;
+          try {
+            const obs = new MutationObserver(() => { void check(); });
+            obs.__target = target;
+            obs.observe(target, { childList: true, subtree: true, attributes: true, characterData: true });
+            observers.push(obs);
+          } catch (_e) {}
+        };
+        const observeFrameRoot = () => {
+          observeTarget(document);
+          if (Array.isArray(sameOriginFrames) && sameOriginFrames.length > 0) {
+            try {
+              const rf = resolveSameOriginTargetRoot(sameOriginFrames);
+              if (rf?.root && rf.root !== document) observeTarget(rf.root);
+            } catch (_e) {}
+          }
+        };
+        observeFrameRoot();
+        const interval = setInterval(() => { void check(); }, 100);
+        const timer = setTimeout(() => {
+          void (async () => {
+            try { finish(await runOnce()); }
+            catch (error) { finish(fail(error?.message || "Locator evaluation failed", "error", false)); }
+          })();
+        }, waitMs);
+      });
+    })();
+  };
+`;
+
 /**
- * Build a full Playwright-style locator & action expression executed via Runtime.evaluate.
+ * Install or verify the persistent in-page locator runtime (`globalThis.__buRt`).
+ * @returns {string}
+ */
+export function locatorRuntimeInstallExpression() {
+  return `(() => {
+    if (globalThis.__buRt && globalThis.__buRt.v === ${LOCATOR_RUNTIME_VERSION}) {
+      return { installed: true, v: ${LOCATOR_RUNTIME_VERSION} };
+    }
+    ${SHARED_DOM_HELPERS}
+    ${SHARED_LOCATOR_RESOLVER}
+    ${SHARED_RUNNER_CORE}
+    Object.defineProperty(globalThis, "__buRt", {
+      value: {
+        v: ${LOCATOR_RUNTIME_VERSION},
+        run: runLocatorAction,
+        suggestCandidates: suggestLocatorCandidates,
+      },
+      configurable: true,
+      writable: true,
+    });
+    return { installed: true, v: ${LOCATOR_RUNTIME_VERSION} };
+  })()`;
+}
+
+/**
+ * Build a minimal (~250 byte) expression invoking the already-installed `globalThis.__buRt`.
+ * @param {string} selector
+ * @param {{mutation?:string|null, value?:string|null, select?:unknown, state?:string, sameOriginFrames?:string[], evalFn?:string|null, evalArg?:unknown, hasEvalArg?:boolean, asyncEval?:boolean, attrName?:string|null, force?:boolean, crossOriginDirect?:boolean, inPageWaitMs?:number}} [options]
+ * @returns {string}
+ */
+export function locatorInvokeExpression(selector, options = {}) {
+  const waitMs = Math.max(0, Math.round(Number(options.inPageWaitMs) || 0));
+  const isAsync = Boolean(options.asyncEval || waitMs > 0);
+  const compactOpts = {};
+  if (options.mutation != null) compactOpts.mutation = options.mutation;
+  if (options.value != null) compactOpts.value = options.value;
+  if (options.select != null) compactOpts.select = options.select;
+  if (options.state && options.state !== "visible") compactOpts.state = options.state;
+  if (Array.isArray(options.sameOriginFrames) && options.sameOriginFrames.length > 0) compactOpts.sameOriginFrames = options.sameOriginFrames;
+  if (options.crossOriginDirect) compactOpts.crossOriginDirect = true;
+  if (options.force) compactOpts.force = true;
+  if (options.attrName != null) compactOpts.attrName = options.attrName;
+  if (options.hasEvalArg) {
+    compactOpts.hasEvalArg = true;
+    compactOpts.evalArg = options.evalArg ?? null;
+  }
+  if (options.asyncEval) compactOpts.asyncEval = true;
+  if (waitMs > 0) compactOpts.inPageWaitMs = waitMs;
+
+  const args = [JSON.stringify(selector), JSON.stringify(compactOpts)];
+  if (options.evalFn) args.push(`(${options.evalFn})`);
+  const call = `globalThis.__buRt.run(${args.join(",")})`;
+  return isAsync
+    ? `(async()=>globalThis.__buRt?.v===${LOCATOR_RUNTIME_VERSION}?await ${call}:{__buRtMissing:true})()`
+    : `(()=>globalThis.__buRt?.v===${LOCATOR_RUNTIME_VERSION}?${call}:{__buRtMissing:true})()`;
+}
+
+/**
+ * Build a standalone Playwright-style locator & action expression executed via Runtime.evaluate.
+ * Kept self-contained as fallback for stateless evaluators and direct test callers.
  * @param {string} selector
  * @param {{mutation?:string|null, value?:string|null, select?:unknown, state?:string, sameOriginFrames?:string[], evalFn?:string|null, evalArg?:unknown, hasEvalArg?:boolean, asyncEval?:boolean, attrName?:string|null, force?:boolean, crossOriginDirect?:boolean, inPageWaitMs?:number}} [options]
  * @returns {string}
@@ -406,360 +926,27 @@ export function locatorExpression(selector, options = {}) {
   const waitMs = Math.max(0, Math.round(Number(options.inPageWaitMs) || 0));
   const isAsync = Boolean(options.asyncEval || waitMs > 0);
   const wrapperStart = isAsync ? "(async () => {" : "(() => {";
-  const evalAwait = options.asyncEval ? "await " : "";
-  const bodyPrefix = waitMs > 0
-    ? `    const runOnce = ${options.asyncEval ? "async " : ""}() => {\n`
-    : "";
+  const evalAwait = isAsync ? "await " : "";
+  const optsExpr = JSON.stringify({
+    mutation: options.mutation ?? null,
+    value: options.value ?? null,
+    select: options.select ?? null,
+    state: options.state ?? "visible",
+    sameOriginFrames: options.sameOriginFrames ?? null,
+    crossOriginDirect: Boolean(options.crossOriginDirect),
+    force: Boolean(options.force),
+    attrName: options.attrName ?? null,
+    hasEvalArg: Boolean(options.hasEvalArg),
+    evalArg: options.hasEvalArg ? (options.evalArg ?? null) : undefined,
+    asyncEval: Boolean(options.asyncEval),
+    inPageWaitMs: waitMs,
+  });
   return `${wrapperStart}
-    const raw = ${JSON.stringify(selector)};
     const mutation = ${JSON.stringify(options.mutation ?? null)};
-    const nextValue = ${JSON.stringify(options.value ?? null)};
-    const selectSpec = ${JSON.stringify(options.select ?? null)};
-    const waitState = ${JSON.stringify(options.state ?? "visible")};
-    const sameOriginFrames = ${JSON.stringify(options.sameOriginFrames ?? null)};
-    const crossOriginDirect = ${JSON.stringify(Boolean(options.crossOriginDirect))};
-    const force = ${JSON.stringify(Boolean(options.force))};
-    const attrName = ${JSON.stringify(options.attrName ?? null)};
-    const hasEvalArg = ${JSON.stringify(Boolean(options.hasEvalArg))};
-    const __evalArg = ${options.hasEvalArg ? JSON.stringify(options.evalArg ?? null) : "undefined"};
-    const __userFn = ${embeddedEvalFn};
-    const fail = (message, code = "error", retryable = false) => ({ error: message, code, retryable });
     ${SHARED_DOM_HELPERS}
     ${SHARED_LOCATOR_RESOLVER}
-
-    const isDisabledEl = (el) => !!(el.matches?.(":disabled") || el.getAttribute?.("aria-disabled") === "true");
-    const cursorPt = (el) => {
-      if (!el || typeof el.getBoundingClientRect !== "function") return {};
-      const r = el.getBoundingClientRect();
-      return r && r.width > 0 && r.height > 0
-        ? { x: r.left + r.width / 2, y: r.top + r.height / 2, __cursorMove: true }
-        : {};
-    };
-${bodyPrefix}
-    let targetRoot = document;
-    try {
-      const resolvedFrame = resolveSameOriginTargetRoot(sameOriginFrames);
-      if (resolvedFrame.error) return fail(resolvedFrame.error, resolvedFrame.code, resolvedFrame.retryable);
-      targetRoot = resolvedFrame.root;
-    } catch (error) {
-      return fail("Invalid frame locator: " + error.message, "invalid", false);
-    }
-
-    let nodes;
-    try {
-      nodes = resolvePipeline(targetRoot, raw);
-    } catch (error) {
-      return fail("Invalid locator: " + error.message, "invalid", false);
-    }
-
-    if (mutation === "count") return { count: nodes.length };
-    if (mutation === "evalAll") {
-      if (typeof __userFn !== "function") return fail("Missing evaluation function", "invalid", false);
-      const out = hasEvalArg ? __userFn(nodes, __evalArg) : __userFn(nodes);
-      return { count: nodes.length, value: ${evalAwait}out };
-    }
-    if (mutation === "allTextContents") {
-      return { count: nodes.length, values: nodes.map((el) => el.textContent || "") };
-    }
-    if (mutation === "allInnerTexts") {
-      return { count: nodes.length, values: nodes.map((el) => (el.innerText || "").trim()) };
-    }
-    if (mutation === "isVisible") {
-      return { value: nodes.length > 0 && isVisibleEl(nodes[0]) };
-    }
-    if (mutation === "isEnabled") {
-      return { value: nodes.length > 0 && !isDisabledEl(nodes[0]) };
-    }
-    if (mutation === "isChecked") {
-      const el = nodes[0];
-      const checked = el
-        ? (el instanceof HTMLInputElement ? !!el.checked : el.getAttribute?.("aria-checked") === "true")
-        : false;
-      return { value: checked };
-    }
-    if (mutation === "wait") {
-      if (waitState === "detached") return { count: nodes.length, satisfied: nodes.length === 0 };
-      if (waitState === "attached") return { count: nodes.length, satisfied: nodes.length > 0 };
-      const visibleCount = nodes.filter(isVisibleEl).length;
-      if (waitState === "visible") return { count: nodes.length, visibleCount, satisfied: visibleCount > 0 };
-      if (waitState === "hidden") return { count: nodes.length, visibleCount, satisfied: visibleCount === 0 };
-      return fail("Unsupported wait state: " + waitState, "invalid", false);
-    }
-
-    if (nodes.length === 0) return fail("Locator did not match any element: " + raw, "not_found", true);
-    if (nodes.length > 1) {
-      const previews = nodes.slice(0, 3).map((el, i) => {
-        const tag = el.tagName.toLowerCase();
-        const text = (el.innerText || el.getAttribute("aria-label") || el.id || "").replace(/\\s+/g, " ").trim().slice(0, 40);
-        return "#" + i + " <" + tag + (el.id ? "#" + el.id : "") + ">" + (text ? ' "' + text + '"' : "");
-      }).join(", ");
-      return fail("Locator matched " + nodes.length + " elements; narrow it (e.g. append >> first or >> nth=0): " + raw + " [" + previews + "]", "multiple", false);
-    }
-
-    const element = nodes[0];
-    if (mutation === "eval") {
-      if (typeof __userFn !== "function") return fail("Missing evaluation function", "invalid", false);
-      const out = hasEvalArg ? __userFn(element, __evalArg) : __userFn(element);
-      return { count: 1, value: ${evalAwait}out };
-    }
-    if (mutation === "attr") {
-      if (!attrName) return fail("Attribute name is required", "invalid", false);
-      return { count: 1, value: element.getAttribute(attrName) };
-    }
-    if (mutation === "inputValue") {
-      if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement)) {
-        return fail("Locator did not match an input, textarea, or select element: " + raw, "invalid", false);
-      }
-      return { count: 1, value: element.value ?? "" };
-    }
-    if (mutation === "text") {
-      return { count: 1, text: (element.innerText || element.textContent || "").trim() };
-    }
-    if (mutation === "textContent") {
-      return { count: 1, text: element.textContent };
-    }
-    if (mutation === "innerText") {
-      return { count: 1, text: (element.innerText || "").trim() };
-    }
-    if (mutation === "focus") {
-      if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
-      element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-      element.focus();
-      return { count: 1, focused: true, ...cursorPt(element) };
-    }
-    if (mutation === "check" || mutation === "uncheck") {
-      if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
-      if (!force && isDisabledEl(element)) return fail("Element is disabled: " + raw, "disabled", true);
-      const want = mutation === "check";
-      const isChecked = element instanceof HTMLInputElement
-        ? !!element.checked
-        : element.getAttribute("aria-checked") === "true";
-      if (isChecked === want) {
-        return { count: 1, changed: false, checked: isChecked, ...cursorPt(element) };
-      }
-      if (crossOriginDirect) {
-        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-        element.click();
-        return { count: 1, changed: true, clicked: true, checked: want, ...cursorPt(element) };
-      }
-    }
-    if (mutation === "click") {
-      if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
-      if (!force && isDisabledEl(element)) return fail("Element is disabled: " + raw, "disabled", true);
-      element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-      element.click();
-      return { count: 1, clicked: true, ...cursorPt(element) };
-    }
-    if (mutation === "hover") {
-      if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
-      element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-      const rect = element.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return fail("Locator matched an element with no visible box: " + raw, "not_visible", true);
-      return { count: 1, hovered: true, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, __cursorMove: true };
-    }
-    if (mutation === "fill" || mutation === "clear") {
-      if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
-      if (!force && isDisabledEl(element)) return fail("Element is disabled: " + raw, "disabled", true);
-      if ((element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) && element.readOnly) {
-        return fail("Element is read-only: " + raw, "readonly", false);
-      }
-      element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-      const assigned = mutation === "clear" ? "" : String(nextValue ?? "");
-      const inputType = mutation === "clear" ? "deleteContentBackward" : "insertText";
-      if (element.isContentEditable) {
-        element.focus();
-        element.textContent = assigned;
-        element.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: assigned, inputType }));
-        element.dispatchEvent(new Event("change", { bubbles: true }));
-        return { count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }), ...cursorPt(element) };
-      }
-      element.focus();
-      const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value");
-      if (descriptor?.set) descriptor.set.call(element, assigned); else element.value = assigned;
-      element.dispatchEvent(typeof InputEvent === "function"
-        ? new InputEvent("input", { bubbles: true, composed: true, data: assigned, inputType })
-        : new Event("input", { bubbles: true, composed: true }));
-      element.dispatchEvent(new Event("change", { bubbles: true }));
-      return { count: 1, ...(mutation === "clear" ? { cleared: true } : { filled: true }), ...cursorPt(element) };
-    }
-    if (mutation === "select") {
-      if (!(element instanceof HTMLSelectElement)) return fail("Locator did not match a <select> element: " + raw, "invalid", false);
-      if (!force && element.disabled) return fail("Select element is disabled: " + raw, "disabled", true);
-      const wanted = Array.isArray(selectSpec) ? selectSpec : [selectSpec];
-      const options = Array.from(element.options);
-      const selected = [];
-      for (const spec of wanted) {
-        let opt = null;
-        if (typeof spec === "string") {
-          opt = options.find((o) => o.value === spec) || options.find((o) => o.label === spec || o.text.trim() === spec);
-        } else if (spec && typeof spec === "object") {
-          if (spec.index !== undefined) opt = options[spec.index];
-          else if (spec.value !== undefined) opt = options.find((o) => o.value === spec.value);
-          else if (spec.label !== undefined) opt = options.find((o) => o.label === spec.label || o.text.trim() === spec.label);
-        }
-        if (!opt) return fail("Select option not found: " + JSON.stringify(spec), "not_found", true);
-        if (opt.disabled) return fail("Select option is disabled: " + opt.text, "disabled", true);
-        selected.push(opt);
-      }
-      if (!element.multiple) {
-        for (const o of options) o.selected = o === selected[0];
-      } else {
-        for (const o of options) o.selected = selected.includes(o);
-      }
-      element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-      element.dispatchEvent(new Event("change", { bubbles: true }));
-      return { count: 1, selected: selected.map((o) => o.value), ...cursorPt(element) };
-    }
-
-    if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);
-    if (!force && isDisabledEl(element)) return fail("Element is disabled: " + raw, "disabled", true);
-    element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-    const rect = element.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return fail("Locator matched an element with no visible box: " + raw, "not_visible", true);
-
-    const doc = element.ownerDocument || document;
-    const win = doc.defaultView || window;
-    const vv = win.visualViewport;
-    const ox = vv?.offsetLeft ?? 0;
-    const oy = vv?.offsetTop ?? 0;
-    const vw = vv?.width ?? win.innerWidth;
-    const vh = vv?.height ?? win.innerHeight;
-    const vLeft = Math.max(rect.left, ox);
-    const vRight = Math.min(rect.right, ox + vw);
-    const vTop = Math.max(rect.top, oy);
-    const vBottom = Math.min(rect.bottom, oy + vh);
-    if (!force && (vRight <= vLeft || vBottom <= vTop)) {
-      return fail("Locator element is outside the viewport: " + raw, "not_visible", true);
-    }
-
-    const boxLeft = vRight > vLeft ? vLeft : rect.left;
-    const boxRight = vRight > vLeft ? vRight : rect.right;
-    const boxTop = vBottom > vTop ? vTop : rect.top;
-    const boxBottom = vBottom > vTop ? vBottom : rect.bottom;
-    const cx = (boxLeft + boxRight) / 2;
-    const cy = (boxTop + boxBottom) / 2;
-    const dx = Math.max(1, (boxRight - boxLeft) * 0.25);
-    const dy = Math.max(1, (boxBottom - boxTop) * 0.25);
-
-    const control = element instanceof HTMLInputElement || element instanceof HTMLButtonElement ||
-      element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement ? element : null;
-    const accepted = new Set([element, ...(control?.labels ? Array.from(control.labels) : [])]);
-    const matchesTarget = (node) => {
-      for (let cur = node; cur; cur = cur.parentNode || cur.host) {
-        if (accepted.has(cur)) return true;
-        if (cur.assignedSlot && accepted.has(cur.assignedSlot)) return true;
-      }
-      return false;
-    };
-
-    const points = [
-      { x: cx, y: cy },
-      { x: boxLeft + dx, y: boxTop + dy },
-      { x: boxRight - dx, y: boxTop + dy },
-      { x: boxLeft + dx, y: boxBottom - dy },
-      { x: boxRight - dx, y: boxBottom - dy },
-    ];
-    let chosen = null;
-    let firstHitTag = null;
-    for (const pt of points) {
-      const hit = elementFromPointDeep(doc, pt.x, pt.y);
-      if (firstHitTag === null) firstHitTag = hit?.tagName?.toLowerCase() ?? null;
-      if (hit && matchesTarget(hit)) {
-        chosen = pt;
-        break;
-      }
-    }
-    if (!force && !chosen) {
-      return fail("Locator element is covered by <" + (firstHitTag || "unknown") + ">: " + raw, "covered", true);
-    }
-
-    const pt = chosen || { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-    const sameOriginRect = Array.isArray(sameOriginFrames) && sameOriginFrames.length > 0;
-    let offsetX = 0;
-    let offsetY = 0;
-    if (sameOriginRect) {
-      let fWin = element.ownerDocument.defaultView;
-      while (fWin && fWin !== window) {
-        const frameEl = fWin.frameElement;
-        if (!frameEl) break;
-        const fr = frameEl.getBoundingClientRect();
-        offsetX += fr.left + frameEl.clientLeft;
-        offsetY += fr.top + frameEl.clientTop;
-        fWin = fWin.parent;
-      }
-    }
-    return {
-      count: 1,
-      x: offsetX + pt.x,
-      y: offsetY + pt.y,
-      width: rect.width,
-      height: rect.height,
-      hitTag: firstHitTag,
-      ...(mutation === "check" || mutation === "uncheck"
-        ? { changed: true, checked: mutation === "check" }
-        : {}),
-    };
-${waitMs > 0 ? `    };
-    const isDone = (res) => mutation === "wait"
-      ? Boolean(res?.satisfied || (res?.error && !res.retryable))
-      : Boolean(res && (!res.error || !res.retryable));
-    const initial = ${evalAwait}runOnce();
-    if (isDone(initial) || typeof MutationObserver !== "function") return initial;
-    return await new Promise((resolve) => {
-      let done = false;
-      let polling = false;
-      const observers = [];
-      const finish = (res) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        clearInterval(interval);
-        for (const obs of observers) {
-          try { obs.disconnect(); } catch (_e) {}
-        }
-        resolve(res);
-      };
-      const check = ${options.asyncEval ? "async " : ""}() => {
-        if (done || polling) return;
-        polling = true;
-        try {
-          const next = ${evalAwait}runOnce();
-          if (isDone(next)) { finish(next); return; }
-          observeFrameRoot();
-        } catch (error) {
-          finish(fail(error?.message || "Locator evaluation failed", "error", false));
-        } finally {
-          polling = false;
-        }
-      };
-      const observeTarget = (root) => {
-        const target = root?.documentElement || root?.body || root;
-        if (!target || typeof target !== "object" || observers.some((o) => o.__target === target)) return;
-        try {
-          const obs = new MutationObserver(() => { void check(); });
-          obs.__target = target;
-          obs.observe(target, { childList: true, subtree: true, attributes: true, characterData: true });
-          observers.push(obs);
-        } catch (_e) {}
-      };
-      const observeFrameRoot = () => {
-        observeTarget(document);
-        if (Array.isArray(sameOriginFrames) && sameOriginFrames.length > 0) {
-          try {
-            const rf = resolveSameOriginTargetRoot(sameOriginFrames);
-            if (rf?.root && rf.root !== document) observeTarget(rf.root);
-          } catch (_e) {}
-        }
-      };
-      observeFrameRoot();
-      const interval = setInterval(() => { void check(); }, 100);
-      const timer = setTimeout(() => {
-        void (${options.asyncEval ? "async " : ""}() => {
-          try { finish(${evalAwait}runOnce()); }
-          catch (error) { finish(fail(error?.message || "Locator evaluation failed", "error", false)); }
-        })();
-      }, ${waitMs});
-    });` : ""}
+    ${SHARED_RUNNER_CORE}
+    return ${evalAwait}runLocatorAction(${JSON.stringify(selector)}, ${optsExpr}, ${embeddedEvalFn});
   })()`;
 }
 
@@ -931,6 +1118,12 @@ export function smartSetValueFunctionDeclaration() {
         throw new Error(label + " is read-only");
       }
     };
+    const resultStatus = (status) => {
+      const rect = typeof this.getBoundingClientRect === "function" ? this.getBoundingClientRect() : null;
+      return rect && rect.width > 0 && rect.height > 0
+        ? { status, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, __cursorMove: true }
+        : { status };
+    };
     const emit = () => {
       this.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
       this.dispatchEvent(new Event("change", { bubbles: true }));
@@ -947,7 +1140,7 @@ export function smartSetValueFunctionDeclaration() {
       if (setter) setter.call(this, checked); else this.checked = checked;
       if (this.type === "checkbox") this.indeterminate = false;
       if (changed) emit();
-      return "done";
+      return resultStatus("done");
     }
 
     if (this instanceof HTMLSelectElement) {
@@ -966,7 +1159,7 @@ export function smartSetValueFunctionDeclaration() {
       const changed = !opt.selected;
       opt.selected = true;
       if (changed) emit();
-      return "done";
+      return resultStatus("done");
     }
 
     if (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) {
@@ -974,32 +1167,61 @@ export function smartSetValueFunctionDeclaration() {
         throw new Error("File inputs require browser_upload_files");
       }
       ensureEditable("Input", true);
+      const win = this.ownerDocument?.defaultView || window;
+      const cke = win?.CKEDITOR?.instances;
+      if (cke && typeof cke === "object") {
+        for (const inst of Object.values(cke)) {
+          if (inst && (inst.element?.$ === this || (this.id && inst.name === this.id) || (this.name && inst.name === this.name))) {
+            inst.setData?.(val);
+            inst.updateElement?.();
+            return resultStatus("done");
+          }
+        }
+      }
+      const tiny = this.id ? win?.tinymce?.get?.(this.id) : null;
+      if (tiny && typeof tiny.setContent === "function") {
+        tiny.setContent(val);
+        tiny.save?.();
+        return resultStatus("done");
+      }
       this.focus();
       const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), "value");
       if (descriptor?.set) descriptor.set.call(this, val); else this.value = val;
       emit();
-      return "done";
+      return resultStatus("done");
     }
 
     if (role === "tab") {
       ensureEditable("Tab");
-      return this.getAttribute("aria-selected") === "true" ? "done" : "needs-click";
+      return this.getAttribute("aria-selected") === "true" ? resultStatus("done") : resultStatus("needs-click");
     }
 
+    const ck5 = this.ckeditorInstance || this.closest?.(".ck-editor__editable")?.ckeditorInstance;
+    if (ck5 && typeof ck5.setData === "function") {
+      ensureEditable("Editable element");
+      ck5.setData(val);
+      return resultStatus("done");
+    }
+    const quill = this.__quill || this.closest?.(".ql-container")?.__quill;
+    if (quill && typeof quill.setText === "function") {
+      ensureEditable("Editable element");
+      quill.setText(val);
+      return resultStatus("done");
+    }
     if (this instanceof HTMLElement && this.isContentEditable) {
       ensureEditable("Editable element");
       this.focus();
       this.textContent = val;
       this.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: val, inputType: "insertText" }));
       this.dispatchEvent(new Event("change", { bubbles: true }));
-      return "done";
+      return resultStatus("done");
     }
 
     if (typeof this.focus === "function") this.focus();
     const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), "value");
     if (descriptor?.set) descriptor.set.call(this, val); else this.value = val;
     emit();
-    return "done";
+    return resultStatus("done");
   }`;
 }
 

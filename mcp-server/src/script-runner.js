@@ -599,25 +599,45 @@ export class BrowserScriptSession {
         screenshot: opts?.screenshot === true,
         fullPage: opts?.fullPage ?? opts?.full_page ?? false,
         format: opts?.format ?? "jpeg",
-        quality: opts?.quality ?? 80,
+        quality: opts?.quality ?? 75,
         diff: opts?.full !== true && opts?.disableDiffing !== true,
         full: opts?.full === true || opts?.disableDiffing === true,
+        mode: opts?.mode ?? "full",
         maxLines: opts?.maxLines ?? opts?.max_lines ?? 2_000,
       }), "getState", guardOpts),
       state: (opts = {}) => tabApi.getState(opts),
       ariaSnapshot: async (opts = {}) => (await self.#guard((b) => b.ariaSnapshot({
         tabId: resolveTab(opts),
         maxLines: opts?.maxLines ?? opts?.max_lines ?? 2_000,
+        mode: opts?.mode ?? "full",
       }), "ariaSnapshot", guardOpts)).text,
       screenshot: (opts = {}) => self.#guard((b) => b.screenshot(resolveTab(opts), {
         fullPage: opts?.fullPage ?? opts?.full_page ?? false,
         format: opts?.format ?? "jpeg",
-        quality: opts?.quality ?? 80,
+        quality: opts?.quality ?? 75,
+        ...(opts?.maxWidth !== undefined || opts?.max_width !== undefined
+          ? { maxWidth: opts?.maxWidth ?? opts?.max_width }
+          : {}),
         clip: opts?.clip,
         scale: opts?.scale ?? "css",
       }), "screenshot", guardOpts),
-      getContent: async (opts) => (await self.#guard((b) => b.getContent(resolveTab(opts)), "getContent", guardOpts))?.text ?? "",
-      content: (opts) => tabApi.getContent(opts),
+      getContent: async (opts) => {
+        const format = typeof opts === "string" ? opts : opts?.format;
+        const maxChars = typeof opts === "object" && opts ? (opts.maxChars ?? opts.max_chars) : undefined;
+        const passOpts = (format || maxChars !== undefined)
+          ? { ...(format ? { format } : {}), ...(maxChars !== undefined ? { maxChars } : {}) }
+          : undefined;
+        const res = await self.#guard((b) => b.getContent(resolveTab(opts), passOpts), "getContent", guardOpts);
+        if (format === "tables" || format === "links") return res;
+        return res?.content ?? res?.text ?? "";
+      },
+      webmcp: {
+        listTools: (opts) => self.#guard((b) => b.webmcpListTools(resolveTab(opts)), "webmcp.listTools", guardOpts),
+        invokeTool: (name, args, opts) => self.#guard((b) => b.webmcpInvokeTool(name, args, { tabId: resolveTab(opts) }), "webmcp.invokeTool", guardOpts),
+      },
+      assets: {
+        list: (opts = {}) => self.#guard((b) => b.listPageAssets(resolveTab(opts), opts), "assets.list", guardOpts),
+      },
       domSnapshot: (opts = {}) => self.#guard((b) => b.domSnapshot({
         tabId: resolveTab(opts),
         maxChars: opts?.maxChars ?? opts?.max_chars ?? 24_000,
@@ -819,10 +839,21 @@ export class BrowserScriptSession {
         }), "waitFor", guardOpts);
       },
       wait: (optsOrMs) => tabApi.waitFor(optsOrMs),
-      waitForEvent: (eventName, opts = {}) => self.#guard((b) => b.waitForEvent(eventName, {
-        tabId: resolveTab(opts),
-        timeoutMs: self.#clampTimeout(opts?.timeoutMs ?? opts?.timeout_ms ?? 30_000),
-      }), `waitForEvent(${eventName})`, guardOpts),
+      waitForEvent: async (eventName, opts = {}) => {
+        const res = await self.#guard((b) => b.waitForEvent(eventName, {
+          tabId: resolveTab(opts),
+          timeoutMs: self.#clampTimeout(opts?.timeoutMs ?? opts?.timeout_ms ?? 30_000),
+        }), `waitForEvent(${eventName})`, guardOpts);
+        if (eventName === "popup" && res?.tab_id) {
+          const handle = self.#createTabHandle(res.tab_id);
+          handle.openerTabId = res.opener_tab_id;
+          handle.opener_tab_id = res.opener_tab_id;
+          handle.initialUrl = res.url;
+          handle.initialTitle = res.title;
+          return handle;
+        }
+        return res;
+      },
       waitForLoadState: (stateOrOpts = "load", maybeOpts = {}) => {
         const opts = typeof stateOrOpts === "string"
           ? { ...maybeOpts, loadState: stateOrOpts }
@@ -951,6 +982,14 @@ export class BrowserScriptSession {
         ariaSnapshot: (opts = {}) => tabApi.ariaSnapshot(opts),
       },
     };
+    tabApi.content = Object.assign(
+      (opts) => tabApi.getContent(opts),
+      {
+        export: (opts = {}) => tabApi.getContent({ ...opts, format: opts?.format ?? "markdown" }),
+        tables: (opts = {}) => tabApi.getContent({ ...opts, format: "tables" }),
+        links: (opts = {}) => tabApi.getContent({ ...opts, format: "links" }),
+      },
+    );
     tabApi.playwright = tabApi;
     return tabApi;
   }
@@ -975,6 +1014,10 @@ export class BrowserScriptSession {
           await self.#guard((b) => b.claimTab(wanted), "tabs.claim", { trackActiveTab: false });
         }
         return self.#createTabHandle(wanted);
+      },
+      read: async (tabOrId, opts = {}) => {
+        const raw = isPlainObject(tabOrId) ? (tabOrId.tab_id ?? tabOrId.id ?? tabOrId.providerTabId) : tabOrId;
+        return await self.#guard((b) => b.readTabContext(raw, opts), "tabs.read", { trackActiveTab: false });
       },
       claim: async (tabOrId) => {
         const raw = isPlainObject(tabOrId) ? (tabOrId.tab_id ?? tabOrId.id) : tabOrId;
@@ -1004,6 +1047,10 @@ export class BrowserScriptSession {
         const raw = isPlainObject(tabOrId) ? (tabOrId.tab_id ?? tabOrId.id ?? tabOrId.providerTabId) : tabOrId;
         const info = await self.#guard((b) => b.claimTab(raw), "user.claimTab", { trackActiveTab: true });
         return self.#createTabHandle(info.tab_id);
+      },
+      getTabContext: async (tabOrId, opts = {}) => {
+        const raw = isPlainObject(tabOrId) ? (tabOrId.tab_id ?? tabOrId.id ?? tabOrId.providerTabId) : tabOrId;
+        return await self.#guard((b) => b.readTabContext(raw, opts), "user.getTabContext", { trackActiveTab: false });
       },
     };
     api.viewport = {

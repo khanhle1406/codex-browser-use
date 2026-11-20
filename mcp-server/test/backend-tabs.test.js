@@ -150,6 +150,11 @@ test("getUserTabs and claimUserTab allow claiming open user tabs, enforce sessio
       if (!tab) throw new Error("No tab");
       return { ...tab, owned: true, origin: "user" };
     },
+    async readTabContext(id, opts) {
+      const tab = tabs.get(id);
+      if (!tab) throw new Error("No tab");
+      return { title: tab.title, url: tab.url, format: opts?.format || "markdown", text: "# Passive", truncated: false };
+    },
     async readTab(id) { return tabs.get(id) ?? null; },
     async closeTab(id) { closed.push(id); tabs.delete(id); },
     async releaseTab(id) { released.push(id); },
@@ -163,6 +168,11 @@ test("getUserTabs and claimUserTab allow claiming open user tabs, enforce sessio
     const infoA = handlers.get("getInfo")(a, first.signal, () => undefined);
     handlers.get("getInfo")(b, second.signal, () => undefined);
     assert.equal(infoA.apiSupportOverrides["BrowserUser.openTabs"], true);
+    assert.equal(infoA.apiSupportOverrides["BrowserUser.getTabContext"], true);
+
+    // Passive read works before claiming without adding tab 50 to session A
+    const readA = await handlers.get("readTabContext")({ ...a, tabId: 50, format: "markdown" }, first.signal);
+    assert.equal(readA.text, "# Passive");
 
     const openForA = await handlers.get("getUserTabs")(a, first.signal);
     assert.equal(openForA.length, 1);
@@ -175,9 +185,10 @@ test("getUserTabs and claimUserTab allow claiming open user tabs, enforce sessio
     assert.equal(claimed.owned, true);
     assert.equal(claimed.origin, "user");
 
-    // Session B cannot see or claim tab 50 while Session A owns it
+    // Session B cannot see, read passively, or claim tab 50 while Session A owns it
     const openForB = await handlers.get("getUserTabs")(b, second.signal);
     assert.equal(openForB.length, 0);
+    await assert.rejects(handlers.get("readTabContext")({ ...b, tabId: 50 }, second.signal), /unavailable/);
     await assert.rejects(handlers.get("claimUserTab")({ ...b, tabId: 50 }, second.signal), /unavailable/);
 
     // Session A also creates an ephemeral agent tab 60, then ends turn without marking either tab
@@ -191,6 +202,50 @@ test("getUserTabs and claimUserTab allow claiming open user tabs, enforce sessio
   } finally {
     first.abort();
     second.abort();
+  }
+});
+
+test("onTabCreated auto-claims popup child tabs into the opener's session and tab group", async () => {
+  let emitDriverEvent = () => {};
+  const notifications = [];
+  const grouped = [];
+  const tabs = new Map([[1, { id: 1, url: "https://app.example/", title: "App" }]]);
+  const acA = new AbortController();
+  const acB = new AbortController();
+  const sessA = { session_id: "sess-a", turn_id: "t-a1" };
+  const sessB = { session_id: "sess-b", turn_id: "t-b1" };
+
+  const handlers = createTabHandlers({
+    async createBlankTab() { return tabs.get(1); },
+    async readTab(id) { return tabs.get(id) ?? null; },
+    async closeTab(id) { tabs.delete(id); },
+    async groupTabs(tabIds, opts) { grouped.push({ tabIds, title: opts.title }); return { groupId: 77, supported: true }; },
+    onEvent(fn) { emitDriverEvent = fn; },
+  }, { name: "Popup fixture", version: "0.6.0" });
+
+  try {
+    handlers.get("getInfo")(sessA, acA.signal, (method, params) => notifications.push({ method, params }));
+    handlers.get("getInfo")(sessB, acB.signal, () => {});
+    await handlers.get("createTab")(sessA, acA.signal);
+    await handlers.get("nameSession")({ ...sessA, name: "Work", color: "blue" }, acA.signal);
+
+    // Driver emits onTabCreated for child popup 99 opened from tab 1
+    const child = { id: 99, url: "https://app.example/popup", title: "Popup", active: false };
+    tabs.set(99, child);
+    emitDriverEvent("onTabCreated", 1, { openerTabId: 1, tab: child });
+    await Promise.resolve();
+
+    const aTabs = await handlers.get("getTabs")(sessA, acA.signal);
+    const bTabs = await handlers.get("getTabs")(sessB, acB.signal);
+    assert.deepEqual(aTabs.map((t) => t.id), [1, 99]);
+    assert.deepEqual(bTabs, []);
+    assert.equal(notifications.some((n) => n.method === "onTabCreated" && n.params.tab.id === 99), true);
+    assert.equal(grouped.some((g) => g.tabIds.includes(99) && g.title === "Work"), true);
+    await handlers.get("turnEnded")(sessA, acA.signal);
+    assert.equal(tabs.size, 0);
+  } finally {
+    acA.abort();
+    acB.abort();
   }
 });
 

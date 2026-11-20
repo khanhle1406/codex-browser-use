@@ -659,3 +659,87 @@ test("MCP server lists and auto-claims already-open Chrome user tabs via browser
   assert.equal(runRes.result.id, "132");
   assert.equal(runRes.result.val, "Existing form data from tab 132");
 });
+
+test("MCP tool profiles reduce compact schema bytes by >=75% and support WebMCP, assets, and popup handles", async (t) => {
+  const mkPair = async (profile) => {
+    const ownedTabs = new Map([[1, { id: 1, url: "https://app.example/", title: "App" }]]);
+    let browserRef = null;
+    const browser = new BridgeBrowser({
+      request: async (method, params = {}) => {
+        if (method === "getTabs") return [...ownedTabs.values()];
+        if (method === "attach" || method === "markTab" || method === "turnEnded") return null;
+        if (method === "executeCdp" && params.method === "Runtime.evaluate") {
+          const expr = String(params.commandParams?.expression || "");
+          if (expr.includes("navigator.modelContext") && expr.includes("invokeTool")) {
+            return { result: { value: { count: 42 } } };
+          }
+          if (expr.includes("navigator.modelContext")) {
+            return { result: { value: { supported: true, tools: [{ name: "searchCatalog", description: "Search" }] } } };
+          }
+          if (expr.includes("document.fonts")) {
+            return { result: { value: { url: "https://app.example/", assets: [{ kind: "image", url: "https://app.example/a.png", source: "img" }], fonts: [], inlineSvgCount: 1, inlineSvgs: [] } } };
+          }
+          return { result: { value: "ok" } };
+        }
+        return {};
+      },
+      close: async () => {},
+      sessionId: `s-${profile}`,
+      turnId: `t-${profile}`,
+    });
+    browserRef = browser;
+    const server = createStandaloneServer({ profile, getBrowser: async () => browserRef, resetBrowser: async () => {} });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: `c-${profile}`, version: "1.0.0" });
+    await Promise.all([server.connect(st), client.connect(ct)]);
+    t.after(async () => { await client.close(); await server.close(); });
+    return { client, browser };
+  };
+
+  const fullEnv = await mkPair("full");
+  const stdEnv = await mkPair("standard");
+  const cmpEnv = await mkPair("compact");
+
+  const fullList = await fullEnv.client.listTools();
+  const stdList = await stdEnv.client.listTools();
+  const cmpList = await cmpEnv.client.listTools();
+
+  assert.equal(fullList.tools.length, 36);
+  assert.equal(stdList.tools.length, 14);
+  assert.equal(cmpList.tools.length, 7);
+
+  const fullBytes = JSON.stringify(fullList.tools).length;
+  const cmpBytes = JSON.stringify(cmpList.tools).length;
+  assert.ok(cmpBytes <= fullBytes * 0.25, `Expected compact schema (${cmpBytes}B) <= 25% of full (${fullBytes}B)`);
+
+  // Verify WebMCP + assets + waitForEvent('popup') inside compact browser_run
+  setTimeout(() => {
+    cmpEnv.browser.handleTabCreated({
+      openerTabId: 1,
+      tab: { id: 2, url: "https://app.example/popup", title: "Popup" },
+    });
+  }, 15);
+  const rawCall = await cmpEnv.client.callTool({
+    name: "browser_run",
+    arguments: {
+      return_state: "none",
+      code: `
+        const tools = await page.webmcp.listTools();
+        const invoked = await page.webmcp.invokeTool("searchCatalog", { q: "pump" });
+        const assets = await page.assets.list();
+        const popup = await page.waitForEvent("popup", { timeoutMs: 1000 });
+        return { toolsCount: tools.tools.length, invoked, assetsCount: assets.assets.length, popupId: popup.id };
+      `,
+    },
+  });
+  const rawText = rawCall.content[0].text;
+  const res = JSON.parse(rawText.split("\n<notifications>")[0]);
+  assert.match(rawText, /Popup tab 2 opened from tab 1/);
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.result, {
+    toolsCount: 1,
+    invoked: { tab_id: "1", name: "searchCatalog", result: { count: 42 } },
+    assetsCount: 1,
+    popupId: "2",
+  });
+});

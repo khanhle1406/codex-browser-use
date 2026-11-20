@@ -3,11 +3,14 @@ import test from "node:test";
 import vm from "node:vm";
 import { parse } from "acorn";
 import {
+  LOCATOR_RUNTIME_VERSION,
   domSnapshotExpression,
   hitTestFunctionDeclaration,
   inspectElementAtPointExpression,
   locatorExpression,
+  locatorInvokeExpression,
   locatorResolveNodeExpression,
+  locatorRuntimeInstallExpression,
   selectOptionFunctionDeclaration,
   smartSetValueFunctionDeclaration,
   waitForTextExpression,
@@ -309,4 +312,168 @@ test("in-page MutationObserver waits resolve selector and text in one evaluation
   ]);
   assert.equal(selWait.satisfied, true);
   assert.equal(txtWait.matched, true);
+});
+
+test("locatorRuntimeInstallExpression installs globalThis.__buRt and locatorInvokeExpression runs in <350B", async () => {
+  const doc = {
+    body: { nodeType: 1, tagName: "BODY", children: [], childNodes: [] },
+    documentElement: null,
+    children: [],
+    querySelectorAll: () => [],
+    elementFromPoint: () => null,
+    getElementById: () => null,
+  };
+  doc.documentElement = doc.body;
+  const btn = {
+    nodeType: 1,
+    tagName: "BUTTON",
+    id: "go",
+    innerText: "Go",
+    textContent: "Go",
+    children: [],
+    childNodes: [],
+    labels: [],
+    shadowRoot: null,
+    ownerDocument: doc,
+    getAttribute: (k) => (k === "id" ? "go" : null),
+    hasAttribute: (k) => k === "id",
+    matches: () => false,
+    closest: () => null,
+    scrollIntoView() {},
+    focus() {},
+    getBoundingClientRect: () => ({ left: 5, top: 5, right: 85, bottom: 35, x: 5, y: 5, width: 80, height: 30 }),
+  };
+  doc.querySelectorAll = (css) => (css === "#go" || css.includes("button") ? [btn] : []);
+  doc.elementFromPoint = () => btn;
+  doc.body.children = [btn];
+
+  const vmCtx = vm.createContext({
+    document: doc,
+    window: { innerWidth: 1280, innerHeight: 800, getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) },
+    CSS: { escape: (s) => String(s) },
+    HTMLInputElement: class {},
+    HTMLButtonElement: class {},
+    HTMLTextAreaElement: class {},
+    HTMLSelectElement: class {},
+    HTMLElement: class {},
+    ShadowRoot: class {},
+    MutationObserver: class { observe() {} disconnect() {} },
+    InputEvent: class { constructor(t) { this.type = t; } },
+    Event: class { constructor(t) { this.type = t; } },
+  });
+
+  // Before install, invoke returns __buRtMissing cleanly
+  const invokeExpr = locatorInvokeExpression("css=#go", { mutation: "point" });
+  assert.ok(invokeExpr.length < 350);
+  const miss = vm.runInNewContext(invokeExpr, vmCtx);
+  assert.equal(miss.__buRtMissing, true);
+
+  // After install, tiny invoke expression resolves element point cleanly
+  const installed = vm.runInNewContext(locatorRuntimeInstallExpression(), vmCtx);
+  assert.equal(installed.installed, true);
+  assert.equal(installed.v, LOCATOR_RUNTIME_VERSION);
+  const hit = vm.runInNewContext(invokeExpr, vmCtx);
+  assert.equal(hit.count, 1);
+  assert.equal(hit.x, 45);
+  assert.equal(hit.y, 20);
+});
+
+test("tryFillRichEditor supports CKEditor 4, CKEditor 5, TinyMCE, and Quill editors", () => {
+  const calls = [];
+  const doc = {
+    body: { nodeType: 1, tagName: "BODY", children: [], childNodes: [] },
+    documentElement: null,
+    children: [],
+    querySelectorAll: () => [],
+    elementFromPoint: () => null,
+    getElementById: () => null,
+  };
+  doc.documentElement = doc.body;
+  const makeRichEl = (id, extra = {}) => ({
+    nodeType: 1,
+    tagName: extra.tag || "TEXTAREA",
+    id,
+    name: id,
+    children: [],
+    childNodes: [],
+    labels: [],
+    shadowRoot: null,
+    ownerDocument: doc,
+    isContentEditable: Boolean(extra.contentEditable),
+    ckeditorInstance: extra.ck5 || null,
+    __quill: extra.quill || null,
+    getAttribute: (k) => (k === "id" ? id : null),
+    hasAttribute: (k) => k === "id",
+    matches: () => false,
+    closest: () => null,
+    scrollIntoView() {},
+    focus() {},
+    dispatchEvent() {},
+    getBoundingClientRect: () => ({ left: 10, top: 10, right: 200, bottom: 100, x: 10, y: 10, width: 190, height: 90 }),
+  });
+
+  const ckeArea = makeRichEl("cke4");
+  const tinyArea = makeRichEl("tiny1");
+  const ck5Div = makeRichEl("ck5", {
+    tag: "DIV",
+    contentEditable: true,
+    ck5: { setData: (v) => calls.push(["ck5", v]) },
+  });
+  const quillDiv = makeRichEl("quill1", {
+    tag: "DIV",
+    quill: { setText: (v) => calls.push(["quill", v]) },
+  });
+  doc.querySelectorAll = (css) => {
+    if (css === "#cke4") return [ckeArea];
+    if (css === "#tiny1") return [tinyArea];
+    if (css === "#ck5") return [ck5Div];
+    if (css === "#quill1") return [quillDiv];
+    return [];
+  };
+
+  const vmCtx = vm.createContext({
+    document: doc,
+    window: {
+      innerWidth: 1280,
+      innerHeight: 800,
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+      CKEDITOR: {
+        instances: {
+          cke4: {
+            name: "cke4",
+            element: { $: ckeArea },
+            setData: (v) => calls.push(["ck4.setData", v]),
+            updateElement: () => calls.push(["ck4.update"]),
+          },
+        },
+      },
+      tinymce: {
+        get: (id) => (id === "tiny1" ? { setContent: (v) => calls.push(["tiny.set", v]), save: () => calls.push(["tiny.save"]) } : null),
+      },
+    },
+    CSS: { escape: (s) => String(s) },
+    HTMLInputElement: class {},
+    HTMLButtonElement: class {},
+    HTMLTextAreaElement: class {},
+    HTMLSelectElement: class {},
+    HTMLElement: class {},
+    ShadowRoot: class {},
+    MutationObserver: class { observe() {} disconnect() {} },
+    InputEvent: class { constructor(t) { this.type = t; } },
+    Event: class { constructor(t) { this.type = t; } },
+  });
+
+  vm.runInNewContext(locatorExpression("css=#cke4", { mutation: "fill", value: "<p>CK4</p>" }), vmCtx);
+  vm.runInNewContext(locatorExpression("css=#tiny1", { mutation: "fill", value: "<p>Tiny</p>" }), vmCtx);
+  vm.runInNewContext(locatorExpression("css=#ck5", { mutation: "fill", value: "CK5" }), vmCtx);
+  vm.runInNewContext(locatorExpression("css=#quill1", { mutation: "fill", value: "Quill" }), vmCtx);
+
+  assert.deepEqual(calls, [
+    ["ck4.setData", "<p>CK4</p>"],
+    ["ck4.update"],
+    ["tiny.set", "<p>Tiny</p>"],
+    ["tiny.save"],
+    ["ck5", "CK5"],
+    ["quill", "Quill"],
+  ]);
 });

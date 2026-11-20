@@ -8,6 +8,7 @@ import { BrowserScriptSession } from "./script-runner.js";
 const bridgeFile = process.env.BROWSER_USE_BRIDGE_FILE ?? defaultBridgeFile();
 const stringOrNumber = z.union([z.string(), z.number()]).transform((value) => String(value));
 const returnStateEnum = z.enum(["none", "diff", "full", "screenshot", "both"]);
+const axModeEnum = z.enum(["full", "compact", "interactive"]);
 const tabGroupColorEnum = z.enum(["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"]);
 const keepEntrySchema = z.object({
   tab_id: stringOrNumber,
@@ -130,6 +131,7 @@ const batchStepSchema = z.object({
     "click", "set_value", "type_text", "press_key", "select_option", "hover",
     "drag", "scroll", "locator_click", "locator_fill", "upload_files", "wait",
     "handle_dialog", "set_viewport", "reset_viewport", "name_session",
+    "get_state", "get_content", "evaluate", "read_tab",
   ]).describe("Action type to execute"),
   tab_id: stringOrNumber.optional(),
   url: z.string().optional(),
@@ -168,7 +170,22 @@ const batchStepSchema = z.object({
   prompt_text: z.string().optional(),
   name: z.string().min(1).max(80).optional(),
   color: tabGroupColorEnum.optional(),
+  expression: z.string().optional(),
+  format: z.enum(["text", "markdown", "tables", "links"]).optional(),
+  max_chars: z.number().int().min(200).max(100_000).optional(),
+  mode: axModeEnum.optional(),
 });
+
+const compactBatchStepSchema = z.object({
+  action: batchStepSchema.shape.action,
+  tab_id: stringOrNumber.optional(),
+  url: z.string().optional(),
+  selector: z.string().optional(),
+  element_index: stringOrNumber.optional(),
+  value: z.union([z.string(), z.array(z.string())]).optional(),
+  text: z.string().optional(),
+  key: z.string().optional(),
+}).passthrough();
 
 const ALL_TOOL_NAMES = [
   "browser_status", "browser_run", "browser_batch", "browser_get_state",
@@ -184,12 +201,63 @@ const ALL_TOOL_NAMES = [
   "browser_end_turn", "browser_reset",
 ];
 
+const COMPACT_TOOLS = [
+  "browser_run", "browser_batch", "browser_get_state", "browser_goto",
+  "browser_list_tabs", "browser_screenshot", "browser_end_turn",
+];
+
+const STANDARD_TOOLS = [
+  ...COMPACT_TOOLS,
+  "browser_status", "browser_get_content", "browser_select_tab",
+  "browser_new_tab", "browser_close_tab", "browser_evaluate", "browser_reset",
+];
+
+export const TOOL_PROFILES = {
+  compact: COMPACT_TOOLS,
+  standard: STANDARD_TOOLS,
+  full: ALL_TOOL_NAMES,
+};
+
 /**
- * Register the complete 36-tool Browser Use MCP surface.
+ * Resolve MCP tool surface profile from `--profile` CLI flag or `BROWSER_USE_TOOL_PROFILE`.
+ * @param {string[]} [argv]
+ * @param {Record<string, string|undefined>} [env]
+ * @returns {"compact"|"standard"|"full"}
+ */
+export function resolveToolProfile(argv = process.argv.slice(2), env = process.env) {
+  let profile = env?.BROWSER_USE_TOOL_PROFILE || "full";
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--profile") {
+      profile = argv[++i] || "";
+    } else if (arg.startsWith("--profile=")) {
+      profile = arg.slice("--profile=".length);
+    }
+  }
+  if (!Object.hasOwn(TOOL_PROFILES, profile)) {
+    throw new Error(`Invalid browser-use profile ${JSON.stringify(profile)}. Choose compact, standard, or full.`);
+  }
+  return /** @type {"compact"|"standard"|"full"} */ (profile);
+}
+
+/**
+ * Register the Browser Use MCP surface filtered by profile (`full` = 36 tools, `standard` = 14, `compact` = 7).
  * @param {McpServer} server
- * @param {{getBrowser?:()=>Promise<BridgeBrowser>, resetBrowser?:()=>Promise<void>}} [deps]
+ * @param {{getBrowser?:()=>Promise<BridgeBrowser>, resetBrowser?:()=>Promise<void>, profile?:"compact"|"standard"|"full"}} [deps]
  */
 export function registerTools(server, deps = {}) {
+  const profile = deps.profile ?? "full";
+  if (!Object.hasOwn(TOOL_PROFILES, profile)) {
+    throw new Error(`Invalid browser-use profile ${JSON.stringify(profile)}. Choose compact, standard, or full.`);
+  }
+  const activeTools = TOOL_PROFILES[profile];
+  const allowedTools = new Set(activeTools);
+  const registerTool = (name, description, schema, handler) => {
+    if (allowedTools.has(name)) {
+      server.tool(name, description, schema, handler);
+    }
+  };
+
   const scriptSession = new BrowserScriptSession();
   const getBrowser = deps.getBrowser ?? defaultGetBrowser;
   const resetBrowser = deps.resetBrowser ?? (async () => {
@@ -199,7 +267,7 @@ export function registerTools(server, deps = {}) {
     await browser?.close();
   });
 
-  server.tool(
+  registerTool(
     "browser_status",
     "Report the Chrome bridge descriptor, connection state, and available tools. Does not open a browser session.",
     {},
@@ -215,25 +283,27 @@ export function registerTools(server, deps = {}) {
         bridge,
         connected: deps.getBrowser ? undefined : browserPromise !== null,
         node: process.version,
-        tools: ALL_TOOL_NAMES,
+        profile,
+        tools: activeTools,
       });
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_run",
-    "Execute an async JavaScript browser script with a persistent session context across turns (`browser`/`page` helpers, fluent `getByRole`/`getByText`/`.check()`/`.evaluateAll()`, `ariaSnapshot()`, read-only `evaluate`, `viewImage`, `log`, `markDeliverable`) and optional inline `end_turn` cleanup.",
+    "Execute an async JavaScript browser script with persistent session bindings (`browser`/`page`, `ariaSnapshot()`, `ax.write()`, `content.export()`, read-only `evaluate`, `viewImage`, `markDeliverable`) and optional `end_turn`.",
     {
       code: z.string().min(1).describe("Async JavaScript body with `browser`/`page`, `log`, `sleep`, `viewImage` in scope"),
       tab_id: stringOrNumber.optional().describe("Optional initial tab_id"),
-      timeout_ms: z.number().int().min(500).max(120_000).optional().describe("Script execution deadline in ms. Defaults to 45000"),
-      return_state: returnStateEnum.optional().describe("Optional post-script state; defaults to diff if script returns undefined and does not end turn, else none"),
-      end_turn: z.boolean().optional().describe("End turn automatically after the script succeeds (auto-enabled when `keep` or `markDeliverable`/`markHandoff` is used)"),
-      keep: keepParamSchema.optional().describe('Keep mode ("handoff" | "deliverable") for active tab or explicit [{ tab_id, mode }] list when ending turn'),
-      max_lines: z.number().int().min(1).max(10_000).optional().describe("Maximum AX lines when returning state. Defaults to 1500"),
-      reset_context: z.boolean().optional().describe("Reset persisted top-level VM variables before running this script"),
+      timeout_ms: z.number().int().min(500).max(120_000).optional().describe("Timeout ms (default 45000)"),
+      return_state: returnStateEnum.optional().describe("Post-script state (default diff if result undefined, else none)"),
+      mode: axModeEnum.optional().describe("AX compression mode: full (default), compact, or interactive"),
+      end_turn: z.boolean().optional().describe("End turn automatically after script succeeds"),
+      keep: keepParamSchema.optional().describe('Keep mode ("handoff" | "deliverable") or [{ tab_id, mode }]'),
+      max_lines: z.number().int().min(1).max(10_000).optional().describe("Max AX lines (default 1500)"),
+      reset_context: z.boolean().optional().describe("Reset persisted VM variables"),
     },
-    async ({ code, tab_id, timeout_ms, return_state, end_turn, keep, max_lines, reset_context }) => {
+    async ({ code, tab_id, timeout_ms, return_state, mode, end_turn, keep, max_lines, reset_context }) => {
       let browser = null;
       let run = null;
       try {
@@ -258,6 +328,7 @@ export function registerTools(server, deps = {}) {
             diff: effectiveReturnState === "diff",
             full: effectiveReturnState === "full" || effectiveReturnState === "both",
             maxLines: max_lines ?? 1_500,
+            mode: mode ?? "full",
           }).catch(() => null);
           if (state?.screenshotBase64) {
             images.push({ data: state.screenshotBase64, mimeType: state.screenshotMimeType || "image/jpeg" });
@@ -305,23 +376,25 @@ export function registerTools(server, deps = {}) {
     },
   );
 
-  server.tool(
+  registerTool(
     "browser_batch",
-    "Execute multiple browser actions sequentially in one tool call with automatic post-action settling and final state/diff output. Prefer this over separate round-trips for multi-step flows (e.g. fill fields + click submit + wait).",
+    "Execute multiple browser actions sequentially in one tool call with automatic settling and final state/diff.",
     {
-      steps: z.array(batchStepSchema).min(1).max(50).describe("Ordered array of action steps"),
-      tab_id: stringOrNumber.optional().describe("Optional tab_id; auto-creates a tab if none exist"),
-      return_state: returnStateEnum.optional().describe("State returned after batch completes. Defaults to diff"),
-      max_lines: z.number().int().min(1).max(10_000).optional().describe("Maximum AX lines. Defaults to 1500"),
-      stop_on_error: z.boolean().optional().describe("Stop and return diagnostics + state on first error. Defaults to true"),
-      end_turn: z.boolean().optional().describe("End turn automatically after all steps succeed"),
-      keep: keepParamSchema.optional().describe('Keep mode ("handoff" | "deliverable") for active tab or explicit [{ tab_id, mode }] list when ending turn'),
+      steps: z.array(profile === "compact" ? compactBatchStepSchema : batchStepSchema).min(1).max(50).describe("Ordered action steps"),
+      tab_id: stringOrNumber.optional().describe("Optional tab_id"),
+      return_state: returnStateEnum.optional().describe("Final state (default diff)"),
+      mode: axModeEnum.optional().describe("AX mode: full, compact, or interactive"),
+      max_lines: z.number().int().min(1).max(10_000).optional().describe("Max AX lines (default 1500)"),
+      stop_on_error: z.boolean().optional().describe("Stop on first error (default true)"),
+      end_turn: z.boolean().optional().describe("End turn after all steps succeed"),
+      keep: keepParamSchema.optional().describe('Keep mode ("handoff"|"deliverable") or [{ tab_id, mode }]'),
     },
-    guarded(async ({ steps, tab_id, return_state, max_lines, stop_on_error, end_turn, keep }) => {
+    guarded(async ({ steps, tab_id, return_state, mode, max_lines, stop_on_error, end_turn, keep }) => {
       const browser = await getBrowser();
       const result = await browser.batch(steps, {
         tabId: tab_id,
         returnState: return_state ?? "diff",
+        mode: mode ?? "full",
         maxLines: max_lines ?? 1_500,
         stopOnError: stop_on_error !== false,
       });
@@ -345,35 +418,35 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_list_tabs",
     "List all controllable Chrome tabs (both tabs created by this session and existing open user tabs) with tab_id, title, url, active state, owned flag, and origin ('agent' | 'user').",
     {},
     guarded(async () => text(await (await getBrowser()).listTabs())),
   );
 
-  server.tool(
+  registerTool(
     "browser_new_tab",
     "Open a new tab, optionally navigating to a URL. The new tab becomes the active tab.",
     { url: z.string().optional().describe("URL to open in the new tab") },
     guarded(async ({ url }) => text(await (await getBrowser()).newTab(url))),
   );
 
-  server.tool(
+  registerTool(
     "browser_select_tab",
     "Select an existing tab by tab_id (automatically claiming already-open user tabs in Chrome into this session) and make it the active tab.",
     { tab_id: stringOrNumber.describe("Tab ID from browser_list_tabs to activate and control") },
     guarded(async ({ tab_id }) => text(await (await getBrowser()).selectTab(tab_id))),
   );
 
-  server.tool(
+  registerTool(
     "browser_close_tab",
     "Close a tab owned by this browser session.",
     { tab_id: stringOrNumber.describe("Tab ID to close") },
     guarded(async ({ tab_id }) => text(await (await getBrowser()).closeTab(tab_id))),
   );
 
-  server.tool(
+  registerTool(
     "browser_goto",
     "Navigate a tab to a URL (auto-creating a tab if none exists), wait for load, and return the accessibility tree by default.",
     {
@@ -389,7 +462,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_back",
     "Navigate the active tab back in browsing history.",
     {
@@ -403,7 +476,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_forward",
     "Navigate the active tab forward in browsing history.",
     {
@@ -417,7 +490,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_reload",
     "Reload the active tab and wait for the document to finish loading.",
     {
@@ -431,30 +504,32 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_get_state",
-    "Return the page accessibility tree as <ax_state> (using compact structural diff on subsequent calls unless full=true), plus an optional screenshot. Defaults to screenshot=false for speed and token efficiency.",
+    "Return the page accessibility tree as <ax_state> (diff-first unless full=true), plus optional screenshot.",
     {
       tab_id: stringOrNumber.optional().describe("Optional tab_id"),
-      screenshot: z.boolean().optional().describe("Include a viewport screenshot. Defaults to false"),
-      full_page: z.boolean().optional().describe("Include full-page screenshot when screenshot=true. Defaults to false"),
-      format: z.enum(["jpeg", "png"]).optional().describe("Screenshot format. Defaults to jpeg"),
-      full: z.boolean().optional().describe("Return full AX tree instead of structural diff. Defaults to false"),
-      max_lines: z.number().int().min(1).max(10_000).optional().describe("Maximum accessibility lines. Defaults to 2000"),
+      screenshot: z.boolean().optional().describe("Include viewport screenshot (default false)"),
+      full_page: z.boolean().optional().describe("Full-page screenshot when screenshot=true"),
+      format: z.enum(["jpeg", "png"]).optional().describe("Screenshot format (default jpeg)"),
+      full: z.boolean().optional().describe("Return full AX tree instead of diff"),
+      mode: axModeEnum.optional().describe("AX mode: full (default), compact, or interactive"),
+      max_lines: z.number().int().min(1).max(10_000).optional().describe("Max accessibility lines (default 2000)"),
     },
-    guarded(async ({ tab_id, screenshot, full_page, format, full, max_lines }) => stateResponse(
+    guarded(async ({ tab_id, screenshot, full_page, format, full, mode, max_lines }) => stateResponse(
       await (await getBrowser()).getState(tab_id, {
         screenshot: screenshot === true,
         fullPage: full_page === true,
         format: format ?? "jpeg",
         diff: full !== true,
         full: full === true,
+        mode: mode ?? "full",
         maxLines: max_lines ?? 2_000,
       }),
     )),
   );
 
-  server.tool(
+  registerTool(
     "browser_click",
     "Click elements by element_index (or comma-separated indices) or viewport coordinates (x, y), with Shadow-DOM hit-testing.",
     {
@@ -482,7 +557,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_set_value",
     "Semantically set the value of an input, textarea, checkbox/radio ('true'/'false'), select, or contenteditable element by element_index.",
     {
@@ -498,7 +573,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_type_text",
     "Insert literal text into the focused element, optionally focusing an element_index first.",
     {
@@ -514,7 +589,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_press_key",
     "Press a key or chord such as Return, Tab, Escape, or super+a.",
     {
@@ -534,7 +609,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_select_option",
     "Select one or more options on a <select> element by value, label, or index using element_index or a locator.",
     {
@@ -554,7 +629,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_hover",
     "Hover the pointer over an element_index, locator selector, or viewport coordinates (x, y).",
     {
@@ -573,7 +648,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_drag",
     "Drag from a start element/coordinate to a target element/coordinate.",
     {
@@ -603,7 +678,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_scroll",
     "Scroll the page, or a scrollable element_index / coordinate, by whole pages.",
     {
@@ -622,7 +697,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_locator_click",
     "Click a single element matched by CSS, text=..., role=..., label=..., placeholder=..., testid=..., or chained >> locators (with built-in actionability auto-wait and open Shadow DOM / iframe piercing).",
     {
@@ -652,7 +727,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_locator_fill",
     "Fill a single element matched by CSS, text=..., role=..., label=..., placeholder=..., testid=..., or chained >> locators (with built-in auto-wait).",
     {
@@ -676,7 +751,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_wait_for",
     "Wait until a selector reaches a state, text appears on the page, URL matches, or load_state completes.",
     {
@@ -703,7 +778,7 @@ export function registerTools(server, deps = {}) {
     )),
   );
 
-  server.tool(
+  registerTool(
     "browser_upload_files",
     "Set absolute local file path(s) on an <input type='file'> element (by element_index or CSS selector) or an active file chooser.",
     {
@@ -721,13 +796,14 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_screenshot",
-    "Capture a CSS-scaled screenshot (JPEG quality 80 by default for speed/size, or PNG/full-page/clip on request).",
+    "Capture a CSS-scaled screenshot (JPEG quality 75, max width 1280px by default).",
     {
-      full_page: z.boolean().optional().describe("Capture beyond the viewport. Defaults to false"),
-      format: z.enum(["jpeg", "png"]).optional().describe("Image format. Defaults to jpeg"),
-      quality: z.number().int().min(10).max(100).optional().describe("JPEG quality 10-100. Defaults to 80"),
+      full_page: z.boolean().optional().describe("Capture beyond the viewport"),
+      format: z.enum(["jpeg", "png"]).optional().describe("Image format (default jpeg)"),
+      quality: z.number().int().min(10).max(100).optional().describe("JPEG quality 10-100 (default 75)"),
+      max_width: z.number().int().min(320).max(4096).optional().describe("Cap viewport screenshot CSS width (default 1280)"),
       clip: z.object({
         x: z.number(),
         y: z.number(),
@@ -736,18 +812,19 @@ export function registerTools(server, deps = {}) {
       }).optional().describe("Optional viewport clip rectangle"),
       tab_id: stringOrNumber.optional().describe("Optional tab_id"),
     },
-    guarded(async ({ full_page, format, quality, clip, tab_id }) => {
+    guarded(async ({ full_page, format, quality, max_width, clip, tab_id }) => {
       const capture = await (await getBrowser()).screenshot(tab_id, {
         fullPage: full_page === true,
         format: format ?? "jpeg",
-        quality: quality ?? 80,
+        quality: quality ?? 75,
+        ...(max_width !== undefined ? { maxWidth: max_width } : {}),
         clip,
       });
       return { content: [{ type: "image", data: capture.data, mimeType: capture.mimeType }] };
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_evaluate",
     "Evaluate a read-only JavaScript expression in the page and return its value. Assignment, DOM mutation, navigation, and network calls are rejected.",
     {
@@ -757,36 +834,45 @@ export function registerTools(server, deps = {}) {
     guarded(async ({ expression, tab_id }) => text(await (await getBrowser()).evaluate(expression, { tabId: tab_id }))),
   );
 
-  server.tool(
+  registerTool(
     "browser_get_content",
-    "Return the visible text content of the page.",
-    { tab_id: stringOrNumber.optional().describe("Optional tab_id") },
-    guarded(async ({ tab_id }) => {
-      const result = await (await getBrowser()).getContent(tab_id);
-      return text(result.text);
+    "Return page content as plain text, clean Readability-style markdown, extracted tables, or links.",
+    {
+      tab_id: stringOrNumber.optional().describe("Optional tab_id"),
+      format: z.enum(["text", "markdown", "tables", "links"]).optional().describe("Extraction format (default text)"),
+      max_chars: z.number().int().min(200).max(100_000).optional().describe("Character limit (default 16000 for structured formats)"),
+    },
+    guarded(async ({ tab_id, format, max_chars }) => {
+      const opts = (format || max_chars !== undefined)
+        ? { ...(format ? { format } : {}), ...(max_chars !== undefined ? { maxChars: max_chars } : {}) }
+        : undefined;
+      const result = await (await getBrowser()).getContent(tab_id, opts);
+      return text(format === "tables" || format === "links" ? result : (result.content ?? result.text));
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_dom_snapshot",
     "Return a compact visible DOM tree (default) or clean YAML ARIA snapshot (`format=\"aria\"`) for fast selector discovery or line filtering.",
     {
       format: z.enum(["dom", "aria"]).optional().describe('Snapshot format: "dom" (compact visible DOM) or "aria" (YAML ARIA tree). Defaults to "dom"'),
+      mode: axModeEnum.optional().describe("ARIA compression mode when format='aria': full (default), compact, or interactive"),
       max_chars: z.number().int().min(1_000).max(100_000).optional().describe("Character limit for DOM format. Defaults to 24000"),
       max_lines: z.number().int().min(1).max(10_000).optional().describe("Line limit for ARIA format. Defaults to 2000"),
       tab_id: stringOrNumber.optional().describe("Optional tab_id"),
     },
-    guarded(async ({ format, max_chars, max_lines, tab_id }) => text(
+    guarded(async ({ format, mode, max_chars, max_lines, tab_id }) => text(
       await (await getBrowser()).domSnapshot({
         tabId: tab_id,
         format: format ?? "dom",
+        mode: mode ?? "full",
         maxChars: max_chars ?? 24_000,
         maxLines: max_lines ?? 2_000,
       }),
     )),
   );
 
-  server.tool(
+  registerTool(
     "browser_inspect_element",
     "Inspect the element(s) at viewport coordinates (x, y) and return ranked locator candidates.",
     {
@@ -797,7 +883,7 @@ export function registerTools(server, deps = {}) {
     guarded(async ({ x, y, tab_id }) => text(await (await getBrowser()).inspectElement(x, y, { tabId: tab_id }))),
   );
 
-  server.tool(
+  registerTool(
     "browser_console_logs",
     "Read captured console messages and uncaught page exceptions for the tab.",
     {
@@ -812,7 +898,7 @@ export function registerTools(server, deps = {}) {
     )),
   );
 
-  server.tool(
+  registerTool(
     "browser_network_logs",
     "Read captured network requests, HTTP status codes, and failed requests for the tab.",
     {
@@ -839,7 +925,7 @@ export function registerTools(server, deps = {}) {
     )),
   );
 
-  server.tool(
+  registerTool(
     "browser_set_viewport",
     "Override the tab viewport dimensions and mobile emulation for responsive layout testing, or reset back to normal.",
     {
@@ -866,7 +952,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_name_session",
     "Name the current browser automation session and group session-owned tabs inside a labeled Chrome tab group.",
     {
@@ -878,7 +964,7 @@ export function registerTools(server, deps = {}) {
     )),
   );
 
-  server.tool(
+  registerTool(
     "browser_handle_dialog",
     "Accept or dismiss the JavaScript dialog currently open in the tab.",
     {
@@ -894,7 +980,7 @@ export function registerTools(server, deps = {}) {
     }),
   );
 
-  server.tool(
+  registerTool(
     "browser_end_turn",
     "End the agent turn. Tabs marked as handoff stay available next turn, deliverable tabs stay open, and unmarked tabs close.",
     {
@@ -906,7 +992,7 @@ export function registerTools(server, deps = {}) {
     guarded(async ({ keep }) => text(await (await getBrowser()).endTurn({ keep: keep ?? [] }))),
   );
 
-  server.tool(
+  registerTool(
     "browser_reset",
     "Discard the current browser session and reset persisted `browser_run` variables.",
     {},
@@ -920,12 +1006,13 @@ export function registerTools(server, deps = {}) {
 
 /**
  * Create a configured McpServer instance (useful for standalone run and unit tests).
- * @param {{getBrowser?:()=>Promise<BridgeBrowser>, resetBrowser?:()=>Promise<void>}} [deps]
+ * @param {{getBrowser?:()=>Promise<BridgeBrowser>, resetBrowser?:()=>Promise<void>, profile?:"compact"|"standard"|"full"}} [deps]
  * @returns {McpServer}
  */
 export function createStandaloneServer(deps = {}) {
+  const profile = deps.profile ?? resolveToolProfile();
   const server = new McpServer(
-    { name: "browser-use", version: "4.5.0" },
+    { name: "browser-use", version: "4.6.0" },
     {
       instructions: [
         "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.user.claimTab()` in `browser_run`). Claimed user tabs are released (never auto-closed) when a turn ends.",
@@ -936,7 +1023,7 @@ export function createStandaloneServer(deps = {}) {
       ].join("\n"),
     },
   );
-  registerTools(server, deps);
+  registerTools(server, { ...deps, profile });
   return server;
 }
 

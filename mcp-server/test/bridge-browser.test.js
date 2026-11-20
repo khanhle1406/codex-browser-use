@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import { BridgeBrowser, buildAxState, parseKeyCombo, normalizeUrl, sameUrl } from "../src/bridge-browser.js";
 import { assertReadOnly } from "../src/read-only.js";
 
@@ -680,4 +681,118 @@ test("lazy Network.enable, event-driven navigation wait, 2-call setValue, cached
   });
   await browserRef.locatorClick("css=#ok", { tabId: 1, frame: "iframe#pay" });
   assert.equal(cdpCallsList.filter((c) => c.method === "DOM.querySelector").length, 2);
+});
+
+test("stateful __buRt caches locator helper (~300B per call) and passive getContent avoids debugger attach", async () => {
+  const vmCtx = vm.createContext({
+    document: {},
+    window: { innerWidth: 1280, innerHeight: 800, getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }) },
+    CSS: { escape: (s) => String(s) },
+    HTMLInputElement: class {},
+    HTMLButtonElement: class {},
+    HTMLTextAreaElement: class {},
+    HTMLSelectElement: class {},
+    HTMLElement: class {},
+    ShadowRoot: class {},
+    MutationObserver: class { observe() {} disconnect() {} },
+    InputEvent: class { constructor(t) { this.type = t; } },
+    Event: class { constructor(t) { this.type = t; } },
+  });
+  const btn = {
+    nodeType: 1, tagName: "BUTTON", id: "save", innerText: "Save", textContent: "Save",
+    children: [], childNodes: [], labels: [], shadowRoot: null,
+    getAttribute: (k) => (k === "id" ? "save" : null),
+    hasAttribute: (k) => k === "id",
+    matches: () => false, closest: () => null, scrollIntoView() {}, focus() {},
+    getBoundingClientRect: () => ({ left: 10, top: 20, right: 90, bottom: 50, x: 10, y: 20, width: 80, height: 30 }),
+  };
+  btn.ownerDocument = {
+    defaultView: vmCtx.window,
+    querySelectorAll: (css) => (css === "#save" ? [btn] : []),
+    elementFromPoint: () => btn,
+    getElementById: (id) => (id === "save" ? btn : null),
+  };
+  vmCtx.document = { ...btn.ownerDocument, documentElement: btn, children: [btn] };
+
+  const evalExpressions = [];
+  const attachedTabs = [];
+  const request = async (method, params = {}) => {
+    if (method === "getTabs") return [{ id: 1, url: "https://example.com", title: "Ex" }];
+    if (method === "getUserTabs") return [{ id: 2, url: "https://user.example", title: "User Tab", owned: false, origin: "user" }];
+    if (method === "readTabContext") return { title: "User Tab", url: "https://user.example", format: "text", text: "Passive body", truncated: false };
+    if (method === "attach") { attachedTabs.push(params.tabId); return null; }
+    if (method === "executeCdp" && params.method === "Runtime.evaluate") {
+      evalExpressions.push(params.commandParams.expression);
+      const val = vm.runInNewContext(params.commandParams.expression, vmCtx);
+      return { result: { value: val } };
+    }
+    return {};
+  };
+
+  const browser = new BridgeBrowser({
+    request,
+    close: async () => {},
+    sessionId: "s-rt",
+    turnId: "t-rt",
+    info: { apiSupportOverrides: { "BrowserUser.openTabs": true, "BrowserUser.getTabContext": true } },
+  });
+
+  // Passive getContent on unclaimed user tab 2 should NOT attach chrome.debugger!
+  const passive = await browser.getContent(2);
+  assert.equal(passive.text, "Passive body");
+  assert.equal(passive.passive, true);
+  assert.equal(attachedTabs.includes(2), false);
+
+  // Stateful tab 1: first locator installs __buRt once, subsequent calls send tiny invocation (<400B).
+  await browser.locatorCount("css=#save", { tabId: 1 });
+  await browser.locatorClick("css=#save", { tabId: 1 });
+  await browser.locatorText("css=#save", { tabId: 1 });
+  assert.ok(evalExpressions[0].includes("Object.defineProperty(globalThis"));
+  assert.ok(evalExpressions[1].length < 400);
+  assert.ok(evalExpressions[2].length < 400);
+  assert.ok(evalExpressions[3].length < 400);
+});
+
+test("screenshot caps wide viewports at maxWidth and batch supports get_content and evaluate", async () => {
+  const calls = [];
+  const browser = new BridgeBrowser({
+    request: async (method, params = {}) => {
+      calls.push({ method, params });
+      if (method === "getTabs") return [{ id: 1, url: "https://example.com", title: "Ex" }];
+      if (method === "attach") return null;
+      if (method === "executeCdp") {
+        const m = params.method;
+        if (m === "Page.getLayoutMetrics") {
+          return { cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 2560, clientHeight: 1440 } };
+        }
+        if (m === "Runtime.evaluate") {
+          const expr = String(params.commandParams?.expression || "");
+          if (expr === "window.devicePixelRatio") return { result: { value: 2 } };
+          if (expr.includes("format =") || expr.includes("FORMAT = \"markdown\"")) {
+            return { result: { value: { format: "markdown", text: "# Clean", content: "# Clean", truncated: false } } };
+          }
+          if (expr === "document.title") return { result: { value: "Ex Title" } };
+          return { result: { value: { title: "Ex", url: "https://example.com" } } };
+        }
+        if (m === "Page.captureScreenshot") return { data: "abc" };
+      }
+      return {};
+    },
+    close: async () => {},
+    sessionId: "s-cap",
+    turnId: "t-cap",
+  });
+
+  await browser.screenshot(1, { maxWidth: 1280 });
+  const shot = calls.find((c) => c.method === "executeCdp" && c.params.method === "Page.captureScreenshot");
+  assert.equal(shot.params.commandParams.quality, 75);
+  assert.equal(shot.params.commandParams.clip.scale, 0.25);
+
+  const batchRes = await browser.batch([
+    { action: "get_content", format: "markdown", max_chars: 2000 },
+    { action: "evaluate", expression: "document.title" },
+  ], { tabId: 1, returnState: "none" });
+  assert.equal(batchRes.ok, true);
+  assert.equal(batchRes.completed_steps[0].result.text, "# Clean");
+  assert.equal(batchRes.completed_steps[1].result.value, "Ex Title");
 });

@@ -58,7 +58,7 @@ export function createNativeTabDriver(input, output, options = {}) {
       let raw;
       while ((raw = reader.nextFrame()) !== null) {
         const reply = JSON.parse(raw.toString("utf8"));
-        if (["onCDPEvent", "onCDPDetach"].includes(reply?.event) && Number.isSafeInteger(reply.tabId)) {
+        if (["onCDPEvent", "onCDPDetach", "onTabCreated"].includes(reply?.event) && Number.isSafeInteger(reply.tabId)) {
           onEvent?.(reply.event, reply.tabId, reply.params);
           continue;
         }
@@ -158,6 +158,14 @@ export function createNativeTabDriver(input, output, options = {}) {
     async readTab(id) {
       const value = await request("readTab", id);
       return value === null ? null : tab(value, id);
+    },
+    /** @param {number} id @param {{format?:string,maxChars?:number}} [options] @returns {Promise<unknown>} */
+    async readTabContext(id, options = {}) {
+      return await request("readTabContext", id, options);
+    },
+    /** @param {{cursorMode?:string}} [config] @returns {Promise<unknown>} */
+    async setConfig(config = {}) {
+      return await request("setConfig", undefined, config);
     },
     /** @param {number} id @returns {Promise<void>} */
     async closeTab(id) { await request("closeTab", id); },

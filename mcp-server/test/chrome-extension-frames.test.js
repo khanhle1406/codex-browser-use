@@ -244,6 +244,8 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
   const removedTabs = [];
   const detachedTabs = [];
   const scriptsInjected = [];
+  const debuggerAttached = [];
+  let boxModelCalls = 0;
   let pingReady = false;
   let nextReq = 1;
 
@@ -251,6 +253,7 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
     [10, { id: 10, url: "https://congnghieptot.vn/new_admin/addnew_group/132", title: "Admin Form", active: true }],
     [11, { id: 11, url: "chrome://extensions", title: "Extensions", active: false }],
     [12, { id: 12, url: "https://secret.example", title: "Incognito", active: false, incognito: true }],
+    [13, { id: 13, url: "https://docs.example/guide", title: "Docs Tab", active: false }],
   ]);
 
   const port = {
@@ -260,6 +263,7 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
     disconnect() {},
   };
 
+  const tabsCreated = event();
   const chrome = {
     runtime: {
       connectNative: () => port,
@@ -268,6 +272,7 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
     },
     tabs: {
       onRemoved: event(),
+      onCreated: tabsCreated,
       onUpdated: event(),
       onActivated: event(),
       async create(opts) {
@@ -296,6 +301,9 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
     scripting: {
       async executeScript(opts) {
         scriptsInjected.push(opts);
+        if (typeof opts.func === "function") {
+          return [{ result: { title: "Docs Tab", url: "https://docs.example/guide", format: opts.args?.[0]?.format || "markdown", text: "# Guide", content: "# Guide", truncated: false, headingsCount: 1, linksCount: 0, selection: "" } }];
+        }
         pingReady = true;
         return [{ result: true }];
       },
@@ -305,11 +313,15 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
     debugger: {
       onEvent,
       onDetach: event(),
-      async attach() {},
+      async attach({ tabId }) { debuggerAttached.push(tabId); },
       async detach({ tabId }) { detachedTabs.push(tabId); },
       async sendCommand(_target, method) {
         if (method === "DOM.getBoxModel") {
+          boxModelCalls += 1;
           return { model: { border: [100, 200, 180, 200, 180, 240, 100, 240] } };
+        }
+        if (method === "Runtime.callFunctionOn") {
+          return { result: { value: { status: "done", x: 140, y: 220, __cursorMove: true } } };
         }
         if (method === "Runtime.evaluate") {
           return { result: { value: { count: 1, filled: true, x: 320, y: 440, __cursorMove: true } } };
@@ -329,13 +341,19 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
     return replies.find((r) => r.id === id);
   }
 
-  // 1. listTabs exposes normal user tabs (10) while excluding chrome:// (11) and incognito (12)
+  // 1. listTabs exposes normal user tabs (10, 13) while excluding chrome:// (11) and incognito (12)
   const listed = await request({ method: "listTabs" });
   assert.equal(listed.ok, true);
-  assert.equal(listed.value.length, 1);
+  assert.equal(listed.value.length, 2);
   assert.equal(listed.value[0].id, 10);
   assert.equal(listed.value[0].owned, false);
   assert.equal(listed.value[0].origin, "user");
+
+  // 1b. readTabContext reads tab 13 via chrome.scripting.executeScript without attaching chrome.debugger
+  const passive = await request({ method: "readTabContext", tabId: 13, details: { format: "markdown", maxChars: 4000 } });
+  assert.equal(passive.ok, true);
+  assert.equal(passive.value.text, "# Guide");
+  assert.equal(debuggerAttached.includes(13), false);
 
   // 2. claimTab rejects internal chrome:// tabs and claims user tab 10
   const badClaim = await request({ method: "claimTab", tabId: 11 });
@@ -347,12 +365,13 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
 
   // 3. attach dynamically injects content-script.js on CONTENT_PING miss and sends TAB_FAVICON_BADGE + AGENT_CURSOR_STATE
   assert.equal((await request({ method: "attach", tabId: 10 })).ok, true);
-  assert.equal(scriptsInjected.length, 1);
+  assert.equal(scriptsInjected.filter((s) => Array.isArray(s.files)).length, 1);
   assert.ok(tabMessages.some((m) => m.tabId === 10 && m.msg.type === "TAB_FAVICON_BADGE" && m.msg.badge === "active"));
   assert.ok(tabMessages.some((m) => m.tabId === 10 && m.msg.type === "AGENT_CURSOR_STATE" && m.msg.state.isVisible === true));
 
-  // 4. Input.dispatchMouseEvent, Runtime.callFunctionOn, and Runtime.evaluate move the virtual cursor
+  // 4. Cached contentScriptReadyTabs skips repeated CONTENT_PING, Runtime.callFunctionOn skips DOM.getBoxModel, and cursor still moves
   tabMessages.length = 0;
+  boxModelCalls = 0;
   await request({
     method: "execute",
     tabId: 10,
@@ -361,6 +380,7 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
   const mouseMoveCursor = tabMessages.find((m) => m.msg.type === "AGENT_CURSOR_STATE")?.msg?.state?.cursor;
   assert.equal(mouseMoveCursor.x, 250);
   assert.equal(mouseMoveCursor.y, 180);
+  assert.equal(tabMessages.filter((m) => m.msg.type === "CONTENT_PING").length, 0);
 
   tabMessages.length = 0;
   await request({
@@ -368,6 +388,7 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
     tabId: 10,
     details: { method: "Runtime.callFunctionOn", params: { objectId: "obj-1", functionDeclaration: "function(){}" } },
   });
+  assert.equal(boxModelCalls, 0);
   const callFnCursor = tabMessages.find((m) => m.msg.type === "AGENT_CURSOR_STATE")?.msg?.state?.cursor;
   assert.equal(callFnCursor.x, 140);
   assert.equal(callFnCursor.y, 220);
@@ -390,9 +411,17 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
   assert.ok(tabMessages.some((m) => m.tabId === 10 && m.msg.type === "TAB_FAVICON_BADGE" && m.msg.badge === null));
   assert.ok(tabMessages.some((m) => m.tabId === 20 && m.msg.type === "TAB_FAVICON_BADGE" && m.msg.badge === "active"));
 
-  // 6. Disconnecting closes ONLY agent tab 20 while preserving user tab 10!
+  // 5b. Opening a popup child tab from owned tab 20 auto-owns child tab 21 and emits onTabCreated
+  replies.length = 0;
+  const popupTab = { id: 21, openerTabId: 20, url: "https://example.com/popup", title: "Popup", active: false };
+  openTabs.set(21, popupTab);
+  await tabsCreated.emit(popupTab);
+  assert.ok(replies.some((m) => m.event === "onTabCreated" && m.tabId === 20 && m.params?.tab?.id === 21));
+
+  // 6. Disconnecting closes ONLY agent tabs (20, 21) while preserving user tabs (10, 13)!
   await onClicked.emit();
-  assert.deepEqual(removedTabs, [20]);
+  assert.deepEqual(removedTabs.sort((a, b) => a - b), [20, 21]);
   assert.equal(openTabs.has(10), true);
+  assert.equal(openTabs.has(13), true);
   assert.ok(detachedTabs.includes(10));
 });

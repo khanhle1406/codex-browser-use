@@ -171,12 +171,12 @@ export async function installNativeHost({ extensionId = EXTENSION_ID, bridgeFile
 
 /**
  * Merge the browser-use entry into a client's MCP configuration.
- * @param {{client:string, bridgeFile?:string, write?:boolean, home?:string}} options
+ * @param {{client:string, bridgeFile?:string, profile?:string, write?:boolean, home?:string}} options
  */
-export async function configureClient({ client, bridgeFile = defaultBridgeFile(), write = false, home = homedir() }) {
+export async function configureClient({ client, bridgeFile = defaultBridgeFile(), profile, write = false, home = homedir() }) {
   const name = normalizeClient(client);
   const target = clientTarget(name, home);
-  const config = buildConfig(name, { bridgeFile });
+  const config = buildConfig(name, { bridgeFile, profile });
   if (!write || target.file === null) {
     return { written: false, file: target.file, config };
   }

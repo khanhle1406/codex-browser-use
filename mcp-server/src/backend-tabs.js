@@ -1,7 +1,7 @@
 import {validateNetworkPolicy, validatePageCommand} from "./backend-page-commands.js";
 
 /** @typedef {{id:number, title?:string, url?:string, active?:boolean, owned?:boolean, origin?:"agent"|"user"}} BrowserTab */
-/** @typedef {{createBlankTab:()=>Promise<BrowserTab>, listTabs?:()=>Promise<BrowserTab[]>, claimTab?:(id:number)=>Promise<BrowserTab>, readTab:(id:number)=>Promise<BrowserTab|null>, closeTab:(id:number)=>Promise<void>, releaseTab?:(id:number)=>Promise<void>, markTab?:(id:number,status:TabMark)=>Promise<void>, moveCursor?:(id:number,x:number,y:number,waitForArrival?:boolean)=>Promise<void>, attach?:(id:number)=>Promise<void>, detach?:(id:number)=>Promise<void>, navigate?:(id:number,url:string)=>Promise<void>, watchDownloads?:(id:number)=>Promise<void>, unwatchDownloads?:(id:number)=>Promise<void>, groupTabs?:(tabIds:number[],options:{title?:string,color?:string,groupId?:number|null})=>Promise<{groupId:number|null,supported?:boolean}>, execute?:(id:number,method:string,params:RpcParams,childSession?:string)=>Promise<unknown>, onEvent?:(listener:(method:string, id:number, params:RpcParams)=>void)=>void}} TabDriver */
+/** @typedef {{createBlankTab:()=>Promise<BrowserTab>, listTabs?:()=>Promise<BrowserTab[]>, claimTab?:(id:number)=>Promise<BrowserTab>, readTab:(id:number)=>Promise<BrowserTab|null>, readTabContext?:(id:number,options?:{format?:string,maxChars?:number})=>Promise<unknown>, setConfig?:(config:{cursorMode?:string})=>Promise<unknown>, closeTab:(id:number)=>Promise<void>, releaseTab?:(id:number)=>Promise<void>, markTab?:(id:number,status:TabMark)=>Promise<void>, moveCursor?:(id:number,x:number,y:number,waitForArrival?:boolean)=>Promise<void>, attach?:(id:number)=>Promise<void>, detach?:(id:number)=>Promise<void>, navigate?:(id:number,url:string)=>Promise<void>, watchDownloads?:(id:number)=>Promise<void>, unwatchDownloads?:(id:number)=>Promise<void>, groupTabs?:(tabIds:number[],options:{title?:string,color?:string,groupId?:number|null})=>Promise<{groupId:number|null,supported?:boolean}>, execute?:(id:number,method:string,params:RpcParams,childSession?:string)=>Promise<unknown>, onEvent?:(listener:(method:string, id:number, params:RpcParams)=>void)=>void}} TabDriver */
 /** @typedef {"handoff"|"deliverable"} TabMark */
 /** @typedef {{id:string, turn:string|null, ended:Set<string>, tabs:Map<number,TabMark|null>, userTabs:Set<number>, attached:Set<number>, group:null|{title:string,color:string,groupId:number|null}, groupLock:Promise<void>, notify:Notify, cleanup?:Promise<void>}} TabSession */
 /** @typedef {Record<string,unknown>} RpcParams */
@@ -48,6 +48,17 @@ export function createTabHandlers(driver, options) {
   const owners = new Map();
   driver.onEvent?.((method, id, params) => {
     const session = owners.get(id);
+    if (method === "onTabCreated") {
+      const childTab = params?.tab;
+      if (!session || !Number.isSafeInteger(childTab?.id) || owners.has(childTab.id)) return;
+      owners.set(childTab.id, session);
+      session.tabs.set(childTab.id, null);
+      if (session.group && driver.groupTabs) {
+        void applySessionGroup(session, [childTab.id]).catch(() => {});
+      }
+      session.notify("onTabCreated", params);
+      return;
+    }
     if (!session?.attached.has(id)) return;
     if (method === "onCDPDetach") session.attached.delete(id);
     session.notify(method, params);
@@ -184,6 +195,7 @@ export function createTabHandlers(driver, options) {
         apiSupportOverrides: {
           "Tab.ax": false,
           ...(typeof driver.listTabs === "function" ? {"BrowserUser.openTabs": true, "BrowserUser.claimTab": true} : {}),
+          ...(typeof driver.readTabContext === "function" ? {"BrowserUser.getTabContext": true} : {}),
         },
       };
     }],
@@ -288,6 +300,34 @@ export function createTabHandlers(driver, options) {
       session.tabs.set(tab.id, null);
       session.userTabs.add(tab.id);
       return {...tab, owned: true, origin: "user"};
+    }],
+    ["readTabContext", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      if (typeof driver.readTabContext !== "function") {
+        throw new Error("Passive tab reading is not supported on this bridge");
+      }
+      const rawId = Number(params.tabId);
+      if (!Number.isSafeInteger(rawId) || rawId < 0) {
+        throw new Error("Browser tab is unavailable to this session");
+      }
+      const existingOwner = owners.get(rawId);
+      if (existingOwner && existingOwner !== session) {
+        throw new Error("Browser tab is unavailable to this session");
+      }
+      const result = await driver.readTabContext(rawId, {
+        format: params.format === "text" ? "text" : "markdown",
+        maxChars: Number.isFinite(Number(params.maxChars)) ? Number(params.maxChars) : 16_000,
+      });
+      signal.throwIfAborted();
+      return result;
+    }],
+    ["setConfig", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      void session;
+      if (typeof driver.setConfig !== "function") return { ok: true, supported: false };
+      return await driver.setConfig({
+        ...(typeof params.cursorMode === "string" ? { cursorMode: params.cursorMode } : {}),
+      });
     }],
     ["getCommittedTabUrl", async (params, signal) => {
       const session = activateTurn(params, signal);

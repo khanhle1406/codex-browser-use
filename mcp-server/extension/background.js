@@ -51,6 +51,113 @@ function isBadgedFaviconUrl(href) {
   return typeof href === "string" && href.startsWith("data:image/svg+xml,") && href.includes("codex-favicon-badge");
 }
 
+/**
+ * Self-contained DOM extractor injected via chrome.scripting.executeScript for zero-debugger passive reads.
+ * @param {{format?:string,maxChars?:number}} [opts]
+ */
+function extractPassiveTabContext(opts = {}) {
+  const format = opts?.format === "text" ? "text" : "markdown";
+  const maxChars = Math.max(200, Number(opts?.maxChars) || 16_000);
+  const title = document.title || "";
+  const url = location.href || "";
+  const selection = typeof window.getSelection === "function" ? String(window.getSelection() || "").trim() : "";
+  const headingsCount = document.querySelectorAll("h1,h2,h3,h4,h5,h6").length;
+  const linksCount = document.querySelectorAll("a[href]").length;
+
+  const clip = (str) => {
+    const clean = String(str || "").trim();
+    if (clean.length <= maxChars) return { text: clean, truncated: false };
+    return { text: clean.slice(0, maxChars) + "\n...(truncated)", truncated: true };
+  };
+
+  if (format === "text" || !document.body) {
+    const raw = document.body ? (document.body.innerText || "") : "";
+    const out = clip(raw);
+    return { title, url, format: "text", text: out.text, content: out.text, truncated: out.truncated, headingsCount, linksCount, selection };
+  }
+
+  const SKIP = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG", "NAV", "HEADER", "FOOTER", "ASIDE"]);
+  const pickRoot = () => {
+    for (const sel of ["article", "main", '[role="main"]']) {
+      const candidate = document.querySelector(sel);
+      if (candidate && (candidate.innerText || "").trim().length >= 200) return candidate;
+    }
+    return document.body;
+  };
+  const root = pickRoot();
+  const isHidden = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    if (SKIP.has(el.tagName) || el.getAttribute("aria-hidden") === "true" || el.hidden) return true;
+    const st = getComputedStyle(el);
+    return st && (st.display === "none" || st.visibility === "hidden");
+  };
+  const parts = [];
+  let len = 0;
+  let truncated = false;
+  const push = (chunk) => {
+    if (truncated || !chunk) return;
+    if (len + chunk.length > maxChars) {
+      parts.push(chunk.slice(0, Math.max(0, maxChars - len)));
+      truncated = true;
+      return;
+    }
+    parts.push(chunk);
+    len += chunk.length;
+  };
+  const inlineText = (node) => (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+  const walk = (node) => {
+    if (truncated || !node) return;
+    if (node.nodeType === 3) {
+      const t = (node.textContent || "").replace(/\s+/g, " ");
+      if (t.trim()) push(t);
+      return;
+    }
+    if (node.nodeType !== 1 || isHidden(node)) return;
+    const tag = node.tagName;
+    if (/^H[1-6]$/.test(tag)) {
+      const txt = inlineText(node);
+      if (txt) push(`\n\n${"#".repeat(Number(tag[1]))} ${txt}\n\n`);
+      return;
+    }
+    if (tag === "A") {
+      const txt = inlineText(node);
+      const href = node.getAttribute("href") || "";
+      if (txt) push(href && !href.startsWith("javascript:") ? `[${txt}](${href})` : txt);
+      return;
+    }
+    if (tag === "PRE") {
+      const code = (node.innerText || node.textContent || "").trim();
+      if (code) push(`\n\n\`\`\`\n${code}\n\`\`\`\n\n`);
+      return;
+    }
+    if (tag === "LI") {
+      const txt = inlineText(node);
+      if (txt) push(`\n- ${txt}`);
+      return;
+    }
+    if (tag === "BLOCKQUOTE") {
+      const txt = inlineText(node);
+      if (txt) push(`\n> ${txt}\n`);
+      return;
+    }
+    if (tag === "TR") {
+      const cells = Array.from(node.children || []).map((c) => inlineText(c).replace(/\|/g, "\\|"));
+      if (cells.some(Boolean)) push(`\n| ${cells.join(" | ")} |`);
+      return;
+    }
+    const isBlock = /^(P|DIV|SECTION|ARTICLE|MAIN|TABLE|UL|OL|BR|HR)$/u.test(tag);
+    if (isBlock) push("\n");
+    for (const child of node.childNodes || []) {
+      walk(child);
+      if (truncated) break;
+    }
+    if (isBlock) push("\n");
+  };
+  walk(root);
+  const md = parts.join("").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim() + (truncated ? "\n...(truncated)" : "");
+  return { title, url, format: "markdown", text: md, content: md, truncated, headingsCount, linksCount, selection };
+}
+
 /** @returns {void} */
 function connect() {
   const port = chrome.runtime.connectNative(hostName);
@@ -74,10 +181,14 @@ function connect() {
   const faviconCache = new Map();
   /** @type {Map<number, Promise<boolean>>} */
   const preparingContentScripts = new Map();
+  /** @type {Set<number>} */
+  const contentScriptReadyTabs = new Set();
   /** @type {Map<number, () => void>} */
   const cursorArrivalWaiters = new Map();
   /** @type {number|null} */
   let activeVisualTabId = null;
+  /** @type {"fast"|"smooth"|"off"} */
+  let cursorMode = "fast";
   let moveSeq = 0;
   let disconnected = false;
 
@@ -110,7 +221,11 @@ function connect() {
   /** @param {number} tabId @returns {Promise<boolean>} */
   async function prepareContentScript(tabId) {
     if (!canMessageTabs()) return false;
-    if (await pingContentScript(tabId)) return true;
+    if (contentScriptReadyTabs.has(tabId)) return true;
+    if (await pingContentScript(tabId)) {
+      contentScriptReadyTabs.add(tabId);
+      return true;
+    }
     let pending = preparingContentScripts.get(tabId);
     if (!pending) {
       pending = (async () => {
@@ -124,7 +239,9 @@ function connect() {
           800,
         );
         if (injected === null) return false;
-        return await pingContentScript(tabId);
+        const ok = await pingContentScript(tabId);
+        if (ok) contentScriptReadyTabs.add(tabId);
+        return ok;
       })().finally(() => {
         preparingContentScripts.delete(tabId);
       });
@@ -194,17 +311,19 @@ function connect() {
       if (badge) {
         if (!(await prepareContentScript(tabId))) return;
         const faviconDataUrl = await getFaviconDataUrl(tabId);
-        await withTimeout(chrome.tabs.sendMessage(tabId, {
+        const delivered = await withTimeout(chrome.tabs.sendMessage(tabId, {
           type: "TAB_FAVICON_BADGE",
           badge,
           faviconDataUrl,
         }), 500);
+        if (!delivered) contentScriptReadyTabs.delete(tabId);
       } else {
-        await withTimeout(chrome.tabs.sendMessage(tabId, {
+        const delivered = await withTimeout(chrome.tabs.sendMessage(tabId, {
           type: "TAB_FAVICON_BADGE",
           badge: null,
           faviconDataUrl: null,
         }), 400);
+        if (!delivered) contentScriptReadyTabs.delete(tabId);
       }
     } catch {
       // Ignore pages that do not accept content scripts.
@@ -213,6 +332,7 @@ function connect() {
 
   /** @param {number} tabId @returns {Promise<void>} */
   async function showTabCursor(tabId) {
+    if (cursorMode === "off") return;
     const existing = cursorStates.get(tabId);
     const state = {
       cursor: existing?.cursor ? {...existing.cursor, visible: true} : null,
@@ -223,7 +343,8 @@ function connect() {
     cursorStates.set(tabId, state);
     if (!canMessageTabs()) return;
     if (!(await prepareContentScript(tabId))) return;
-    await withTimeout(chrome.tabs.sendMessage(tabId, {type: "AGENT_CURSOR_STATE", state}), 400);
+    const delivered = await withTimeout(chrome.tabs.sendMessage(tabId, {type: "AGENT_CURSOR_STATE", state}), 400);
+    if (!delivered) contentScriptReadyTabs.delete(tabId);
   }
 
   /** @param {number} tabId @returns {Promise<void>} */
@@ -248,7 +369,7 @@ function connect() {
    * @returns {Promise<void>}
    */
   async function updateCursorPosition(tabId, x, y, {visible = true, animate = true, waitForArrival = false} = {}) {
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    if (cursorMode === "off" || !Number.isFinite(x) || !Number.isFinite(y)) return;
     const prev = cursorStates.get(tabId)?.cursor;
     const targetX = Math.round(x);
     const targetY = Math.round(y);
@@ -270,10 +391,22 @@ function connect() {
     };
     cursorStates.set(tabId, state);
     if (!canMessageTabs()) return;
+    const effectiveWait = cursorMode === "smooth" && waitForArrival && visible && animate && dist >= 4;
+    if (contentScriptReadyTabs.has(tabId) && !effectiveWait) {
+      try {
+        const res = chrome.tabs.sendMessage(tabId, {type: "AGENT_CURSOR_STATE", state});
+        if (res && typeof res.catch === "function") {
+          void res.catch(() => contentScriptReadyTabs.delete(tabId));
+        }
+      } catch {
+        contentScriptReadyTabs.delete(tabId);
+      }
+      return;
+    }
     if (!(await prepareContentScript(tabId))) return;
 
     let arrivalPromise = null;
-    if (waitForArrival && visible && animate && dist >= 4 && typeof setTimeout === "function") {
+    if (effectiveWait && typeof setTimeout === "function") {
       arrivalPromise = new Promise((resolve) => {
         const timer = setTimeout(() => {
           cursorArrivalWaiters.delete(seq);
@@ -288,6 +421,7 @@ function connect() {
     }
 
     const delivered = await withTimeout(chrome.tabs.sendMessage(tabId, {type: "AGENT_CURSOR_STATE", state}), 400);
+    if (!delivered) contentScriptReadyTabs.delete(tabId);
     if (arrivalPromise && delivered?.ok === true) {
       await arrivalPromise;
     } else if (arrivalPromise) {
@@ -310,11 +444,12 @@ function connect() {
     }
     const badge = badgeStates.get(tabId) ?? (attached.has(tabId) ? "active" : null);
     if (badge) await updateTabFaviconBadge(tabId, badge);
-    if (attached.has(tabId)) {
+    if (attached.has(tabId) && cursorMode !== "off") {
       const state = cursorStates.get(tabId);
       if (state?.isVisible) {
         if (await prepareContentScript(tabId)) {
-          await withTimeout(chrome.tabs.sendMessage(tabId, {type: "AGENT_CURSOR_STATE", state}), 400);
+          const delivered = await withTimeout(chrome.tabs.sendMessage(tabId, {type: "AGENT_CURSOR_STATE", state}), 400);
+          if (!delivered) contentScriptReadyTabs.delete(tabId);
         }
       } else {
         await showTabCursor(tabId);
@@ -373,6 +508,9 @@ function connect() {
   /** @param {number} tabId @param {chrome.tabs.TabChangeInfo} changeInfo */
   function onTabUpdated(tabId, changeInfo) {
     if (disconnected) return;
+    if (changeInfo?.status === "loading" || changeInfo?.url) {
+      contentScriptReadyTabs.delete(tabId);
+    }
     if (changeInfo?.url || (changeInfo?.favIconUrl && !isBadgedFaviconUrl(changeInfo.favIconUrl))) {
       faviconCache.delete(tabId);
     }
@@ -402,8 +540,24 @@ function connect() {
     badgeStates.delete(id);
     faviconCache.delete(id);
     preparingContentScripts.delete(id);
+    contentScriptReadyTabs.delete(id);
   };
+  /** @param {chrome.tabs.Tab} tab @returns {void} */
+  function onTabCreated(tab) {
+    if (disconnected || !Number.isSafeInteger(tab?.id) || !Number.isSafeInteger(tab?.openerTabId)) return;
+    if (!owned.has(tab.openerTabId) || owned.has(tab.id) || tab.incognito === true) return;
+    const candidateUrl = tab.url || tab.pendingUrl || "";
+    if (!isControllableTabUrl(candidateUrl)) return;
+    owned.add(tab.id);
+    port.postMessage({
+      event: "onTabCreated",
+      tabId: tab.openerTabId,
+      params: {openerTabId: tab.openerTabId, tab: serializeTab(tab)},
+    });
+  }
+
   chrome.tabs.onRemoved.addListener(forget);
+  chrome.tabs.onCreated?.addListener(onTabCreated);
   chrome.tabs.onUpdated?.addListener(onTabUpdated);
   chrome.tabs.onActivated?.addListener(onTabActivated);
   chrome.runtime.onMessage?.addListener(onRuntimeMessage);
@@ -467,6 +621,47 @@ function connect() {
         ...serializeTab(tab),
         owned: true,
         origin: userOwned.has(tab.id) ? "user" : "agent",
+      };
+    }
+    if (method === "setConfig") {
+      if (details?.cursorMode === "fast" || details?.cursorMode === "smooth" || details?.cursorMode === "off") {
+        cursorMode = details.cursorMode;
+      }
+      return {ok: true, cursorMode};
+    }
+    if (method === "readTabContext") {
+      if (!Number.isSafeInteger(tabId) || typeof chrome.tabs?.get !== "function") {
+        throw new Error("Chrome tab is unavailable");
+      }
+      const tab = await chrome.tabs.get(tabId);
+      if (!tab || !Number.isSafeInteger(tab.id) || tab.incognito === true) {
+        throw new Error("Chrome tab is unavailable");
+      }
+      const candidateUrl = tab.url || tab.pendingUrl || "";
+      if (!isControllableTabUrl(candidateUrl)) {
+        throw new Error("Chrome internal tab cannot be read");
+      }
+      if (typeof chrome.scripting?.executeScript !== "function") {
+        throw new Error("Chrome scripting API is unavailable");
+      }
+      const format = details?.format === "text" ? "text" : "markdown";
+      const maxChars = Number.isFinite(Number(details?.maxChars)) ? Number(details.maxChars) : 16_000;
+      const results = await withTimeout(
+        chrome.scripting.executeScript({
+          target: {tabId: tab.id},
+          func: extractPassiveTabContext,
+          args: [{format, maxChars}],
+        }),
+        5000,
+      );
+      const extracted = Array.isArray(results) ? results[0]?.result : null;
+      if (!extracted || typeof extracted !== "object") {
+        throw new Error("Failed to extract passive tab context");
+      }
+      return {
+        ...extracted,
+        title: extracted.title || tab.title || "",
+        url: extracted.url || tab.url || "",
       };
     }
     if (method === "groupTabs") {
@@ -584,14 +779,23 @@ function connect() {
         const cdpMethod = details.method;
         const cdpParams = details.params;
 
-        if (canMessageTabs()) {
+        if (canMessageTabs() && cursorMode !== "off") {
           if (cdpMethod === "Input.dispatchMouseEvent" && Number.isFinite(cdpParams?.x) && Number.isFinite(cdpParams?.y)) {
             if (cdpParams.type === "mouseMoved") {
-              await updateCursorPosition(tabId, Number(cdpParams.x), Number(cdpParams.y), {
-                visible: true,
-                animate: true,
-                waitForArrival: !cdpParams.buttons,
-              });
+              const wait = cursorMode === "smooth" && !cdpParams.buttons;
+              if (wait) {
+                await updateCursorPosition(tabId, Number(cdpParams.x), Number(cdpParams.y), {
+                  visible: true,
+                  animate: true,
+                  waitForArrival: true,
+                });
+              } else {
+                void updateCursorPosition(tabId, Number(cdpParams.x), Number(cdpParams.y), {
+                  visible: true,
+                  animate: true,
+                  waitForArrival: false,
+                });
+              }
             } else if (cdpParams.type === "mousePressed" || cdpParams.type === "mouseWheel") {
               void updateCursorPosition(tabId, Number(cdpParams.x), Number(cdpParams.y), {
                 visible: true,
@@ -599,7 +803,7 @@ function connect() {
                 waitForArrival: false,
               });
             }
-          } else if ((cdpMethod === "Runtime.callFunctionOn" || cdpMethod === "DOM.focus") &&
+          } else if (cdpMethod === "DOM.focus" &&
               (cdpParams?.objectId || Number.isSafeInteger(cdpParams?.backendNodeId))) {
             const boxReq = cdpParams.objectId
               ? {objectId: cdpParams.objectId}
@@ -610,7 +814,12 @@ function connect() {
               const cx = (quad[0] + quad[2]) / 2;
               const cy = (quad[1] + quad[5]) / 2;
               if (Number.isFinite(cx) && Number.isFinite(cy)) {
-                await updateCursorPosition(tabId, cx, cy, {visible: true, animate: true, waitForArrival: true});
+                const wait = cursorMode === "smooth";
+                if (wait) {
+                  await updateCursorPosition(tabId, cx, cy, {visible: true, animate: true, waitForArrival: true});
+                } else {
+                  void updateCursorPosition(tabId, cx, cy, {visible: true, animate: true, waitForArrival: false});
+                }
               }
             }
           }
@@ -618,15 +827,25 @@ function connect() {
 
         const result = await chrome.debugger.sendCommand(target, cdpMethod, cdpParams);
 
-        if (canMessageTabs() && cdpMethod === "Runtime.evaluate") {
+        if (canMessageTabs() && cursorMode !== "off" &&
+            (cdpMethod === "Runtime.evaluate" || cdpMethod === "Runtime.callFunctionOn")) {
           const val = result?.result?.value;
           if (val && typeof val === "object" && Number.isFinite(val.x) && Number.isFinite(val.y) &&
               (val.__cursorMove === true || val.hovered === true)) {
-            await updateCursorPosition(tabId, Number(val.x), Number(val.y), {
-              visible: true,
-              animate: true,
-              waitForArrival: true,
-            });
+            const wait = cursorMode === "smooth";
+            if (wait) {
+              await updateCursorPosition(tabId, Number(val.x), Number(val.y), {
+                visible: true,
+                animate: true,
+                waitForArrival: true,
+              });
+            } else {
+              void updateCursorPosition(tabId, Number(val.x), Number(val.y), {
+                visible: true,
+                animate: true,
+                waitForArrival: false,
+              });
+            }
           }
         }
         return result;
@@ -660,6 +879,10 @@ function connect() {
           "Network.requestWillBeSent", "Network.responseReceived",
           "Network.loadingFinished", "Network.loadingFailed"].includes(method)) {
       return;
+    }
+    if (sessionId === undefined && (method === "Page.frameStartedLoading" ||
+        (method === "Page.frameNavigated" && !params?.frame?.parentId))) {
+      contentScriptReadyTabs.delete(tabId);
     }
     if (method === "Page.loadEventFired" && sessionId === undefined && attached.has(tabId)) {
       void syncTabVisuals(tabId);
@@ -789,6 +1012,7 @@ function connect() {
     void chrome.action.setBadgeText({text: manualDisconnect ? "OFF" : ""});
     void chrome.action.setTitle?.({title: "Portable Browser Bridge (Disconnected — click to connect)"});
     chrome.tabs.onRemoved.removeListener(forget);
+    chrome.tabs.onCreated?.removeListener(onTabCreated);
     chrome.tabs.onUpdated?.removeListener(onTabUpdated);
     chrome.tabs.onActivated?.removeListener(onTabActivated);
     chrome.runtime.onMessage?.removeListener(onRuntimeMessage);
@@ -818,6 +1042,7 @@ function connect() {
     badgeStates.clear();
     faviconCache.clear();
     preparingContentScripts.clear();
+    contentScriptReadyTabs.clear();
     void Promise.allSettled(closing.map((id) => chrome.tabs.remove(id))).then((results) => {
       for (const result of results) {
         if (result.status === "rejected") console.warn("Portable Browser Bridge tab cleanup:", result.reason);

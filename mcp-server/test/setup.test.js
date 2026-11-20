@@ -99,6 +99,7 @@ test("provider configuration uses absolute paths and the OpenCode V2 schema", ()
     env: { BROWSER_USE_BRIDGE_FILE: "/bridge.json" },
   });
   assert.equal(buildConfig("codex", opts).mcp_servers["browser-use"].command, opts.nodePath);
+  assert.deepEqual(buildConfig("commandcode", { ...opts, profile: "compact" }).mcpServers["browser-use"].args, [opts.serverPath, "--profile", "compact"]);
   assert.throws(() => buildConfig("invented", opts), /Unknown client/);
 });
 

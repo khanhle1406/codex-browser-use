@@ -10,6 +10,93 @@ const STATEFUL_PROPERTIES = new Set([
   "selected",
 ]);
 
+const INTERACTIVE_ROLES = new Set([
+  "button", "link", "textbox", "searchbox", "combobox", "checkbox",
+  "radio", "switch", "slider", "spinbutton", "tab", "menuitem",
+  "menuitemcheckbox", "menuitemradio", "option", "treeitem",
+  "RadioButton", "ToggleButton",
+]);
+
+const STRUCTURAL_LANDMARK_ROLES = new Set([
+  "heading", "main", "navigation", "dialog", "alert", "alertdialog",
+  "form", "region",
+]);
+
+const COLLAPSIBLE_ITEM_ROLES = new Set([
+  "listitem", "row", "option", "treeitem",
+]);
+
+/**
+ * Determine whether a node carries focused, editable, valued, selected, or checked state.
+ * @param {string} value
+ * @param {Map<string, unknown>} propMap
+ * @returns {boolean}
+ */
+function hasInteractiveState(value, propMap) {
+  if (value) return true;
+  if (propMap.get("focused") === true) return true;
+  if (propMap.get("editable") === true) return true;
+  if (propMap.get("selected") === true) return true;
+  const checked = propMap.get("checked");
+  if (checked === true || (typeof checked === "string" && checked !== "false")) return true;
+  return false;
+}
+
+/**
+ * Precompute subtree interactivity flags so landmarks can be kept iff they contain
+ * interactive descendants.
+ * @param {Array<Record<string, any>>} roots
+ * @param {Map<string, Record<string, any>>} byId
+ * @param {Map<string, Array<Record<string, any>>>} children
+ * @param {(node: Record<string, any>, role: string, name: string, value: string) => boolean} isTransparentFn
+ * @param {number} maxTextLength
+ * @returns {Map<string, {directlyInteractive:boolean, hasInteractiveDescendant:boolean}>}
+ */
+function computeInteractiveMetadata(roots, byId, children, isTransparentFn, maxTextLength) {
+  const meta = new Map();
+  const visiting = new Set();
+
+  const analyze = (node) => {
+    if (!node || typeof node.nodeId !== "string") {
+      return { directlyInteractive: false, hasInteractiveDescendant: false };
+    }
+    const existing = meta.get(node.nodeId);
+    if (existing) return existing;
+    if (visiting.has(node.nodeId)) {
+      return { directlyInteractive: false, hasInteractiveDescendant: false };
+    }
+    visiting.add(node.nodeId);
+
+    const role = node.role?.value ?? "unknown";
+    const name = truncateText(normalizeText(node.name?.value), maxTextLength);
+    const value = truncateText(normalizeText(node.value?.value), maxTextLength);
+    const propMap = readPropertyMap(node.properties);
+    const transparent = isTransparentFn(node, role, name, value);
+    const directlyInteractive = !transparent && (
+      INTERACTIVE_ROLES.has(role) || hasInteractiveState(value, propMap)
+    );
+
+    const ordered = Array.isArray(node.childIds) && node.childIds.length > 0
+      ? node.childIds.map((id) => byId.get(id)).filter(Boolean)
+      : children.get(node.nodeId) ?? [];
+    let hasInteractiveDescendant = false;
+    for (const child of ordered) {
+      const childInfo = analyze(child);
+      if (childInfo.directlyInteractive || childInfo.hasInteractiveDescendant) {
+        hasInteractiveDescendant = true;
+      }
+    }
+
+    visiting.delete(node.nodeId);
+    const info = { directlyInteractive, hasInteractiveDescendant };
+    meta.set(node.nodeId, info);
+    return info;
+  };
+
+  for (const root of roots) analyze(root);
+  return meta;
+}
+
 /**
  * Collapse internal whitespace and trim surrounding spaces.
  * @param {unknown} value
@@ -117,6 +204,112 @@ function buildAxTreeGraph(nodes) {
   return { byId, children, roots };
 }
 
+/**
+ * Resolve ordered children of a node, optionally unwrapping transparent nodes
+ * so consecutive repeated items under generic wrappers stay grouped at one depth.
+ * @param {Array<Record<string, any>>} rawList
+ * @param {Map<string, Record<string, any>>} byId
+ * @param {Map<string, Array<Record<string, any>>>} children
+ * @param {(node: Record<string, any>, role: string, name: string, value: string) => boolean} isTransparentFn
+ * @param {number} maxTextLength
+ * @param {boolean} unwrapTransparent
+ * @returns {Array<Record<string, any>>}
+ */
+function resolveSequenceNodes(rawList, byId, children, isTransparentFn, maxTextLength, unwrapTransparent) {
+  if (!unwrapTransparent) return rawList;
+  const out = [];
+  const stack = [...rawList].reverse();
+  const seen = new Set();
+  while (stack.length > 0) {
+    const curr = stack.pop();
+    if (!curr || (typeof curr.nodeId === "string" && seen.has(curr.nodeId))) continue;
+    if (typeof curr.nodeId === "string") seen.add(curr.nodeId);
+    const role = curr.role?.value ?? "unknown";
+    const name = truncateText(normalizeText(curr.name?.value), maxTextLength);
+    const value = truncateText(normalizeText(curr.value?.value), maxTextLength);
+    if (isTransparentFn(curr, role, name, value)) {
+      const grand = Array.isArray(curr.childIds) && curr.childIds.length > 0
+        ? curr.childIds.map((id) => byId.get(id)).filter(Boolean)
+        : children.get(curr.nodeId) ?? [];
+      for (let i = grand.length - 1; i >= 0; i--) stack.push(grand[i]);
+    } else {
+      out.push(curr);
+    }
+  }
+  return out;
+}
+
+/**
+ * Determine whether a non-transparent node should be emitted in `interactive` mode.
+ * @param {Record<string, any>} node
+ * @param {string} role
+ * @param {string} name
+ * @param {Map<string, {directlyInteractive:boolean, hasInteractiveDescendant:boolean}>} interactiveMeta
+ * @param {boolean} includeRootWebArea
+ * @returns {boolean}
+ */
+function shouldKeepInteractiveNode(node, role, name, interactiveMeta, includeRootWebArea) {
+  const info = interactiveMeta?.get(node.nodeId);
+  if (info?.directlyInteractive) return true;
+  if (role === "heading") return Boolean(name) || Boolean(info?.hasInteractiveDescendant);
+  if (STRUCTURAL_LANDMARK_ROLES.has(role)) return Boolean(info?.hasInteractiveDescendant);
+  if (includeRootWebArea && role === "RootWebArea") return Boolean(info?.hasInteractiveDescendant);
+  return false;
+}
+
+/**
+ * Traverse a sibling sequence, collapsing runs of > 5 consecutive items sharing
+ * a collapsible role (`listitem`, `row`, `option`, `treeitem`) when enabled.
+ */
+function visitCollapsibleSequence({
+  items,
+  depth,
+  indentOffset = 0,
+  ancestor,
+  shouldCollapse,
+  maxLines,
+  lines,
+  setTruncated,
+  isTruncated,
+  visitNode,
+}) {
+  if (!shouldCollapse) {
+    for (const item of items) visitNode(item, depth, ancestor);
+    return;
+  }
+  let i = 0;
+  while (i < items.length && !isTruncated()) {
+    const role = items[i].role?.value ?? "unknown";
+    if (!COLLAPSIBLE_ITEM_ROLES.has(role)) {
+      visitNode(items[i], depth, ancestor);
+      i += 1;
+      continue;
+    }
+    let j = i + 1;
+    while (j < items.length && (items[j].role?.value ?? "unknown") === role) {
+      j += 1;
+    }
+    const runLen = j - i;
+    if (runLen <= 5) {
+      for (let k = i; k < j; k++) visitNode(items[k], depth, ancestor);
+    } else {
+      for (let k = i; k < i + 3; k++) visitNode(items[k], depth, ancestor);
+      if (!isTruncated()) {
+        if (lines.length >= maxLines) {
+          setTruncated();
+          return;
+        }
+        const omitted = runLen - 4;
+        lines.push(`${"  ".repeat(indentOffset + depth)}... (+${omitted} similar ${role} items omitted)`);
+      }
+      if (!isTruncated()) {
+        visitNode(items[j - 1], depth, ancestor);
+      }
+    }
+    i = j;
+  }
+}
+
 export function buildAxState(nodes, {
   maxLines = 2_000,
   maxTextLength = 240,
@@ -124,8 +317,27 @@ export function buildAxState(nodes, {
   baseDepth = 0,
   frameId = null,
   sessionId = null,
+  mode = "full",
+  collapseRepeated,
 } = {}) {
+  const effectiveMode = mode === "compact" || mode === "interactive" ? mode : "full";
+  const shouldCollapse = collapseRepeated ?? (effectiveMode === "compact");
   const { byId, children, roots } = buildAxTreeGraph(nodes);
+  const isTransparent = (node, role, _name, value) => {
+    if (node.ignored === true || role === "none" || role === "LineBreak" || role === "InlineTextBox") {
+      return true;
+    }
+    if (role === "generic") {
+      if (effectiveMode === "interactive") {
+        return !hasInteractiveState(value, readPropertyMap(node.properties));
+      }
+      return true;
+    }
+    return false;
+  };
+  const interactiveMeta = effectiveMode === "interactive"
+    ? computeInteractiveMetadata(roots, byId, children, isTransparent, maxTextLength)
+    : null;
 
   const lines = [];
   const entries = [];
@@ -143,8 +355,7 @@ export function buildAxState(nodes, {
     const role = node.role?.value ?? "unknown";
     const name = truncateText(normalizeText(node.name?.value), maxTextLength);
     const value = truncateText(normalizeText(node.value?.value), maxTextLength);
-    const transparent = node.ignored === true || role === "none" || role === "LineBreak" ||
-      role === "InlineTextBox" || role === "generic";
+    const transparent = isTransparent(node, role, name, value);
 
     // Prune StaticText nodes whose text duplicates their interactive/heading ancestor's accessible name.
     if (!transparent && role === "StaticText" && ancestor &&
@@ -153,8 +364,16 @@ export function buildAxState(nodes, {
       return;
     }
 
+    let emit = !transparent;
+    if (emit && effectiveMode === "compact" && role === "StaticText" && !name && !value) {
+      emit = false;
+    }
+    if (emit && effectiveMode === "interactive") {
+      emit = shouldKeepInteractiveNode(node, role, name, interactiveMeta, true);
+    }
+
     let nextAncestor = ancestor;
-    if (!transparent) {
+    if (emit) {
       if (lines.length >= maxLines) {
         truncated = true;
         return;
@@ -197,14 +416,36 @@ export function buildAxState(nodes, {
       nextAncestor = { role, name };
     }
 
-    const childDepth = transparent ? depth : depth + 1;
-    const ordered = Array.isArray(node.childIds) && node.childIds.length > 0
+    const childDepth = emit ? depth + 1 : depth;
+    const rawChildren = Array.isArray(node.childIds) && node.childIds.length > 0
       ? node.childIds.map((id) => byId.get(id)).filter(Boolean)
       : children.get(node.nodeId) ?? [];
-    for (const child of ordered) visit(child, childDepth, nextAncestor);
+    const ordered = resolveSequenceNodes(rawChildren, byId, children, isTransparent, maxTextLength, shouldCollapse);
+    visitCollapsibleSequence({
+      items: ordered,
+      depth: childDepth,
+      ancestor: nextAncestor,
+      shouldCollapse,
+      maxLines,
+      lines,
+      setTruncated: () => { truncated = true; },
+      isTruncated: () => truncated,
+      visitNode: visit,
+    });
   };
 
-  for (const root of roots) visit(root, baseDepth, null);
+  const effectiveRoots = resolveSequenceNodes(roots, byId, children, isTransparent, maxTextLength, shouldCollapse);
+  visitCollapsibleSequence({
+    items: effectiveRoots,
+    depth: baseDepth,
+    ancestor: null,
+    shouldCollapse,
+    maxLines,
+    lines,
+    setTruncated: () => { truncated = true; },
+    isTruncated: () => truncated,
+    visitNode: visit,
+  });
   return {
     lines,
     index,
@@ -218,9 +459,14 @@ export function buildAxState(nodes, {
 /**
  * Merge main-frame and child-iframe AX node lists into one sequentially indexed tree.
  * @param {Array<{nodes:Array<Record<string, any>>, frameId:string|null, sessionId:string|null, url?:string, depth?:number}>} frames
- * @param {{maxLines?:number, maxTextLength?:number}} [options]
+ * @param {{maxLines?:number, maxTextLength?:number, mode?:"full"|"compact"|"interactive", collapseRepeated?:boolean}} [options]
  */
-export function mergeFrameAxStates(frames, { maxLines = 2_000, maxTextLength = 240 } = {}) {
+export function mergeFrameAxStates(frames, {
+  maxLines = 2_000,
+  maxTextLength = 240,
+  mode = "full",
+  collapseRepeated,
+} = {}) {
   const lines = [];
   const entries = [];
   const index = new Map();
@@ -243,6 +489,8 @@ export function mergeFrameAxStates(frames, { maxLines = 2_000, maxTextLength = 2
       baseDepth,
       frameId: frame.frameId ?? null,
       sessionId: frame.sessionId ?? null,
+      mode,
+      collapseRepeated,
     });
     if (isChild && snapshot.lines.length > 0) {
       const urlHint = frame.url ? ` (${truncateText(normalizeText(frame.url), 100)})` : "";
@@ -435,11 +683,35 @@ export function buildDialogAxState(dialog, tabMeta) {
  * Format CDP AX nodes into a compact, Playwright-style YAML ARIA tree
  * ideal for 1-line `.split('\n').filter(...)` queries without index clutter.
  * @param {Array<Record<string, any>>} nodes
- * @param {{maxLines?:number, maxTextLength?:number, baseDepth?:number}} [options]
+ * @param {{maxLines?:number, maxTextLength?:number, baseDepth?:number, mode?:"full"|"compact"|"interactive", collapseRepeated?:boolean}} [options]
  * @returns {{text:string, lineCount:number, truncated:boolean}}
  */
-export function formatAriaSnapshot(nodes, { maxLines = 2_000, maxTextLength = 240, baseDepth = 0 } = {}) {
+export function formatAriaSnapshot(nodes, {
+  maxLines = 2_000,
+  maxTextLength = 240,
+  baseDepth = 0,
+  mode = "full",
+  collapseRepeated,
+} = {}) {
+  const effectiveMode = mode === "compact" || mode === "interactive" ? mode : "full";
+  const shouldCollapse = collapseRepeated ?? (effectiveMode === "compact");
   const { byId, children, roots } = buildAxTreeGraph(nodes);
+  const isTransparent = (node, role, name, value) => {
+    if (node.ignored === true || role === "none" || role === "LineBreak" ||
+        role === "InlineTextBox" || role === "RootWebArea") {
+      return true;
+    }
+    if (role === "generic") {
+      if (effectiveMode === "interactive") {
+        return !hasInteractiveState(value, readPropertyMap(node.properties));
+      }
+      return !name && !value;
+    }
+    return false;
+  };
+  const interactiveMeta = effectiveMode === "interactive"
+    ? computeInteractiveMetadata(roots, byId, children, isTransparent, maxTextLength)
+    : null;
   const lines = [];
   let truncated = false;
 
@@ -471,9 +743,7 @@ export function formatAriaSnapshot(nodes, { maxLines = 2_000, maxTextLength = 24
     const role = node.role?.value ?? "unknown";
     const name = truncateText(normalizeText(node.name?.value), maxTextLength);
     const value = truncateText(normalizeText(node.value?.value), maxTextLength);
-    const transparent = node.ignored === true || role === "none" || role === "LineBreak" ||
-      role === "InlineTextBox" || role === "RootWebArea" ||
-      (role === "generic" && !name && !value);
+    const transparent = isTransparent(node, role, name, value);
 
     if (!transparent && role === "StaticText" && ancestor &&
         TEXT_PRUNABLE_PARENT_ROLES.has(ancestor.role) && ancestor.name &&
@@ -481,8 +751,13 @@ export function formatAriaSnapshot(nodes, { maxLines = 2_000, maxTextLength = 24
       return;
     }
 
+    let emit = !transparent;
+    if (emit && effectiveMode === "interactive") {
+      emit = shouldKeepInteractiveNode(node, role, name, interactiveMeta, false);
+    }
+
     let nextAncestor = ancestor;
-    if (!transparent) {
+    if (emit) {
       if (lines.length >= maxLines) {
         truncated = true;
         return;
@@ -509,14 +784,38 @@ export function formatAriaSnapshot(nodes, { maxLines = 2_000, maxTextLength = 24
       nextAncestor = { role, name };
     }
 
-    const childDepth = transparent ? depth : depth + 1;
-    const ordered = Array.isArray(node.childIds) && node.childIds.length > 0
+    const childDepth = emit ? depth + 1 : depth;
+    const rawChildren = Array.isArray(node.childIds) && node.childIds.length > 0
       ? node.childIds.map((id) => byId.get(id)).filter(Boolean)
       : children.get(node.nodeId) ?? [];
-    for (const child of ordered) visit(child, childDepth, nextAncestor);
+    const ordered = resolveSequenceNodes(rawChildren, byId, children, isTransparent, maxTextLength, shouldCollapse);
+    visitCollapsibleSequence({
+      items: ordered,
+      depth: childDepth,
+      indentOffset: baseDepth,
+      ancestor: nextAncestor,
+      shouldCollapse,
+      maxLines,
+      lines,
+      setTruncated: () => { truncated = true; },
+      isTruncated: () => truncated,
+      visitNode: visit,
+    });
   };
 
-  for (const root of roots) visit(root, 0, null);
+  const effectiveRoots = resolveSequenceNodes(roots, byId, children, isTransparent, maxTextLength, shouldCollapse);
+  visitCollapsibleSequence({
+    items: effectiveRoots,
+    depth: 0,
+    indentOffset: baseDepth,
+    ancestor: null,
+    shouldCollapse,
+    maxLines,
+    lines,
+    setTruncated: () => { truncated = true; },
+    isTruncated: () => truncated,
+    visitNode: visit,
+  });
   return {
     text: lines.join("\n"),
     lineCount: lines.length,
@@ -527,10 +826,15 @@ export function formatAriaSnapshot(nodes, { maxLines = 2_000, maxTextLength = 24
 /**
  * Merge main-frame and child-iframe ARIA snapshots into one clean indented YAML tree.
  * @param {Array<{nodes:Array<Record<string, any>>, frameId:string|null, url?:string, depth?:number}>} frames
- * @param {{maxLines?:number, maxTextLength?:number}} [options]
+ * @param {{maxLines?:number, maxTextLength?:number, mode?:"full"|"compact"|"interactive", collapseRepeated?:boolean}} [options]
  * @returns {{text:string, lineCount:number, truncated:boolean}}
  */
-export function mergeFrameAriaSnapshots(frames, { maxLines = 2_000, maxTextLength = 240 } = {}) {
+export function mergeFrameAriaSnapshots(frames, {
+  maxLines = 2_000,
+  maxTextLength = 240,
+  mode = "full",
+  collapseRepeated,
+} = {}) {
   const lines = [];
   let truncated = false;
 
@@ -547,6 +851,8 @@ export function mergeFrameAriaSnapshots(frames, { maxLines = 2_000, maxTextLengt
       maxLines: isChild ? Math.max(0, remaining - 1) : remaining,
       maxTextLength,
       baseDepth,
+      mode,
+      collapseRepeated,
     });
     if (!snapshot.text) continue;
     const frameLines = snapshot.text.split("\n");

@@ -53,20 +53,25 @@ export async function setupWorkspace(workspace, bridgeFile) {
 
 /**
  * @param {string[]} argv
- * @returns {{command:string, client?:string, enginePath?:string, bridgeFile?:string, workspace?:string, extensionId?:string, write:boolean, skill:boolean, json:boolean, help:boolean}}
+ * @returns {{command:string, client?:string, enginePath?:string, bridgeFile?:string, workspace?:string, extensionId?:string, profile?:string, write:boolean, skill:boolean, json:boolean, help:boolean}}
  */
 function parseArgs(argv) {
   const options = { command: argv[0] ?? "help", json: false, help: false, write: false, skill: false };
   for (let i = 1; i < argv.length; i++) {
     const arg = argv[i];
-    if (["--client", "--engine", "--bridge", "--workspace", "--extension-id"].includes(arg)) {
+    if (["--client", "--engine", "--bridge", "--workspace", "--extension-id", "--profile"].includes(arg)) {
       const value = argv[++i];
       if (!value || value.startsWith("--")) throw new Error(`${arg} requires a value`);
       if (arg === "--client") options.client = value;
       else if (arg === "--engine") options.enginePath = value;
       else if (arg === "--bridge") options.bridgeFile = value;
       else if (arg === "--extension-id") options.extensionId = value;
-      else options.workspace = value;
+      else if (arg === "--profile") {
+        if (!["compact", "standard", "full"].includes(value)) {
+          throw new Error(`Invalid profile ${JSON.stringify(value)}. Choose compact, standard, or full.`);
+        }
+        options.profile = value;
+      } else options.workspace = value;
     } else if (arg === "--write") options.write = true;
     else if (arg === "--skill") options.skill = true;
     else if (arg === "--json") options.json = true;
@@ -82,9 +87,9 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.help || ["help", "--help", "-h"].includes(options.command)) {
     process.stdout.write([
       "Usage:",
-      "  browser-use install [--client NAME] [--write] [--skill] [--bridge FILE] [--extension-id ID] [--json]",
+      "  browser-use install [--client NAME] [--profile compact|standard|full] [--write] [--skill] [--bridge FILE] [--extension-id ID] [--json]",
       "  browser-use doctor [--bridge FILE] [--engine PATH] [--json]",
-      "  browser-use config --client NAME [--bridge FILE]",
+      "  browser-use config --client NAME [--profile compact|standard|full] [--bridge FILE]",
       "  browser-use setup --workspace DIR [--bridge FILE] [--json]",
       "",
       "Clients: generic, claude_code, commandcode, copilot, antigravity, cursor, windsurf, opencode, codex",
@@ -102,7 +107,7 @@ export async function main(argv = process.argv.slice(2)) {
     const extension = await installExtension();
     const nativeHost = await installNativeHost({ extensionId: options.extensionId ?? EXTENSION_ID, bridgeFile });
     const client = options.client
-      ? await configureClient({ client: options.client, bridgeFile, write: options.write })
+      ? await configureClient({ client: options.client, bridgeFile, profile: options.profile, write: options.write })
       : null;
     const skill = options.skill
       ? await installSkill({ client: options.client ?? "generic" })
@@ -163,7 +168,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   const client = normalizeClient(options.client ?? "generic");
-  const config = buildConfig(client, { bridgeFile });
+  const config = buildConfig(client, { bridgeFile, profile: options.profile });
   process.stdout.write(client === "codex" && !options.json ? codexToml(config) : `${JSON.stringify(config, null, 2)}\n`);
   return 0;
 }
