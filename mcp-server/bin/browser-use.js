@@ -116,7 +116,7 @@ export async function main(argv = process.argv.slice(2)) {
       skill,
       next: [
         `Open chrome://extensions, enable Developer mode, and Load unpacked from ${extension.path}.`,
-        "Click the Portable Browser Bridge toolbar action once; the badge shows ON.",
+        "Portable Browser Bridge connects automatically once loaded (no manual toggle needed).",
         client?.written
           ? `Restart ${normalizeClient(options.client)} so it reads the new MCP entry.`
           : "Merge the printed client fragment into the client's MCP settings, then restart it.",

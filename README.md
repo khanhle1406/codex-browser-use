@@ -11,7 +11,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-26.12.1%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#quick-start)
 [![MCP tools](https://img.shields.io/badge/MCP-36%20tools-5B8DEF?style=flat-square)](#why-its-better)
-[![Extension](https://img.shields.io/badge/Extension-v0.5.3-34D399?style=flat-square)](#quick-start)
+[![Extension](https://img.shields.io/badge/Extension-v0.5.4-34D399?style=flat-square)](#quick-start)
 [![GitHub stars](https://img.shields.io/github/stars/khanhle1406/codex-browser-use?style=flat-square)](https://github.com/khanhle1406/codex-browser-use/stargazers)
 
 [Quick start](#quick-start) · [How it works](#how-it-works) · [What you can do](#what-you-can-do) · [Why it's better](#why-its-better) · [FAQ](#faq) · [Documentation](#documentation)
@@ -50,7 +50,7 @@ node mcp-server/bin/browser-use.js install --client antigravity --write --skill
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-`install` copies the Chrome extension (`v0.5.3`) to your home folder, hooks up Chrome's local bridge, adds the MCP server to your agent (saving a `.bak` backup first), and installs the matching instructions.
+`install` copies the Chrome extension (`v0.5.4`) to your home folder, hooks up Chrome's local bridge, adds the MCP server to your agent (saving a `.bak` backup first), and installs the matching instructions.
 
 <details>
 <summary><strong>Using Claude Code, Codex, Cursor, Windsurf, Copilot, Command Code, or OpenCode?</strong></summary>
@@ -74,7 +74,7 @@ node mcp-server/bin/browser-use.js install --client codex --skill
 ### Connect Chrome
 
 1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and choose `~/.local/share/browser-use/extension`.
-2. That's it — the **Portable Browser Bridge** icon turns `ON` automatically (you can still click it anytime to pause or reconnect).
+2. That's it — **Portable Browser Bridge** connects automatically in the background (hover the icon to check status, or click to pause/reconnect).
 3. Restart your coding agent so it loads all **36 tools**.
 
 ### Ask your agent

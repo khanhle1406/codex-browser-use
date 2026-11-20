@@ -154,7 +154,7 @@ function richMockBridge() {
     calls.push({ kind: "rpc", method, params });
     if (method === "executeCdp") return cdp(params.target.tabId, params.target.sessionId, params.method, params.commandParams);
     switch (method) {
-      case "getInfo": return { type: "extension", family: "chrome", name: "Mock", version: "0.5.3" };
+      case "getInfo": return { type: "extension", family: "chrome", name: "Mock", version: "0.5.4" };
       case "getTabs": return [...tabs.values()];
       case "createTab": {
         const id = nextTab++;

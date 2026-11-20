@@ -296,7 +296,8 @@ function connect() {
     const error = chrome.runtime.lastError?.message;
     if (error) console.warn("Portable Browser Bridge:", error);
     disconnectActive = null;
-    void chrome.action.setBadgeText({text: ""});
+    void chrome.action.setBadgeText({text: manualDisconnect ? "OFF" : ""});
+    void chrome.action.setTitle?.({title: "Portable Browser Bridge (Disconnected — click to connect)"});
     chrome.tabs.onRemoved.removeListener(forget);
     chrome.debugger.onEvent.removeListener(onDebuggerEvent);
     chrome.debugger.onDetach.removeListener(onDebuggerDetach);
@@ -353,7 +354,8 @@ function connect() {
     onDisconnect();
     port.disconnect();
   };
-  void chrome.action.setBadgeText({text: "ON"});
+  void chrome.action.setBadgeText({text: ""});
+  void chrome.action.setTitle?.({title: "Portable Browser Bridge (Connected)"});
 }
 
 chrome.action.onClicked.addListener(() => {
