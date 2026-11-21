@@ -1,11 +1,11 @@
 ---
 trigger: always_on
-description: Standalone browser-use MCP server (v4.8.0 / extension v0.6.0): 36 tools in full profile or 7 core tools in compact profile (-75.4% schema tokens, auto-selected per client via --profile auto), Probe-1-then-Batch 300s browser_run with scoped locator.ariaSnapshot(), auto-reported saved_files, saveScreenshot, tabs.content, responseBody, endTurn, auto-grouped claimed user tabs, zero-debugger passive reads, and compact-first AX compression.
+description: Standalone browser-use MCP server (v4.8.0 / extension v0.6.1): 36 tools in full profile or 7 core tools in compact profile (-75.4% schema tokens, auto-selected per client via --profile auto), Probe-1-then-Batch 300s browser_run with scoped locator.ariaSnapshot(), auto-reported saved_files, saveScreenshot, tabs.content, responseBody, endTurn, auto-grouped claimed user tabs, zero-debugger passive reads, and compact-first AX compression.
 ---
 
 # Browser Use Policy
 
-1. **Default Tool & Profiles**: Use the standalone `browser-use` MCP server (`v4.8.0` / extension `v0.6.0`) for browser UI tasks; prefer `curl`, CLI, or API calls when no UI interaction is needed.
+1. **Default Tool & Profiles**: Use the standalone `browser-use` MCP server (`v4.8.0` / extension `v0.6.1`) for browser UI tasks; prefer `curl`, CLI, or API calls when no UI interaction is needed.
    - Use `--profile compact` (`7` core tools, `75.4%` smaller schema: `~1,865` vs `~7,576` est. tokens) or `--profile auto` for CLI/non-lazy clients (`codex`, `claude_code`, `commandcode`), and `full` (`36` tools) for lazy-loading clients.
 2. **Decision Routing**:
    - **Read-only open user tab**: Use zero-debugger passive `browser.tabs.read(id)` / `browser.user.getTabContext(id)` or passive `browser_get_content` (no debugger attach).

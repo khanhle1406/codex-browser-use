@@ -154,3 +154,14 @@ test("bundled extension manifest bundles 16/32/48/128 PNG icons matching EXTENSI
     assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
   }
 });
+
+test("bundled content-script renders inline SVG cursor without cross-origin extension URLs", async () => {
+  const manifest = JSON.parse(await readFile(path.join(extensionSource, "manifest.json"), "utf8"));
+  assert.equal(manifest.web_accessible_resources, undefined);
+
+  const contentScript = await readFile(path.join(extensionSource, "content-script.js"), "utf8");
+  assert.equal(contentScript.includes("chrome.runtime.getURL"), false);
+  assert.equal(contentScript.includes("cursor-chat.png"), false);
+  assert.equal(contentScript.includes("chrome-extension://"), false);
+  assert.equal(contentScript.includes('createElementNS("http://www.w3.org/2000/svg","svg")'), true);
+});

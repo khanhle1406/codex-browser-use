@@ -7,7 +7,7 @@ export { defaultBridgeFile };
 
 export const HOST_NAME = "com.portable_browser_use.bridge";
 export const EXTENSION_ID = "ehooacpcolldccnemjebdnmfgmgekghn";
-export const EXTENSION_VERSION = "0.6.0";
+export const EXTENSION_VERSION = "0.6.1";
 export const extensionSource = fileURLToPath(new URL("../extension", import.meta.url));
 
 /** @returns {string} */

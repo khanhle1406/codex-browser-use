@@ -1,6 +1,6 @@
 ---
 name: codex-browser-use
-description: Fast, token-efficient Chrome automation (v4.8.0 / extension v0.6.0; 36 tools in full profile, 7 core tools in compact profile). Run 300s persistent multi-step and multi-tab browser_run scripts with Probe-1-then-Batch loops, scoped locator.ariaSnapshot(), local saveFile/readFile/saveScreenshot with auto-reported saved_files, parallel browser.tabs.content(), network responseBody() capture, elementScreenshot(), ax.paste/selectText, zero-debugger passive user tab reads, auto-grouped Chrome tab groups, auto-waiting locators with rich-text smart fill, and compact-first AX compression.
+description: Fast, token-efficient Chrome automation (v4.8.0 / extension v0.6.1; 36 tools in full profile, 7 core tools in compact profile). Run 300s persistent multi-step and multi-tab browser_run scripts with Probe-1-then-Batch loops, scoped locator.ariaSnapshot(), local saveFile/readFile/saveScreenshot with auto-reported saved_files, parallel browser.tabs.content(), network responseBody() capture, elementScreenshot(), ax.paste/selectText, zero-debugger passive user tab reads, auto-grouped Chrome tab groups, auto-waiting locators with rich-text smart fill, and compact-first AX compression.
 ---
 
 # codex-browser-use (v4.8.0)
