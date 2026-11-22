@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { runInNewContext } from "node:vm";
 import { configureClient, installExtension, installRules, installSkill } from "../src/install.js";
 import { EXTENSION_ID, EXTENSION_VERSION, extensionSource } from "../src/extension.js";
 
@@ -164,4 +165,225 @@ test("bundled content-script renders inline SVG cursor without cross-origin exte
   assert.equal(contentScript.includes("cursor-chat.png"), false);
   assert.equal(contentScript.includes("chrome-extension://"), false);
   assert.equal(contentScript.includes('createElementNS("http://www.w3.org/2000/svg","svg")'), true);
+});
+
+test("bundled content-script tolerates invalidated chrome.runtime without throwing sendMessage errors", async () => {
+  const source = await readFile(path.join(extensionSource, "content-script.js"), "utf8");
+  const windowListeners = new Map();
+  const docListeners = new Map();
+  const observerCallbacks = [];
+  const createEl = () => ({
+    style: { setProperty() {} },
+    dataset: {},
+    children: [],
+    isConnected: true,
+    setAttribute() {},
+    appendChild(c) { this.children.push(c); return c; },
+    replaceChildren(...c) { this.children = c; },
+    attachShadow() { return createEl(); },
+    remove() { this.isConnected = false; },
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }),
+  });
+  const docEl = createEl();
+  const mockDoc = {
+    documentElement: docEl,
+    head: null,
+    getElementById: () => null,
+    querySelectorAll: () => [],
+    createElement: createEl,
+    createElementNS: () => createEl(),
+    dispatchEvent() {},
+    addEventListener(type, fn) {
+      if (!docListeners.has(type)) docListeners.set(type, new Set());
+      docListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) { docListeners.get(type)?.delete(fn); },
+  };
+  const chromeObj = {
+    runtime: {
+      id: "ehooacpcolldccnemjebdnmfgmgekghn",
+      sendMessage: () => Promise.resolve({ ok: false }),
+      onMessage: { addListener() {}, removeListener() {} },
+    },
+  };
+  const sandbox = {
+    window: {
+      innerWidth: 1280,
+      innerHeight: 800,
+      setTimeout,
+      clearTimeout,
+      requestAnimationFrame: () => 0,
+      cancelAnimationFrame() {},
+      addEventListener(type, fn) {
+        if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+        windowListeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) { windowListeners.get(type)?.delete(fn); },
+      dispatchEvent() {},
+      postMessage() {},
+    },
+    document: mockDoc,
+    chrome: chromeObj,
+    Event: class Event {},
+    CustomEvent: class CustomEvent { constructor(_t, i) { this.detail = i?.detail; } },
+    HTMLDivElement: class HTMLDivElement {},
+    HTMLLinkElement: class HTMLLinkElement {},
+    SVGElement: class SVGElement {},
+    AbortController: class AbortController { constructor() { this.signal = { aborted: false, addEventListener() {}, removeEventListener() {} }; } abort() { this.signal.aborted = true; } },
+    MutationObserver: class MutationObserver { constructor(cb) { observerCallbacks.push(cb); } observe() {} disconnect() {} },
+    TextEncoder,
+    TextDecoder,
+    URL,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    requestAnimationFrame: () => 0,
+    cancelAnimationFrame() {},
+    requestIdleCallback: () => 0,
+    cancelIdleCallback() {},
+    performance: { now: () => 0 },
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.location = { href: "https://example.com" };
+
+  await assert.doesNotReject(async () => {
+    await runInNewContext(source, sandbox);
+    // Simulate extension reload invalidating chrome.runtime completely (undefined)
+    chromeObj.runtime = undefined;
+    for (const fn of windowListeners.get("pageshow") ?? []) fn();
+    for (const cb of observerCallbacks) cb([]);
+    // Also simulate entirely undefined chrome object
+    sandbox.chrome = undefined;
+    for (const fn of windowListeners.get("pageshow") ?? []) fn();
+    for (const cb of observerCallbacks) cb([]);
+  });
+});
+
+test("bundled content-script animates Bezier cursor moves and VisualViewport resizes without rt name collision", async () => {
+  const source = await readFile(new URL("../extension/content-script.js", import.meta.url), "utf8");
+  const windowListeners = new Map();
+  const vvListeners = new Map();
+  const messageListeners = new Set();
+  const createEl = () => ({
+    style: { setProperty() {} },
+    dataset: {},
+    children: [],
+    isConnected: true,
+    setAttribute() {},
+    appendChild(c) { this.children.push(c); return c; },
+    replaceChildren(...c) { this.children = c; },
+    attachShadow() { return createEl(); },
+    remove() { this.isConnected = false; },
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }),
+  });
+  const docEl = createEl();
+  const vv = {
+    width: 1280,
+    height: 800,
+    offsetLeft: 0,
+    offsetTop: 0,
+    addEventListener(type, fn) {
+      if (!vvListeners.has(type)) vvListeners.set(type, new Set());
+      vvListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) { vvListeners.get(type)?.delete(fn); },
+  };
+  let nowMs = 0;
+  let rafId = 0;
+  const rafQueue = [];
+  const sandbox = {
+    window: {
+      innerWidth: 1280,
+      innerHeight: 800,
+      visualViewport: vv,
+      setTimeout,
+      clearTimeout,
+      requestAnimationFrame: (cb) => { rafQueue.push(cb); return ++rafId; },
+      cancelAnimationFrame() {},
+      addEventListener(type, fn) {
+        if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+        windowListeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) { windowListeners.get(type)?.delete(fn); },
+      dispatchEvent() {},
+      postMessage() {},
+    },
+    visualViewport: vv,
+    document: {
+      documentElement: docEl,
+      head: null,
+      getElementById: () => null,
+      querySelectorAll: () => [],
+      createElement: createEl,
+      createElementNS: () => createEl(),
+      dispatchEvent() {},
+      addEventListener() {},
+      removeEventListener() {},
+    },
+    chrome: {
+      runtime: {
+        id: "ehooacpcolldccnemjebdnmfgmgekghn",
+        sendMessage: () => Promise.resolve({ ok: true }),
+        onMessage: {
+          addListener(fn) { messageListeners.add(fn); },
+          removeListener(fn) { messageListeners.delete(fn); },
+        },
+      },
+    },
+    Event: class Event {},
+    CustomEvent: class CustomEvent { constructor(_t, i) { this.detail = i?.detail; } },
+    HTMLDivElement: class HTMLDivElement {},
+    HTMLLinkElement: class HTMLLinkElement {},
+    SVGElement: class SVGElement {},
+    AbortController: class AbortController { constructor() { this.signal = { aborted: false, addEventListener() {}, removeEventListener() {} }; } abort() { this.signal.aborted = true; } },
+    MutationObserver: class MutationObserver { observe() {} disconnect() {} },
+    TextEncoder,
+    TextDecoder,
+    URL,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    requestAnimationFrame: (cb) => { rafQueue.push(cb); return ++rafId; },
+    cancelAnimationFrame() {},
+    requestIdleCallback: () => 0,
+    cancelIdleCallback() {},
+    performance: { now: () => nowMs },
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.location = { href: "https://example.com" };
+
+  runInNewContext(source, sandbox);
+  assert.ok(messageListeners.size >= 1);
+
+  const sendState = (state) => {
+    for (const fn of messageListeners) {
+      fn({ type: "AGENT_CURSOR_STATE", state }, {}, () => {});
+    }
+  };
+
+  // Two cursor updates >100px apart trigger Bezier planning rt({bounds,end,start}) + ve(e.segments), followed by resize
+  assert.doesNotThrow(() => {
+    sendState({
+      isVisible: true,
+      sessionId: "sess-1",
+      turnId: "turn-1",
+      cursor: { x: 40, y: 40, visible: true, animateMovement: true, moveSequence: 1 },
+    });
+    sendState({
+      isVisible: true,
+      sessionId: "sess-1",
+      turnId: "turn-1",
+      cursor: { x: 420, y: 310, visible: true, animateMovement: true, moveSequence: 2 },
+    });
+    nowMs = 16;
+    while (rafQueue.length > 0 && nowMs <= 64) {
+      const cb = rafQueue.shift();
+      cb?.(nowMs);
+      nowMs += 16;
+    }
+    for (const fn of vvListeners.get("resize") ?? []) fn();
+    for (const fn of windowListeners.get("resize") ?? []) fn();
+  });
 });

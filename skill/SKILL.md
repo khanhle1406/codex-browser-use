@@ -1,9 +1,9 @@
 ---
 name: codex-browser-use
-description: Fast, token-efficient Chrome automation (v4.8.0 / extension v0.6.1; 36 tools in full profile, 7 core tools in compact profile). Run 300s persistent multi-step and multi-tab browser_run scripts with Probe-1-then-Batch loops, scoped locator.ariaSnapshot(), local saveFile/readFile/saveScreenshot with auto-reported saved_files, parallel browser.tabs.content(), network responseBody() capture, elementScreenshot(), ax.paste/selectText, zero-debugger passive user tab reads, auto-grouped Chrome tab groups, auto-waiting locators with rich-text smart fill, and compact-first AX compression.
+description: Fast, token-efficient Chrome automation (v4.8.1 / extension v0.6.4; 36 tools in full profile, 7 core tools in compact profile). Run 300s persistent multi-step and multi-tab browser_run scripts with Probe-1-then-Batch loops, scoped locator.ariaSnapshot(), local saveFile/readFile/saveScreenshot with auto-reported saved_files, parallel browser.tabs.content(), network responseBody() capture, elementScreenshot(), ax.paste/selectText, zero-debugger passive user tab reads, consolidated auto-uncollapsing Chrome tab groups, auto-waiting locators with rich-text smart fill, and compact-first AX compression.
 ---
 
-# codex-browser-use (v4.8.0)
+# codex-browser-use (v4.8.1)
 
 Control the user's real Chrome browser over a local MCP bridge while preserving cookies/logins, grouping agent tabs cleanly, and leaving personal tabs untouched. Prefer `curl`, CLI, or API calls when no browser UI interaction is needed.
 
@@ -37,11 +37,12 @@ Control the user's real Chrome browser over a local MCP bridge while preserving 
    - Inspect via `ariaSnapshot()` / `locator.ariaSnapshot()` (`"compact"` default) before guessing selectors; narrow multi-matches with `.first()`, `.nth(i)`, `.filter({ visible, hasText, hasNotText })` (skip `{ exact: true }` if buttons have icons/badges).
    - Never call `goto(sameUrl)` to refresh (use `await tab.reload()`). Stop blind retries after 2 misses and re-inspect. Stop immediately on the first authoritative success signal.
 
-## 3. Session & User-Tab Hygiene
+## 3. Session, Tab & Group Hygiene
 
-- `browser.nameSession("Bench", "blue")` puts new tabs in one colored Chrome Tab Group.
-- For existing tabs: list with `await browser.user.openTabs()`, filter by `url`/`title`, read passively with `await browser.tabs.read(id)` when read-only, or claim **only** the matching tab via `await browser.user.claimTab(match)` (auto-joins session group and stays cleanly grouped after release, never closed).
-- Popups (`target="_blank"`) auto-claim (`const [popup] = await Promise.all([page.waitForEvent("popup"), link.click()])`). Finish via `end_turn: true`, `tab.markDeliverable()` / `tab.markHandoff()`, or `await browser.endTurn({ keep })`.
+- Use **1** concise task name per job via `browser.nameSession("Task QA", "blue")`; across turns, new/claimed tabs reuse the same Chrome Tab Group and automatically uncollapse it so tabs stay visible on the Chrome bar.
+- **Reuse before opening**: check `await browser.user.openTabs()` or `browser.tabs.list()` for an already-open tab matching your URL and reuse it (`user.claimTab(match)` / `tab.reload()`) instead of spawning duplicate localhost/preview tabs.
+- For read-only inspection of open user tabs, prefer `await browser.tabs.read(id)` / `await browser.user.getTabContext(id)` (zero debugger attach, zero group clutter).
+- Popups (`target="_blank"`) auto-claim (`const [popup] = await Promise.all([page.waitForEvent("popup"), link.click()])`). Finish via `end_turn: true`, `tab.markDeliverable()` / `tab.markHandoff()`, or `await browser.endTurn({ keep, ungroup })` (pass `ungroup: true` to dissolve finished group labels, or call `browser.groups.cleanup({ ungroupFinished: true })` / `browser.groups.ungroup()`).
 
 ## 4. `browser_run` Essential API (Shadow-DOM Auto-Wait Locators)
 

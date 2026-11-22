@@ -202,6 +202,10 @@ export class BridgeBrowser {
     this.activeTabId = null;
     /** @type {Set<number>} */
     this.attached = new Set();
+    /** @type {Map<number, Promise<void>>} */
+    this.attaching = new Map();
+    /** @type {Set<(event: Record<string, unknown>) => void>} */
+    this.eventListeners = new Set();
     /** @type {Map<number, Set<string>>} */
     this.enabledDomains = new Map();
     /** @type {Map<number, Map<string, Promise<void>>>} */
@@ -390,24 +394,28 @@ export class BridgeBrowser {
     }
     if (method === "Runtime.consoleAPICalled") {
       const level = event.type === "warning" ? "warn" : (event.type || "log");
-      this.#pushLog(state, {
+      const entry = {
         level,
         message: formatConsoleArgs(event),
         timestamp: new Date().toISOString(),
         url: event.stackTrace?.callFrames?.[0]?.url,
-      });
+      };
+      this.#pushLog(state, entry);
+      this.#emitEvent({ kind: "console", tabId, entry });
       return;
     }
     if (method === "Runtime.exceptionThrown") {
       const details = event.exceptionDetails ?? {};
       const msg = details.exception?.description || details.text || "Uncaught exception";
-      this.#pushLog(state, {
+      const entry = {
         level: "error",
         message: msg,
         timestamp: new Date().toISOString(),
         url: details.url,
-      });
+      };
+      this.#pushLog(state, entry);
       this.#pushNotification(state, `Page exception: ${msg.split("\n")[0].slice(0, 160)}`);
+      this.#emitEvent({ kind: "pageerror", tabId, entry, error: new Error(msg) });
       return;
     }
     if (method === "Network.requestWillBeSent" && typeof event.requestId === "string") {
@@ -650,19 +658,57 @@ export class BridgeBrowser {
     return state.notifications.splice(0, state.notifications.length);
   }
 
+  /** @param {(event: Record<string, unknown>) => void} listener @returns {() => void} */
+  addEventListener(listener) {
+    if (typeof listener !== "function") return () => {};
+    this.eventListeners.add(listener);
+    return () => {
+      this.eventListeners.delete(listener);
+    };
+  }
+
+  /** @param {Record<string, unknown>} event @returns {void} */
+  #emitEvent(event) {
+    if (this.eventListeners.size === 0) return;
+    for (const listener of [...this.eventListeners]) {
+      try {
+        listener(event);
+      } catch {
+        // Ignore user script listener failures.
+      }
+    }
+  }
+
   /** @param {string} method @param {Record<string, unknown>} [params] */
   #rpc(method, params = {}) {
     return this.request(method, { session_id: this.sessionId, turn_id: this.turnId, ...params });
   }
 
+  /** @param {number} tabId @param {string|null|undefined} sessionId @param {string} method @param {Record<string, unknown>} [params] */
+  async #executeCdpWithRetry(tabId, sessionId, method, params = {}) {
+    const target = sessionId ? { tabId, sessionId } : { tabId };
+    try {
+      return await this.#rpc("executeCdp", { target, method, commandParams: params });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (!/Debugger unattached/i.test(msg)) throw error;
+      this.attached.delete(tabId);
+      this.#clearTabCaches(tabId);
+      this.autoAttached.delete(tabId);
+      await this.attach(tabId);
+      if (sessionId) throw error;
+      return await this.#rpc("executeCdp", { target: { tabId }, method, commandParams: params });
+    }
+  }
+
   /** @param {number} tabId @param {string} method @param {Record<string, unknown>} [params] */
   #cdp(tabId, method, params = {}) {
-    return this.#rpc("executeCdp", { target: { tabId }, method, commandParams: params });
+    return this.#executeCdpWithRetry(tabId, null, method, params);
   }
 
   /** @param {number} tabId @param {string} sessionId @param {string} method @param {Record<string, unknown>} [params] */
   #cdpIn(tabId, sessionId, method, params = {}) {
-    return this.#rpc("executeCdp", { target: { tabId, sessionId }, method, commandParams: params });
+    return this.#executeCdpWithRetry(tabId, sessionId, method, params);
   }
 
   /** @param {number} tabId @param {string|null|undefined} sessionId @param {string} method @param {Record<string, unknown>} [params] */
@@ -860,15 +906,63 @@ export class BridgeBrowser {
   /** @param {number} tabId @returns {Promise<void>} */
   async attach(tabId) {
     if (this.attached.has(tabId)) return;
-    await this.#rpc("attach", { tabId });
-    this.attached.add(tabId);
-    this.axCache.delete(tabId);
-    this.enabledDomains.delete(tabId);
-    this.enablingDomains.delete(tabId);
-    this.frameRouteCache.delete(tabId);
-    this.#clearLocatorRuntime(tabId);
-    this.#tabState(tabId);
-    await this.#cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+    const inflight = this.attaching.get(tabId);
+    if (inflight) {
+      await inflight;
+      return;
+    }
+    const task = (async () => {
+      try {
+        await this.#rpc("attach", { tabId });
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (/Browser tab is unavailable to this session/i.test(msg)) {
+          this.ownedTabs.delete(tabId);
+          this.tabs.delete(tabId);
+          this.attached.delete(tabId);
+          this.#clearTabCaches(tabId);
+          if (this.activeTabId === tabId) this.activeTabId = this.ownedTabs.values().next().value ?? null;
+        }
+        throw error;
+      }
+      this.attached.add(tabId);
+      this.axCache.delete(tabId);
+      this.enabledDomains.delete(tabId);
+      this.enablingDomains.delete(tabId);
+      this.frameRouteCache.delete(tabId);
+      this.#clearLocatorRuntime(tabId);
+      this.#tabState(tabId);
+      await this.#cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+    })().finally(() => {
+      this.attaching.delete(tabId);
+    });
+    this.attaching.set(tabId, task);
+    await task;
+  }
+
+  /** @param {unknown} [tabId] @returns {Promise<void>} */
+  async enableRuntime(tabId) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    await this.#ensureDomain(id, "Runtime", "Runtime.enable", {}, true);
+  }
+
+  /** @param {unknown} [tabId] @param {{autoCreate?:boolean}} [options] @returns {Promise<number>} */
+  async #ensureAttachedTab(tabId, { autoCreate = false } = {}) {
+    const hasExplicit = tabId !== undefined && tabId !== null && tabId !== "";
+    const id = await this.#resolveTab(tabId, { autoCreate });
+    try {
+      await this.attach(id);
+      return id;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (autoCreate && !hasExplicit && /Browser tab is unavailable to this session/i.test(msg)) {
+        const fresh = await this.#resolveTab(undefined, { autoCreate: true });
+        await this.attach(fresh);
+        return fresh;
+      }
+      throw error;
+    }
   }
 
   /** @param {number} tabId @param {{network?:boolean}} [options] */
@@ -957,8 +1051,7 @@ export class BridgeBrowser {
 
   /** @param {string} url @param {unknown} [tabId] @param {{waitUntil?:string, timeoutMs?:number, trackNetwork?:boolean}} [options] */
   async goto(url, tabId, { waitUntil = "load", timeoutMs = DEFAULT_LOAD_TIMEOUT_MS, trackNetwork = false } = {}) {
-    const id = await this.#resolveTab(tabId, { autoCreate: true });
-    await this.attach(id);
+    const id = await this.#ensureAttachedTab(tabId, { autoCreate: true });
     const target = normalizeUrl(url);
     const needNetwork = waitUntil === "networkidle" || trackNetwork || process.env.BROWSER_USE_TRACK_NETWORK === "1";
     await this.#enableInspectionDomains(id, { network: needNetwork }).catch((err) => {
@@ -1167,8 +1260,7 @@ export class BridgeBrowser {
       allowUnindexedBaseline = false,
     } = options ?? {};
 
-    const id = await this.#resolveTab(tabId, { autoCreate: true });
-    await this.attach(id);
+    const id = await this.#ensureAttachedTab(tabId, { autoCreate: true });
 
     const tabState = this.#tabState(id);
     if (tabState.dialog) {
@@ -2596,6 +2688,25 @@ export class BridgeBrowser {
     return { tab_id: String(id), ok: true, action: "locator_click", selector, ...(frame ? { frame } : {}) };
   }
 
+  /** @param {string} selector @param {{tabId?:unknown, frame?:string, timeoutMs?:number}} [options] */
+  async locatorScrollIntoView(selector, { tabId, frame, timeoutMs } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const { result } = await this.#runLocatorWithAutoWait(id, selector, {
+      frame,
+      mutation: "scrollIntoView",
+      timeoutMs,
+    });
+    return {
+      tab_id: String(id),
+      ok: true,
+      action: "scroll_into_view",
+      selector,
+      ...(frame ? { frame } : {}),
+      ...(result?.box ? { box: result.box } : {}),
+    };
+  }
+
   /** @param {string} selector @param {string} value @param {{tabId?:unknown, frame?:string, force?:boolean, timeoutMs?:number, settle?:boolean}} [options] */
   async locatorFill(selector, value, { tabId, frame, force = false, timeoutMs, settle = false } = {}) {
     const id = await this.#resolveTab(tabId);
@@ -3081,26 +3192,94 @@ export class BridgeBrowser {
     };
   }
 
-  /** @param {{keep?:Array<{tab_id:unknown, mode?:string}>}} [options] */
-  async endTurn({ keep = [] } = {}) {
+  /** @param {Array<{tab_id:unknown, mode?:string, focus?:boolean}>} [entries] */
+  async markTabs(entries = []) {
+    const marked = [];
+    for (const entry of entries) {
+      const id = await this.#resolveTab(entry?.tab_id);
+      const mode = entry?.mode === "deliverable" ? "deliverable" : "handoff";
+      if (mode === "deliverable" && entry?.focus === true && this.attached.has(id)) {
+        await this.#cdp(id, "Page.bringToFront").catch(() => {});
+      }
+      await this.#rpc("markTab", {
+        tabId: id,
+        status: mode,
+        ...(entry?.focus === true ? { focus: true } : {}),
+      });
+      marked.push({ tab_id: String(id), mode });
+    }
+    return marked;
+  }
+
+  /** @param {{keep?:Array<{tab_id:unknown, mode?:string, focus?:boolean}>, ungroup?:boolean}} [options] */
+  async endTurn({ keep = [], ungroup = false } = {}) {
+    const handoffIds = new Set();
     for (const entry of keep) {
       const id = await this.#resolveTab(entry?.tab_id);
       const mode = entry?.mode === "deliverable" ? "deliverable" : "handoff";
-      if (mode === "deliverable" && this.attached.has(id)) {
+      if (mode === "handoff") handoffIds.add(id);
+      if (mode === "deliverable" && entry?.focus === true && this.attached.has(id)) {
         await this.#cdp(id, "Page.bringToFront").catch(() => {});
       }
-      await this.#rpc("markTab", { tabId: id, status: mode });
+      await this.#rpc("markTab", {
+        tabId: id,
+        status: mode,
+        ...(entry?.focus === true ? { focus: true } : {}),
+      });
     }
-    await this.#rpc("turnEnded");
+    await this.#rpc("turnEnded", { ...(ungroup === true ? { ungroup: true } : {}) });
+    if (ungroup === true) {
+      this.sessionName = null;
+    }
     this.turnId = randomUUID();
+    this.attached.clear();
+    this.attaching.clear();
     this.axCache.clear();
     this.enabledDomains.clear();
+    this.enablingDomains.clear();
+    this.enabledChildAxSessions.clear();
+    this.frameRouteCache.clear();
     this.lastAxSnapshots.clear();
     this.frameSessions.clear();
     this.autoAttached.clear();
     this.locatorRuntimeInstalled.clear();
     this.statelessEvalTabs.clear();
-    return { ok: true, ended: true, nextTurnId: this.turnId };
+    for (const id of [...this.ownedTabs]) {
+      if (!handoffIds.has(id)) {
+        this.ownedTabs.delete(id);
+        this.tabs.delete(id);
+        this.tabStates.delete(id);
+      }
+    }
+    if (this.activeTabId !== null && !this.ownedTabs.has(this.activeTabId)) {
+      this.activeTabId = this.ownedTabs.values().next().value ?? null;
+    }
+    return { ok: true, ended: true, ...(ungroup === true ? { ungrouped: true } : {}), nextTurnId: this.turnId };
+  }
+
+  /** @returns {Promise<Array<Record<string,unknown>>>} */
+  async listTabGroups() {
+    this.#assertOpen();
+    const res = await this.#rpc("listTabGroups");
+    return Array.isArray(res) ? res : [];
+  }
+
+  /** @param {Array<unknown>} [tabIds] @returns {Promise<Record<string,unknown>>} */
+  async ungroupTabs(tabIds) {
+    this.#assertOpen();
+    return await this.#rpc("ungroupTabs", {
+      ...(Array.isArray(tabIds) ? { tabIds: tabIds.map(Number).filter(Number.isSafeInteger) } : {}),
+    });
+  }
+
+  /** @param {{ungroupFinished?:boolean, closeDuplicateDeliverables?:boolean, keepTabIds?:Array<unknown>}} [options] @returns {Promise<Record<string,unknown>>} */
+  async cleanupGroups(options = {}) {
+    this.#assertOpen();
+    return await this.#rpc("cleanupGroups", {
+      ungroupFinished: options?.ungroupFinished === true,
+      closeDuplicateDeliverables: options?.closeDuplicateDeliverables !== false,
+      ...(Array.isArray(options?.keepTabIds) ? { keepTabIds: options.keepTabIds.map(Number).filter(Number.isSafeInteger) } : {}),
+    });
   }
 
   async close() {

@@ -511,7 +511,7 @@ const SHARED_LOCATOR_RESOLVER = `
   };
 `;
 
-export const LOCATOR_RUNTIME_VERSION = 3;
+export const LOCATOR_RUNTIME_VERSION = 4;
 
 const SHARED_RUNNER_CORE = `
   const isDisabledEl = (el) => !!(el.matches?.(":disabled") || el.getAttribute?.("aria-disabled") === "true");
@@ -683,6 +683,16 @@ const SHARED_RUNNER_CORE = `
         element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
         element.focus();
         return { count: 1, focused: true, ...cursorPt(element) };
+      }
+      if (mutation === "scrollIntoView") {
+        element.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+        const rect = element.getBoundingClientRect();
+        return {
+          count: 1,
+          scrolled: true,
+          box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          ...cursorPt(element),
+        };
       }
       if (mutation === "check" || mutation === "uncheck") {
         if (!force && !isVisibleEl(element)) return fail("Locator matched a hidden element: " + raw, "not_visible", true);

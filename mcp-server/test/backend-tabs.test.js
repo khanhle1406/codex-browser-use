@@ -447,3 +447,62 @@ test("navigateTab validates schemes and delegates owned tabs to the driver", asy
     second.abort();
   }
 });
+
+test("session groupId persists across turns for deliverable tabs and turnEnded({ ungroup: true }) dissolves the group cleanly", async () => {
+  let nextId = 1;
+  let nextGroup = 90;
+  const grouped = [];
+  const ungrouped = [];
+  const tabs = new Map();
+  const ac1 = new AbortController();
+  const s1 = { session_id: "persist-sess", turn_id: "turn-1" };
+  const s2 = { session_id: "persist-sess", turn_id: "turn-2" };
+
+  const handlers = createTabHandlers({
+    async createBlankTab() {
+      const tab = { id: nextId++, url: "about:blank", title: "Preview" };
+      tabs.set(tab.id, tab);
+      return tab;
+    },
+    async readTab(id) { return tabs.get(id) ?? null; },
+    async closeTab(id) { tabs.delete(id); },
+    async releaseTab() {},
+    async markTab() {},
+    async groupTabs(tabIds, opts) {
+      const gid = opts.groupId ?? nextGroup++;
+      grouped.push({ tabIds, title: opts.title, groupId: gid, sessionId: opts.sessionId });
+      return { groupId: gid, supported: true };
+    },
+    async ungroupTabs(tabIds) {
+      ungrouped.push([...tabIds]);
+      return { ok: true, ungrouped: tabIds.length, supported: true };
+    },
+  }, { name: "Persist group fixture", version: "0.6.3" });
+
+  try {
+    handlers.get("getInfo")(s1, ac1.signal, () => undefined);
+    await handlers.get("nameSession")({ ...s1, name: "Preview QA", color: "blue" }, ac1.signal);
+    const t1 = await handlers.get("createTab")(s1, ac1.signal);
+    await handlers.get("markTab")({ ...s1, tabId: t1.id, status: "deliverable", focus: true }, ac1.signal);
+    await handlers.get("turnEnded")(s1, ac1.signal);
+    assert.equal(ungrouped.length, 0);
+
+    // Turn 2 on the same session reuses exact same groupId 90!
+    const t2 = await handlers.get("createTab")(s2, ac1.signal);
+    assert.equal(grouped.at(-1).groupId, 90);
+    assert.equal(grouped.at(-1).sessionId, "persist-sess");
+    assert.equal(nextGroup, 91);
+
+    // Marking t2 deliverable and passing ungroup: true dissolves group and resets groupId
+    await handlers.get("markTab")({ ...s2, tabId: t2.id, status: "deliverable" }, ac1.signal);
+    await handlers.get("turnEnded")({ ...s2, ungroup: true }, ac1.signal);
+    assert.deepEqual(ungrouped, [[t2.id]]);
+
+    // Turn 3 creates a fresh groupId 91 now that the previous group was dissolved
+    const s3 = { session_id: "persist-sess", turn_id: "turn-3" };
+    await handlers.get("createTab")(s3, ac1.signal);
+    assert.equal(grouped.at(-1).groupId, 91);
+  } finally {
+    ac1.abort();
+  }
+});

@@ -13,6 +13,7 @@ const tabGroupColorEnum = z.enum(["grey", "blue", "red", "yellow", "green", "pin
 const keepEntrySchema = z.object({
   tab_id: stringOrNumber,
   mode: z.enum(["handoff", "deliverable"]).optional(),
+  focus: z.boolean().optional(),
 });
 const keepParamSchema = z.union([
   z.enum(["handoff", "deliverable"]),
@@ -21,29 +22,44 @@ const keepParamSchema = z.union([
 
 /**
  * Normalize inline `keep` parameter + script-tracked kept tabs into unique keep entries.
- * @param {"handoff"|"deliverable"|Array<{tab_id:unknown, mode?:string}>|undefined} keep
+ * @param {"handoff"|"deliverable"|Array<{tab_id:unknown, mode?:string, focus?:boolean}>|undefined} keep
  * @param {unknown} fallbackTabId
- * @param {Array<{tab_id:unknown, mode?:string}>} [extraKept]
+ * @param {Array<{tab_id:unknown, mode?:string, focus?:boolean}>} [extraKept]
  */
 function resolveKeepEntries(keep, fallbackTabId, extraKept = []) {
   const merged = new Map();
   for (const entry of extraKept) {
     if (entry?.tab_id != null) {
-      merged.set(String(entry.tab_id), entry.mode === "deliverable" ? "deliverable" : "handoff");
+      merged.set(String(entry.tab_id), {
+        mode: entry.mode === "deliverable" ? "deliverable" : "handoff",
+        ...(entry.focus === true ? { focus: true } : {}),
+      });
     }
   }
   if (typeof keep === "string") {
     if (fallbackTabId != null && fallbackTabId !== "") {
-      merged.set(String(fallbackTabId), keep);
+      const prev = merged.get(String(fallbackTabId));
+      merged.set(String(fallbackTabId), {
+        mode: keep,
+        ...(prev?.focus === true ? { focus: true } : {}),
+      });
     }
   } else if (Array.isArray(keep)) {
     for (const entry of keep) {
       if (entry?.tab_id != null) {
-        merged.set(String(entry.tab_id), entry.mode === "deliverable" ? "deliverable" : "handoff");
+        const prev = merged.get(String(entry.tab_id));
+        merged.set(String(entry.tab_id), {
+          mode: entry.mode === "deliverable" ? "deliverable" : "handoff",
+          ...(entry.focus === true || (entry.focus === undefined && prev?.focus === true) ? { focus: true } : {}),
+        });
       }
     }
   }
-  return [...merged.entries()].map(([tab_id, mode]) => ({ tab_id, mode }));
+  return [...merged.entries()].map(([tab_id, cfg]) => ({
+    tab_id,
+    mode: cfg.mode,
+    ...(cfg.focus === true ? { focus: true } : {}),
+  }));
 }
 
 /**
@@ -321,17 +337,18 @@ export function registerTools(server, deps = {}) {
     "browser_run",
     "Execute an async JavaScript browser script with persistent session bindings (`browser`/`page`, `ariaSnapshot()`, `ax.write()`, `content.export()`, read-only `evaluate`, `viewImage`, `saveFile`, `readFile`, `saveScreenshot`, `dev.responseBody`, `tabs.content`, `markDeliverable`) and optional `end_turn`.",
     {
-      code: z.string().min(1).describe("Async JavaScript body with `browser`/`page`, `log`, `sleep`, `viewImage`, `saveFile`, `readFile`, `saveScreenshot` in scope"),
+      code: z.string().min(1).describe("Async JS body with browser/page, log, sleep, saveFile, saveScreenshot"),
       tab_id: stringOrNumber.optional().describe("Optional initial tab_id"),
       timeout_ms: z.number().int().min(500).max(300_000).optional().describe("Timeout ms (default 45000, max 300000)"),
       return_state: returnStateEnum.optional().describe("Post-script state (default diff if result undefined, else none)"),
-      mode: axModeEnum.optional().describe("AX compression mode: compact (default), full, or interactive"),
-      end_turn: z.boolean().optional().describe("End turn automatically after script succeeds"),
+      mode: axModeEnum.optional().describe("AX mode: compact (default), full, or interactive"),
+      end_turn: z.boolean().optional().describe("End turn after script succeeds"),
       keep: keepParamSchema.optional().describe('Keep mode ("handoff" | "deliverable") or [{ tab_id, mode }]'),
+      ungroup: z.boolean().optional().describe("Ungroup tabs on finish"),
       max_lines: z.number().int().min(1).max(10_000).optional().describe("Max AX lines (default 1500)"),
-      reset_context: z.boolean().optional().describe("Reset persisted VM variables"),
+      reset_context: z.boolean().optional().describe("Reset persisted variables"),
     },
-    async ({ code, tab_id, timeout_ms, return_state, mode, end_turn, keep, max_lines, reset_context }) => {
+    async ({ code, tab_id, timeout_ms, return_state, mode, end_turn, keep, ungroup, max_lines, reset_context }) => {
       let browser = null;
       let run = null;
       try {
@@ -342,7 +359,7 @@ export function registerTools(server, deps = {}) {
           timeoutMs: timeout_ms ?? 45_000,
         });
 
-        const shouldEndTurn = end_turn === true || keep !== undefined || (end_turn !== false && (run.keptTabs.length > 0 || run.endTurnRequested));
+        const shouldEndTurn = end_turn === true || (end_turn !== false && (keep !== undefined || run.keptTabs.length > 0 || run.endTurnRequested));
         const effectiveReturnState = return_state ?? (!shouldEndTurn && run.value === undefined ? "diff" : "none");
 
         let state = null;
@@ -366,7 +383,14 @@ export function registerTools(server, deps = {}) {
         let endTurnResult = null;
         if (shouldEndTurn) {
           const entries = resolveKeepEntries(keep, run.activeTabId, run.keptTabs);
-          endTurnResult = await browser.endTurn({ keep: entries });
+          endTurnResult = await browser.endTurn({
+            keep: entries,
+            ungroup: ungroup === true || run.ungroupOnEndTurn === true,
+          });
+          scriptSession.syncActiveTab(browser);
+        } else if (keep !== undefined || run.keptTabs.length > 0) {
+          const entries = resolveKeepEntries(keep, run.activeTabId, run.keptTabs);
+          await browser.markTabs(entries).catch(() => {});
         }
 
         const mergedNotifications = [...new Set([...(run.notifications ?? []), ...(state?.notifications ?? [])])];
@@ -423,8 +447,9 @@ export function registerTools(server, deps = {}) {
       stop_on_error: z.boolean().optional().describe("Stop on first error (default true)"),
       end_turn: z.boolean().optional().describe("End turn after all steps succeed"),
       keep: keepParamSchema.optional().describe('Keep mode ("handoff"|"deliverable") or [{ tab_id, mode }]'),
+      ungroup: z.boolean().optional().describe("Ungroup tabs on finish"),
     },
-    guarded(async ({ steps, tab_id, return_state, mode, max_lines, stop_on_error, end_turn, keep }) => {
+    guarded(async ({ steps, tab_id, return_state, mode, max_lines, stop_on_error, end_turn, keep, ungroup }) => {
       const browser = await getBrowser();
       const result = await browser.batch(steps, {
         tabId: tab_id,
@@ -434,9 +459,17 @@ export function registerTools(server, deps = {}) {
         stopOnError: stop_on_error !== false,
       });
       let endTurnResult = null;
-      if (result.ok && (end_turn === true || keep !== undefined)) {
+      const shouldEndTurn = result.ok && (end_turn === true || (end_turn !== false && keep !== undefined));
+      if (shouldEndTurn) {
         const fallbackTab = result.state?.tab_id ?? tab_id ?? browser.activeTabId;
-        endTurnResult = await browser.endTurn({ keep: resolveKeepEntries(keep, fallbackTab) });
+        endTurnResult = await browser.endTurn({
+          keep: resolveKeepEntries(keep, fallbackTab),
+          ungroup: ungroup === true,
+        });
+        scriptSession.syncActiveTab(browser);
+      } else if (result.ok && keep !== undefined) {
+        const fallbackTab = result.state?.tab_id ?? tab_id ?? browser.activeTabId;
+        await browser.markTabs(resolveKeepEntries(keep, fallbackTab)).catch(() => {});
       }
       const summary = {
         ok: result.ok,
@@ -455,7 +488,7 @@ export function registerTools(server, deps = {}) {
 
   registerTool(
     "browser_list_tabs",
-    "List all controllable Chrome tabs (both tabs created by this session and existing open user tabs) with tab_id, title, url, active state, owned flag, and origin ('agent' | 'user').",
+    "List Chrome tabs (session + open user tabs) with tab_id, title, url, active, owned, and origin ('agent' | 'user').",
     {},
     guarded(async () => text(await (await getBrowser()).listTabs())),
   );
@@ -1017,14 +1050,17 @@ export function registerTools(server, deps = {}) {
 
   registerTool(
     "browser_end_turn",
-    "End the agent turn. Tabs marked as handoff stay available next turn, deliverable tabs stay open, and unmarked tabs close.",
+    "End agent turn: keep handoff/deliverable tabs open and close unmarked tabs.",
     {
-      keep: z.array(z.object({
-        tab_id: stringOrNumber,
-        mode: z.enum(["handoff", "deliverable"]).optional(),
-      })).optional().describe("Tabs to keep through cleanup"),
+      keep: z.array(keepEntrySchema).optional().describe("Kept tabs"),
+      ungroup: z.boolean().optional().describe("Ungroup tabs on finish"),
     },
-    guarded(async ({ keep }) => text(await (await getBrowser()).endTurn({ keep: keep ?? [] }))),
+    guarded(async ({ keep, ungroup }) => {
+      const browser = await getBrowser();
+      const res = await browser.endTurn({ keep: keep ?? [], ungroup: ungroup === true });
+      scriptSession.syncActiveTab(browser);
+      return text(res);
+    }),
   );
 
   registerTool(
@@ -1047,13 +1083,14 @@ export function registerTools(server, deps = {}) {
 export function createStandaloneServer(deps = {}) {
   const profile = deps.profile ?? resolveToolProfile();
   const server = new McpServer(
-    { name: "browser-use", version: "4.8.0" },
+    { name: "browser-use", version: "4.8.1" },
     {
       instructions: [
         "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.tabs.read()` / `browser.user.claimTab()` in `browser_run`). Claimed user tabs join the session Chrome Tab Group and are released (kept open & grouped) when a turn ends.",
-        "Speed & efficiency (Probe 1 -> Batch Loop All): When facing repetitive UI rows/modals/pages, inspect 1 sample item first, then pack the full loop (clicks, chunked reads, `saveFile()`, pagination) or known deterministic click sequence into ONE `browser_run` call (up to 300000ms) instead of repeating small calls. Includes persistent variables (`const`/`let`/`class`), bound tabs (`browser.tabs.new()` / `browser.tabs.get(id)` / parallel `browser.tabs.content(urls)` returning structured `.links`/`.tables`), `browser.nameSession()`, auto-waiting locators (including async CKEditor sync), `locator.screenshot()` / `saveScreenshot()`, `dev.enableNetwork({ captureBodies: true })` + `dev.responseBody(id)`, `markDeliverable`/`markHandoff`, and `browser.endTurn()`/`browser.end_turn()`.",
+        "Tab & Group Hygiene: Use 1 concise task name via `browser.nameSession()` for an entire workflow so tabs across turns consolidate into 1 Chrome Tab Group (avoid spawning separate groups per turn). Before opening a new tab (`tabs.new(url)`), check `browser.user.openTabs()` / `tabs.list()` and reuse an existing tab for the same URL. Close ephemeral tabs with `keep: []` and pass `ungroup: true` when finishing if kept tabs no longer need a group label.",
+        "Speed & efficiency (Probe 1 -> Batch Loop All): When facing repetitive UI rows/modals/pages, inspect 1 sample item first, then pack the full loop (clicks, chunked reads, `saveFile()`, pagination) or known deterministic click sequence into ONE `browser_run` call (up to 300000ms) instead of repeating small calls. Includes persistent variables (`const`/`let`/`class`), bound tabs (`browser.tabs.new()` / `browser.tabs.get(id)` / parallel `browser.tabs.content(urls)` returning structured `.links`/`.tables`), `browser.nameSession()`, `browser.groups`, auto-waiting locators (including async CKEditor sync), `locator.screenshot()` / `saveScreenshot()`, `dev.enableNetwork({ captureBodies: true })` + `dev.responseBody(id)`, `markDeliverable`/`markHandoff`, and `browser.endTurn()`/`browser.end_turn()`.",
         "Diff-first & inspect-first: Start with `ariaSnapshot({ mode: \"compact\" })` or `browser_get_state` / `ax.write()` before guessing selectors; narrow multi-matches with `.first()`/`.nth(i)` and use `reload()` rather than `goto(sameUrl)`. Request `screenshot: true` / `ax.write('screenshot')` / `saveScreenshot(..., { emit: true })` when visual inspection or Proof of Work is needed.",
-        "Pass end_turn/keep to browser_run or browser_batch (or call `browser.endTurn()`/`markDeliverable()` inside `browser_run`), `browser_name_session` / `browser.nameSession()` to group tabs visually, and `browser_end_turn` at the end for tabs that must survive cleanup.",
+        "Pass end_turn/keep/ungroup to browser_run or browser_batch (or call `browser.endTurn()`/`markDeliverable()` inside `browser_run`), `browser_name_session` / `browser.nameSession()` to group tabs visually, and `browser_end_turn` at the end for tabs that must survive cleanup.",
       ].join("\n"),
     },
   );

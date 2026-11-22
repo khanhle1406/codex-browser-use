@@ -14,7 +14,7 @@ const maxUnacknowledged = 128;
  * @param {import("node:stream").Readable} input
  * @param {import("node:stream").Writable} output
  * @param {{timeoutMs?:number}} [options]
- * @returns {{createBlankTab:()=>Promise<BrowserTab>,readTab:(id:number)=>Promise<BrowserTab|null>,closeTab:(id:number)=>Promise<void>,releaseTab?:(id:number)=>Promise<void>,attach:(id:number)=>Promise<void>,detach:(id:number)=>Promise<void>,execute:(id:number,method:string,params:Params,childSession?:string)=>Promise<unknown>,navigate:(id:number,url:string)=>Promise<void>,watchDownloads:(id:number)=>Promise<void>,unwatchDownloads:(id:number)=>Promise<void>,groupTabs:(tabIds:number[],groupOptions?:{title?:string,color?:string,groupId?:number|null})=>Promise<{groupId:number|null,supported?:boolean}>,onEvent:(listener:EventListener)=>void,closed:Promise<Error>,close:()=>void}}
+ * @returns {{createBlankTab:()=>Promise<BrowserTab>,readTab:(id:number)=>Promise<BrowserTab|null>,closeTab:(id:number)=>Promise<void>,releaseTab?:(id:number)=>Promise<void>,markTab?:(id:number,status:string,markOptions?:{focus?:boolean})=>Promise<void>,attach:(id:number)=>Promise<void>,detach:(id:number)=>Promise<void>,execute:(id:number,method:string,params:Params,childSession?:string)=>Promise<unknown>,navigate:(id:number,url:string)=>Promise<void>,watchDownloads:(id:number)=>Promise<void>,unwatchDownloads:(id:number)=>Promise<void>,groupTabs:(tabIds:number[],groupOptions?:{title?:string,color?:string,groupId?:number|null,sessionId?:string,collapsed?:boolean})=>Promise<{groupId:number|null,supported?:boolean}>,ungroupTabs?:(tabIds:number[])=>Promise<{ok?:boolean,ungrouped?:number,supported?:boolean}>,listTabGroups?:()=>Promise<Array<Record<string,unknown>>>,cleanupGroups?:(cleanupOptions?:{ungroupFinished?:boolean,closeDuplicateDeliverables?:boolean,keepTabIds?:number[]})=>Promise<Record<string,unknown>>,onEvent:(listener:EventListener)=>void,closed:Promise<Error>,close:()=>void}}
  */
 export function createNativeTabDriver(input, output, options = {}) {
   /** @type {Map<number,{resolve:(result:unknown)=>void,reject:(error:Error)=>void,timer:ReturnType<typeof setTimeout>,parts:string[]}>} */
@@ -171,8 +171,10 @@ export function createNativeTabDriver(input, output, options = {}) {
     async closeTab(id) { await request("closeTab", id); },
     /** @param {number} id @returns {Promise<void>} */
     async releaseTab(id) { await request("releaseTab", id); },
-    /** @param {number} id @param {string} status @returns {Promise<void>} */
-    async markTab(id, status) { await request("markTab", id, {status}); },
+    /** @param {number} id @param {string} status @param {{focus?:boolean}} [markOptions] @returns {Promise<void>} */
+    async markTab(id, status, markOptions = {}) {
+      await request("markTab", id, {status, ...(markOptions?.focus === true ? {focus: true} : {})});
+    },
     /** @param {number} id @param {number} x @param {number} y @param {boolean} [waitForArrival] @returns {Promise<void>} */
     async moveCursor(id, x, y, waitForArrival = true) {
       await request("moveCursor", id, {x, y, waitForArrival});
@@ -189,14 +191,29 @@ export function createNativeTabDriver(input, output, options = {}) {
     async watchDownloads(id) { await request("watchDownloads", id); },
     /** @param {number} id @returns {Promise<void>} */
     async unwatchDownloads(id) { await request("unwatchDownloads", id); },
-    /** @param {number[]} tabIds @param {{title?:string,color?:string,groupId?:number|null}} [groupOptions] @returns {Promise<{groupId:number|null,supported?:boolean}>} */
+    /** @param {number[]} tabIds @param {{title?:string,color?:string,groupId?:number|null,sessionId?:string,collapsed?:boolean}} [groupOptions] @returns {Promise<{groupId:number|null,supported?:boolean}>} */
     async groupTabs(tabIds, groupOptions = {}) {
       return await request("groupTabs", undefined, {
         tabIds,
         title: groupOptions.title,
         color: groupOptions.color,
         groupId: groupOptions.groupId ?? null,
+        ...(typeof groupOptions.sessionId === "string" ? {sessionId: groupOptions.sessionId} : {}),
+        ...(typeof groupOptions.collapsed === "boolean" ? {collapsed: groupOptions.collapsed} : {}),
       });
+    },
+    /** @param {number[]} tabIds @returns {Promise<{ok?:boolean,ungrouped?:number,supported?:boolean}>} */
+    async ungroupTabs(tabIds) {
+      return await request("ungroupTabs", undefined, {tabIds});
+    },
+    /** @returns {Promise<Array<Record<string,unknown>>>} */
+    async listTabGroups() {
+      const value = await request("listTabGroups");
+      return Array.isArray(value) ? value : [];
+    },
+    /** @param {{ungroupFinished?:boolean,closeDuplicateDeliverables?:boolean,keepTabIds?:number[]}} [cleanupOptions] @returns {Promise<Record<string,unknown>>} */
+    async cleanupGroups(cleanupOptions = {}) {
+      return await request("cleanupGroups", undefined, cleanupOptions);
     },
     /** @param {EventListener} listener @returns {void} */
     onEvent(listener) { onEvent = listener; },

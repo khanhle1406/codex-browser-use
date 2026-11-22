@@ -29,10 +29,29 @@ let manualDisconnect = false;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 
-/** @param {chrome.tabs.Tab} tab @returns {{id:number,url?:string,title?:string,active:boolean}} */
+/** @param {chrome.tabs.Tab} tab @returns {{id:number,url?:string,title?:string,active:boolean,windowId?:number,groupId?:number}} */
 function serializeTab(tab) {
   if (!Number.isSafeInteger(tab?.id)) throw new Error("Chrome returned a tab without an ID");
-  return {id: tab.id, url: tab.url, title: tab.title, active: Boolean(tab.active)};
+  return {
+    id: tab.id,
+    url: tab.url,
+    title: tab.title,
+    active: Boolean(tab.active),
+    ...(Number.isSafeInteger(tab.windowId) ? {windowId: tab.windowId} : {}),
+    ...(Number.isSafeInteger(tab.groupId) && tab.groupId >= 0 ? {groupId: tab.groupId} : {}),
+  };
+}
+
+/** @param {string|undefined} rawUrl @returns {string|null} */
+function normalizeComparableUrl(rawUrl) {
+  if (typeof rawUrl !== "string" || !rawUrl) return null;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return `${parsed.origin}${parsed.pathname.replace(/\/+$/u, "")}${parsed.search}`;
+  } catch {
+    return null;
+  }
 }
 
 /** @param {string|undefined} url @returns {boolean} */
@@ -167,6 +186,12 @@ function connect() {
   const userOwned = new Set();
   /** @type {Set<number>} */
   const attached = new Set();
+  /** @type {Set<number>} */
+  const agentGroups = new Set();
+  /** @type {Map<string, number>} */
+  const sessionGroups = new Map();
+  /** @type {Map<number, {url:string|null,groupId:number|null,createdAt:number}>} */
+  const deliveredAgentTabs = new Map();
   /** @type {Map<number, Map<string,{parentId:string|null,targetId:string}>>} */
   const frames = new Map();
   /** @type {Map<number, {startedAt:number}>} */
@@ -191,6 +216,25 @@ function connect() {
   let cursorMode = "fast";
   let moveSeq = 0;
   let disconnected = false;
+  /** @type {Map<number, {current:{tabId:number,wasUserTab:boolean}|null, previous:{tabId:number,wasUserTab:boolean}|null}>} */
+  const windowActiveHistory = new Map();
+  /** @type {Set<number>} */
+  const restoringFocus = new Set();
+
+  if (typeof chrome.tabs?.query === "function") {
+    void Promise.resolve(chrome.tabs.query({active: true})).then((tabs) => {
+      if (disconnected || !Array.isArray(tabs)) return;
+      for (const tab of tabs) {
+        if (!Number.isSafeInteger(tab?.id) || !Number.isSafeInteger(tab?.windowId)) continue;
+        if (!windowActiveHistory.has(tab.windowId)) {
+          windowActiveHistory.set(tab.windowId, {
+            current: {tabId: tab.id, wasUserTab: !owned.has(tab.id)},
+            previous: null,
+          });
+        }
+      }
+    }).catch(() => {});
+  }
 
   /**
    * @template T
@@ -519,9 +563,20 @@ function connect() {
     }
   }
 
-  /** @param {{tabId:number}} activeInfo */
+  /** @param {{tabId:number, windowId?:number}} activeInfo */
   function onTabActivated(activeInfo) {
     const tabId = activeInfo?.tabId;
+    if (Number.isSafeInteger(tabId) && Number.isSafeInteger(activeInfo?.windowId)) {
+      const hist = windowActiveHistory.get(activeInfo.windowId) ?? {current: null, previous: null};
+      if (hist.current?.tabId !== tabId) {
+        windowActiveHistory.set(activeInfo.windowId, {
+          current: {tabId, wasUserTab: !owned.has(tabId)},
+          previous: hist.current,
+        });
+      } else {
+        hist.current.wasUserTab = !owned.has(tabId);
+      }
+    }
     if (!Number.isSafeInteger(tabId) || attached.has(tabId)) return;
     const badge = badgeStates.get(tabId);
     if (badge === "deliverable" || badge === "handoff") {
@@ -534,6 +589,7 @@ function connect() {
     owned.delete(id);
     userOwned.delete(id);
     attached.delete(id);
+    deliveredAgentTabs.delete(id);
     frames.delete(id);
     downloadWatchers.delete(id);
     cursorStates.delete(id);
@@ -541,7 +597,21 @@ function connect() {
     faviconCache.delete(id);
     preparingContentScripts.delete(id);
     contentScriptReadyTabs.delete(id);
+    restoringFocus.delete(id);
+    for (const hist of windowActiveHistory.values()) {
+      if (hist.current?.tabId === id) hist.current = null;
+      if (hist.previous?.tabId === id) hist.previous = null;
+    }
   };
+
+  /** @param {chrome.tabGroups.TabGroup} group @returns {void} */
+  function onTabGroupRemoved(group) {
+    if (disconnected || !Number.isSafeInteger(group?.id)) return;
+    agentGroups.delete(group.id);
+    for (const [sid, gid] of sessionGroups) {
+      if (gid === group.id) sessionGroups.delete(sid);
+    }
+  }
   /** @param {chrome.tabs.Tab} tab @returns {void} */
   function onTabCreated(tab) {
     if (disconnected || !Number.isSafeInteger(tab?.id) || !Number.isSafeInteger(tab?.openerTabId)) return;
@@ -549,6 +619,17 @@ function connect() {
     const candidateUrl = tab.url || tab.pendingUrl || "";
     if (!isControllableTabUrl(candidateUrl)) return;
     owned.add(tab.id);
+    if (tab.active === true && Number.isSafeInteger(tab.windowId) &&
+        typeof chrome.tabs?.update === "function" && !restoringFocus.has(tab.id)) {
+      const hist = windowActiveHistory.get(tab.windowId);
+      const candidate = hist?.current?.tabId === tab.id ? hist?.previous : hist?.current;
+      if (candidate && candidate.tabId !== tab.id && candidate.wasUserTab && !owned.has(candidate.tabId)) {
+        restoringFocus.add(tab.id);
+        void Promise.resolve(chrome.tabs.update(candidate.tabId, {active: true}))
+          .catch(() => {})
+          .finally(() => restoringFocus.delete(tab.id));
+      }
+    }
     port.postMessage({
       event: "onTabCreated",
       tabId: tab.openerTabId,
@@ -560,13 +641,31 @@ function connect() {
   chrome.tabs.onCreated?.addListener(onTabCreated);
   chrome.tabs.onUpdated?.addListener(onTabUpdated);
   chrome.tabs.onActivated?.addListener(onTabActivated);
+  chrome.tabGroups?.onRemoved?.addListener(onTabGroupRemoved);
   chrome.runtime.onMessage?.addListener(onRuntimeMessage);
 
-  /** @param {{method:string,tabId?:number,details?:{method:string,params:object,childSession?:string,url?:string,tabIds?:number[],title?:string,color?:string,groupId?:number|null,status?:string,x?:number,y?:number,waitForArrival?:boolean}}} request @returns {Promise<unknown>} */
+  /** @param {number} gid @param {number|null} targetWindowId @returns {Promise<chrome.tabGroups.TabGroup|null>} */
+  async function getAliveGroup(gid, targetWindowId) {
+    if (!Number.isSafeInteger(gid) || gid < 0) return null;
+    if (typeof chrome.tabGroups?.get === "function") {
+      const g = await chrome.tabGroups.get(gid).catch(() => null);
+      if (!g) return null;
+      if (targetWindowId !== null && Number.isSafeInteger(g.windowId) && g.windowId !== targetWindowId) return null;
+      return g;
+    }
+    return {id: gid, collapsed: false};
+  }
+
+  /** @param {{method:string,tabId?:number,details?:{method:string,params:object,childSession?:string,url?:string,tabIds?:number[],title?:string,color?:string,groupId?:number|null,sessionId?:string,collapsed?:boolean,focus?:boolean,ungroupFinished?:boolean,closeDuplicateDeliverables?:boolean,keepTabIds?:number[],status?:string,x?:number,y?:number,waitForArrival?:boolean}}} request @returns {Promise<unknown>} */
   async function handle({method, tabId, details}) {
     if (disconnected) throw new Error("Chrome bridge is disconnected");
     if (method === "createBlankTab") {
-      const tab = serializeTab(await chrome.tabs.create({url: "about:blank", active: false}));
+      let createOpts = {url: "about:blank", active: false};
+      if (typeof chrome.windows?.getLastFocused === "function") {
+        const win = await chrome.windows.getLastFocused({windowTypes: ["normal"]}).catch(() => null);
+        if (Number.isSafeInteger(win?.id)) createOpts = {...createOpts, windowId: win.id};
+      }
+      const tab = serializeTab(await chrome.tabs.create(createOpts));
       if (disconnected) {
         await chrome.tabs.remove(tab.id);
         throw new Error("Chrome bridge disconnected during tab creation");
@@ -675,25 +774,150 @@ function connect() {
       const title = typeof details?.title === "string" ? details.title.trim().slice(0, 80) : "";
       const color = TAB_GROUP_COLORS.has(details?.color) ? details.color : undefined;
       const requestedGroupId = Number.isSafeInteger(details?.groupId) ? details.groupId : null;
-      let groupId;
+      const sessionId = typeof details?.sessionId === "string" ? details.sessionId : null;
+
+      let targetWindowId = null;
+      if (typeof chrome.tabs?.get === "function") {
+        const firstTab = await chrome.tabs.get(tabIds[0]).catch(() => null);
+        if (Number.isSafeInteger(firstTab?.windowId)) targetWindowId = firstTab.windowId;
+      }
+
+      let existingGroup = null;
       if (requestedGroupId !== null) {
+        existingGroup = await getAliveGroup(requestedGroupId, targetWindowId);
+      }
+      if (!existingGroup && sessionId && sessionGroups.has(sessionId)) {
+        existingGroup = await getAliveGroup(sessionGroups.get(sessionId), targetWindowId);
+        if (!existingGroup) sessionGroups.delete(sessionId);
+      }
+      if (!existingGroup && title && typeof chrome.tabGroups?.query === "function") {
+        const groups = await chrome.tabGroups.query(targetWindowId !== null ? {windowId: targetWindowId} : {}).catch(() => []);
+        const want = title.toLowerCase();
+        for (const g of Array.isArray(groups) ? groups : []) {
+          if ((g?.title || "").trim().toLowerCase() !== want) continue;
+          const reservedByOther = [...sessionGroups.entries()].some(([sid, gid]) => gid === g.id && sid !== sessionId);
+          if (!reservedByOther) {
+            existingGroup = g;
+            break;
+          }
+        }
+      }
+
+      const targetGroupId = existingGroup ? existingGroup.id : null;
+      let groupId;
+      if (targetGroupId !== null) {
         try {
-          groupId = await chrome.tabs.group({groupId: requestedGroupId, tabIds});
+          groupId = await chrome.tabs.group({groupId: targetGroupId, tabIds});
         } catch {
           groupId = await chrome.tabs.group({tabIds});
         }
       } else {
         groupId = await chrome.tabs.group({tabIds});
       }
-      if (Number.isSafeInteger(groupId) && typeof chrome.tabGroups?.update === "function") {
-        const updateProps = {};
-        if (title) updateProps.title = title;
-        if (color) updateProps.color = color;
-        if (Object.keys(updateProps).length > 0) {
-          await chrome.tabGroups.update(groupId, updateProps).catch(() => {});
+
+      if (Number.isSafeInteger(groupId)) {
+        agentGroups.add(groupId);
+        if (sessionId) sessionGroups.set(sessionId, groupId);
+        if (typeof chrome.tabGroups?.update === "function") {
+          const updateProps = {};
+          if (title) updateProps.title = title;
+          if (color) updateProps.color = color;
+          if (typeof details?.collapsed === "boolean") {
+            updateProps.collapsed = details.collapsed;
+          } else {
+            const reusedSame = Boolean(existingGroup && groupId === existingGroup.id);
+            if (reusedSame && existingGroup.collapsed === true) {
+              updateProps.collapsed = false;
+            } else if (!reusedSame && typeof chrome.tabGroups?.get === "function") {
+              const created = await chrome.tabGroups.get(groupId).catch(() => null);
+              if (created?.collapsed === true) updateProps.collapsed = false;
+            }
+          }
+          if (Object.keys(updateProps).length > 0) {
+            await chrome.tabGroups.update(groupId, updateProps).catch(() => {});
+          }
         }
       }
       return {groupId: Number.isSafeInteger(groupId) ? groupId : null, supported: true};
+    }
+    if (method === "ungroupTabs") {
+      const tabIds = Array.isArray(details?.tabIds) ? details.tabIds : [];
+      if (tabIds.length === 0 || tabIds.some((id) => !Number.isSafeInteger(id) || (!owned.has(id) && !deliveredAgentTabs.has(id)))) {
+        throw new Error("Chrome bridge can only ungroup owned session tabs");
+      }
+      if (typeof chrome.tabs?.ungroup !== "function") {
+        return {ok: true, ungrouped: 0, supported: false};
+      }
+      await chrome.tabs.ungroup(tabIds).catch(() => {});
+      for (const id of tabIds) {
+        const meta = deliveredAgentTabs.get(id);
+        if (meta) meta.groupId = null;
+      }
+      return {ok: true, ungrouped: tabIds.length, supported: true};
+    }
+    if (method === "listTabGroups") {
+      if (typeof chrome.tabGroups?.query !== "function") return [];
+      const [groups, tabs] = await Promise.all([
+        chrome.tabGroups.query({}).catch(() => []),
+        typeof chrome.tabs?.query === "function" ? chrome.tabs.query({}).catch(() => []) : [],
+      ]);
+      const counts = new Map();
+      for (const t of Array.isArray(tabs) ? tabs : []) {
+        if (Number.isSafeInteger(t?.groupId) && t.groupId >= 0) {
+          counts.set(t.groupId, (counts.get(t.groupId) ?? 0) + 1);
+        }
+      }
+      return (Array.isArray(groups) ? groups : []).map((g) => ({
+        id: g.id,
+        title: g.title || "",
+        color: g.color || "grey",
+        collapsed: Boolean(g.collapsed),
+        windowId: g.windowId,
+        tabCount: counts.get(g.id) ?? 0,
+        agentManaged: agentGroups.has(g.id),
+      }));
+    }
+    if (method === "cleanupGroups") {
+      const ungroupFinished = details?.ungroupFinished === true;
+      const closeDuplicateDeliverables = details?.closeDuplicateDeliverables !== false;
+      const keepSet = new Set(Array.isArray(details?.keepTabIds) ? details.keepTabIds.filter(Number.isSafeInteger) : []);
+      let closedTabs = 0;
+      let ungroupedTabs = 0;
+      if (closeDuplicateDeliverables && deliveredAgentTabs.size > 1) {
+        const seen = new Map();
+        const entries = [...deliveredAgentTabs.entries()].sort((a, b) => (b[1].createdAt || 0) - (a[1].createdAt || 0));
+        for (const [id, meta] of entries) {
+          if (!meta?.url || keepSet.has(id) || owned.has(id) || userOwned.has(id)) continue;
+          if (seen.has(meta.url)) {
+            await chrome.tabs?.remove?.(id).catch(() => {});
+            deliveredAgentTabs.delete(id);
+            closedTabs += 1;
+          } else {
+            seen.set(meta.url, id);
+          }
+        }
+      }
+      if (ungroupFinished && typeof chrome.tabs?.query === "function") {
+        for (const gid of [...agentGroups]) {
+          const tabsInGroup = await chrome.tabs.query({groupId: gid}).catch(() => []);
+          if (!Array.isArray(tabsInGroup) || tabsInGroup.length === 0) {
+            onTabGroupRemoved({id: gid});
+            continue;
+          }
+          if (tabsInGroup.some((t) => owned.has(t.id))) continue;
+          const releasableIds = tabsInGroup.map((t) => t.id).filter((id) => Number.isSafeInteger(id) && !keepSet.has(id));
+          if (releasableIds.length > 0 && typeof chrome.tabs?.ungroup === "function") {
+            await chrome.tabs.ungroup(releasableIds).catch(() => {});
+            ungroupedTabs += releasableIds.length;
+            for (const id of releasableIds) {
+              const meta = deliveredAgentTabs.get(id);
+              if (meta) meta.groupId = null;
+            }
+            if (releasableIds.length === tabsInGroup.length) onTabGroupRemoved({id: gid});
+          }
+        }
+      }
+      return {ok: true, closedTabs, ungroupedTabs};
     }
     if (!Number.isSafeInteger(tabId) || !owned.has(tabId)) {
       if (method === "readTab") return null;
@@ -721,8 +945,33 @@ function connect() {
         return null;
       case "markTab": {
         const status = details?.status === "deliverable" ? "deliverable" : (details?.status === "handoff" ? "handoff" : null);
+        const tab = typeof chrome.tabs?.get === "function" ? await chrome.tabs.get(tabId).catch(() => null) : null;
+        if (details?.focus === true) {
+          if (tab && Number.isSafeInteger(tab.groupId) && tab.groupId >= 0 && typeof chrome.tabGroups?.update === "function") {
+            await chrome.tabGroups.update(tab.groupId, {collapsed: false}).catch(() => {});
+          }
+          if (typeof chrome.tabs?.update === "function") {
+            await chrome.tabs.update(tabId, {active: true}).catch(() => {});
+          }
+        }
         if (status) {
           await updateTabFaviconBadge(tabId, status);
+          if (status === "deliverable" && !userOwned.has(tabId)) {
+            const normUrl = normalizeComparableUrl(tab?.url || tab?.pendingUrl || "");
+            if (normUrl) {
+              for (const [oldId, meta] of [...deliveredAgentTabs.entries()]) {
+                if (oldId !== tabId && !owned.has(oldId) && !userOwned.has(oldId) && meta.url === normUrl) {
+                  await chrome.tabs?.remove?.(oldId).catch(() => {});
+                  deliveredAgentTabs.delete(oldId);
+                }
+              }
+            }
+            deliveredAgentTabs.set(tabId, {
+              url: normUrl,
+              groupId: Number.isSafeInteger(tab?.groupId) && tab.groupId >= 0 ? tab.groupId : null,
+              createdAt: Date.now(),
+            });
+          }
         }
         return null;
       }
@@ -1015,6 +1264,7 @@ function connect() {
     chrome.tabs.onCreated?.removeListener(onTabCreated);
     chrome.tabs.onUpdated?.removeListener(onTabUpdated);
     chrome.tabs.onActivated?.removeListener(onTabActivated);
+    chrome.tabGroups?.onRemoved?.removeListener(onTabGroupRemoved);
     chrome.runtime.onMessage?.removeListener(onRuntimeMessage);
     chrome.debugger.onEvent.removeListener(onDebuggerEvent);
     chrome.debugger.onDetach.removeListener(onDebuggerDetach);
@@ -1043,6 +1293,11 @@ function connect() {
     faviconCache.clear();
     preparingContentScripts.clear();
     contentScriptReadyTabs.clear();
+    windowActiveHistory.clear();
+    restoringFocus.clear();
+    agentGroups.clear();
+    sessionGroups.clear();
+    deliveredAgentTabs.clear();
     void Promise.allSettled(closing.map((id) => chrome.tabs.remove(id))).then((results) => {
       for (const result of results) {
         if (result.status === "rejected") console.warn("Portable Browser Bridge tab cleanup:", result.reason);

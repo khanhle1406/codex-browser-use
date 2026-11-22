@@ -155,6 +155,7 @@ function richMockBridge() {
           if (expr.includes('const mutation = "inputValue"')) return { result: { value: { count: 1, value: valueText } } };
           if (expr.includes('const mutation = "clear"')) return { result: { value: { count: 1, cleared: true } } };
           if (expr.includes('const mutation = "focus"')) return { result: { value: { count: 1, focused: true } } };
+          if (expr.includes('const mutation = "scrollIntoView"')) return { result: { value: { count: 1, scrolled: true, box: { x: 10, y: 20, width: 100, height: 40 } } } };
           if (expr.includes('const mutation = "allTextContents"') || expr.includes('const mutation = "allInnerTexts"')) {
             return { result: { value: { count: 2, values: ["A", "B"] } } };
           }
@@ -371,7 +372,7 @@ test("browser_run executes 1-shot script, viewImage, read-only guards, inline de
   assert.match(body.logs[0], /visited https:\/\/example\.com/);
   assert.equal(okRun.content[1].type, "image");
   assert.equal(okRun.content[1].mimeType, "image/jpeg");
-  assert.ok(calls.some((c) => c.kind === "cdp" && c.method === "Page.bringToFront"));
+  assert.equal(calls.some((c) => c.kind === "cdp" && c.method === "Page.bringToFront"), false);
   assert.ok(calls.some((c) => c.kind === "rpc" && c.method === "markTab" && c.params.status === "deliverable"));
 
   // Read-only evaluate rejection skips noisy <ax_state> dump
@@ -957,4 +958,99 @@ test("locator.ariaSnapshot() returns scoped subtree and unindexed ariaSnapshot b
   assert.doesNotMatch(errAfterAria.content[0].text, /textbox "Email"/);
   assert.ok(resolveCount >= 1);
   assert.ok(calls.some((c) => c.method === "Accessibility.getFullAXTree"));
+});
+
+test("browser_run honors end_turn=false with keep, scroll(dir, pages), Playwright ergonomics, and opt-in deliverable focus", async (t) => {
+  const { browser, calls } = richMockBridge();
+  const dir = await mkdtemp(path.join(tmpdir(), "browser-use-ergonomics-"));
+  const server = createStandaloneServer({ getBrowser: async () => browser, resetBrowser: async () => {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-ergonomics", version: "1.0.0" });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const shotPath = path.join(dir, "ergo.jpg");
+  const stayAlive = await client.callTool({
+    name: "browser_run",
+    arguments: {
+      end_turn: false,
+      keep: "handoff",
+      code: `
+        const consoleMsgs = [];
+        const pageErrors = [];
+        page.on("console", (m) => consoleMsgs.push(m.type() + ":" + m.text()));
+        page.on("pageerror", (e) => pageErrors.push(e.message));
+        const tab = await browser.tabs.new("https://example.com");
+        await tab.scroll("down", 5);
+        await page.setViewportSize({ width: 390, height: 844, mobile: true });
+        await page.keyboard.press("End");
+        await page.locator("css=button", { hasText: "Save" }).scrollIntoViewIfNeeded();
+        await page.screenshot({ path: ${JSON.stringify(shotPath)} });
+        return { consoleMsgs, pageErrors, id: tab.id };
+      `,
+    },
+  });
+  assert.notEqual(stayAlive.isError, true, JSON.stringify(stayAlive));
+  const body = JSON.parse(stayAlive.content[0].text);
+  assert.equal(body.end_turn, undefined);
+  assert.equal(body.saved_files?.[0]?.path, shotPath);
+  const wheel = calls.find((c) => c.method === "Input.dispatchMouseEvent" && c.params?.type === "mouseWheel");
+  assert.equal(wheel?.params?.deltaY, 2500);
+  const vpCall = calls.find((c) => c.method === "Emulation.setDeviceMetricsOverride");
+  assert.equal(vpCall?.params?.width, 390);
+  assert.equal(vpCall?.params?.height, 844);
+  assert.equal(calls.some((c) => c.method === "Input.dispatchKeyEvent" && c.params?.key === "End"), true);
+  assert.equal(calls.some((c) => c.kind === "rpc" && c.method === "turnEnded"), false);
+
+  // Verify console & pageerror delivery + opt-in focus: true brings deliverable to front
+  const eventsRun = await client.callTool({
+    name: "browser_run",
+    arguments: {
+      code: `
+        const msgs = [];
+        const errs = [];
+        page.on("console", (m) => msgs.push(m.type() + ":" + m.text()));
+        page.on("pageerror", (e) => errs.push(e.message));
+        log("armed");
+        return { tabId: page.id };
+      `,
+    },
+  });
+  assert.notEqual(eventsRun.isError, true);
+
+  // Test BridgeBrowser event dispatching directly and focus:true on markDeliverable
+  const seen = [];
+  const off = browser.addEventListener((ev) => seen.push(ev));
+  const curId = browser.activeTabId;
+  browser.handleCdpEvent({
+    source: { tabId: curId },
+    method: "Runtime.consoleAPICalled",
+    params: { type: "error", args: [{ value: "boom" }] },
+  });
+  browser.handleCdpEvent({
+    source: { tabId: curId },
+    method: "Runtime.exceptionThrown",
+    params: { exceptionDetails: { text: "Uncaught Err" } },
+  });
+  off();
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].kind, "console");
+  assert.equal(seen[0].entry.message, "boom");
+  assert.equal(seen[1].kind, "pageerror");
+
+  const focusEnd = await client.callTool({
+    name: "browser_run",
+    arguments: {
+      code: `
+        await page.goto("https://example.com/final");
+        page.markDeliverable({ focus: true });
+      `,
+    },
+  });
+  assert.notEqual(focusEnd.isError, true);
+  assert.equal(calls.some((c) => c.kind === "cdp" && c.method === "Page.bringToFront"), true);
 });

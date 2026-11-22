@@ -898,3 +898,128 @@ test("locatorAriaSnapshot skips error objectIds on missed first attempt and retr
     .map((c) => c.params.commandParams?.objectId);
   assert.deepEqual(releases, ["err-1", "node-1"]);
 });
+
+test("endTurn clears attached/owned state cleanly and #cdp auto-reattaches after Debugger unattached", async () => {
+  let nextId = 1;
+  const owned = new Set();
+  const attached = new Set();
+  const tabUrls = new Map();
+  const calls = [];
+  let failOnceWithUnattached = false;
+
+  const browser = new BridgeBrowser({
+    request: async (method, params = {}) => {
+      calls.push({ method, params });
+      if (method === "createTab") {
+        const id = nextId++;
+        owned.add(id);
+        tabUrls.set(id, "about:blank");
+        return { id, url: "about:blank", title: "Blank" };
+      }
+      if (method === "getTabs") {
+        return [...owned].map((id) => ({ id, url: tabUrls.get(id) ?? "https://example.com", title: "Ex" }));
+      }
+      if (method === "navigateTab") {
+        tabUrls.set(params.tabId, params.url);
+        return null;
+      }
+      if (method === "attach") {
+        if (!owned.has(params.tabId)) throw new Error("Browser tab is unavailable to this session");
+        attached.add(params.tabId);
+        return null;
+      }
+      if (method === "markTab") return null;
+      if (method === "turnEnded") {
+        attached.clear();
+        return null;
+      }
+      if (method === "executeCdp") {
+        const id = params.target?.tabId;
+        if (!attached.has(id) || failOnceWithUnattached) {
+          failOnceWithUnattached = false;
+          attached.delete(id);
+          throw new Error("Debugger unattached");
+        }
+        if (params.method === "Runtime.evaluate") {
+          const expr = params.commandParams?.expression;
+          if (expr === "location.href") return { result: { value: tabUrls.get(id) ?? "about:blank" } };
+          if (expr === "document.readyState") return { result: { value: "complete" } };
+          return { result: { value: "ok" } };
+        }
+        return {};
+      }
+      return {};
+    },
+    close: async () => {},
+    sessionId: "s-reattach",
+    turnId: "t-1",
+  });
+
+  // Handoff tab survives turnEnded in backend, so next turn re-attaches automatically instead of seeing stale attached state
+  const tab1 = await browser.newTab();
+  const handoffId = Number(tab1.tab_id);
+  await browser.endTurn({ keep: [{ tab_id: handoffId, mode: "handoff" }] });
+  assert.equal(browser.attached.has(handoffId), false);
+  assert.equal(browser.ownedTabs.has(handoffId), true);
+  const titleRes = await browser.evaluate("document.title", { tabId: handoffId });
+  assert.equal(titleRes.value, "ok");
+
+  // Mid-turn sudden Debugger unattached triggers automatic single re-attach & retry
+  failOnceWithUnattached = true;
+  const retriedRes = await browser.evaluate("document.title", { tabId: handoffId });
+  assert.equal(retriedRes.value, "ok");
+  assert.ok(calls.filter((c) => c.method === "attach" && c.params.tabId === handoffId).length >= 2);
+
+  // Deliverable tab is purged from ownedTabs/activeTabId on endTurn so next goto auto-creates instead of failing
+  await browser.endTurn({ keep: [{ tab_id: handoffId, mode: "deliverable" }] });
+  owned.delete(handoffId);
+  assert.equal(browser.ownedTabs.has(handoffId), false);
+  assert.equal(browser.activeTabId, null);
+  const fresh = await browser.goto("https://example.com");
+  assert.equal(fresh.tab_id, "2");
+});
+
+test("endTurn forwards focus and ungroup flags and group helpers delegate cleanly", async () => {
+  const { browser, calls } = browserFixture();
+  const extraCalls = [];
+  const origRequest = browser.request;
+  browser.request = async (method, params) => {
+    if (["listTabGroups", "ungroupTabs", "cleanupGroups"].includes(method)) {
+      extraCalls.push({ method, params });
+      if (method === "listTabGroups") return [{ id: 12, title: "QA", tabCount: 1 }];
+      return { ok: true };
+    }
+    return await origRequest(method, params);
+  };
+
+  browser.sessionName = { name: "QA", color: "blue" };
+  await browser.getState({ screenshot: false });
+  const beforeTurn = browser.turnId;
+  const endRes = await browser.endTurn({
+    keep: [{ tab_id: "1", mode: "deliverable", focus: true }],
+    ungroup: true,
+  });
+  assert.equal(endRes.ungrouped, true);
+  assert.equal(browser.sessionName, null);
+
+  const markCall = calls.find((c) => c.kind === "rpc" && c.method === "markTab");
+  assert.deepEqual(markCall.params, {
+    session_id: "session-1",
+    turn_id: beforeTurn,
+    tabId: 1,
+    status: "deliverable",
+    focus: true,
+  });
+  const endedCall = calls.find((c) => c.kind === "rpc" && c.method === "turnEnded");
+  assert.deepEqual(endedCall.params, {
+    session_id: "session-1",
+    turn_id: beforeTurn,
+    ungroup: true,
+  });
+
+  const groups = await browser.listTabGroups();
+  assert.equal(groups.length, 1);
+  await browser.ungroupTabs(["1"]);
+  await browser.cleanupGroups({ ungroupFinished: true, keepTabIds: [1] });
+  assert.deepEqual(extraCalls.map((c) => c.method), ["listTabGroups", "ungroupTabs", "cleanupGroups"]);
+});

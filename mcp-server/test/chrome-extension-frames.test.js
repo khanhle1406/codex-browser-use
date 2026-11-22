@@ -425,3 +425,207 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
   assert.equal(openTabs.has(13), true);
   assert.ok(detachedTabs.includes(10));
 });
+
+test("extension background restores focus to user's active tab when an agent popup opens in foreground", async () => {
+  const onEvent = event();
+  const onMessage = event();
+  const onClicked = event();
+  const tabsCreated = event();
+  const tabsActivated = event();
+  const updatedTabs = [];
+  const openTabs = new Map([
+    [1, { id: 1, windowId: 10, active: true, url: "https://mail.google.com", title: "Gmail" }],
+  ]);
+  const port = { onMessage, onDisconnect: event(), postMessage: () => {} };
+  const chrome = {
+    runtime: { connectNative: () => port },
+    tabs: {
+      onRemoved: event(),
+      onCreated: tabsCreated,
+      onActivated: tabsActivated,
+      async query(q) {
+        return [...openTabs.values()].filter((t) => (q?.active ? t.active : true));
+      },
+      async create() {
+        const tab = { id: 2, windowId: 10, active: false, url: "about:blank", title: "Agent" };
+        openTabs.set(2, tab);
+        return tab;
+      },
+      async update(tabId, props) {
+        updatedTabs.push({ tabId, ...props });
+        return { ...openTabs.get(tabId), ...props };
+      },
+    },
+    action: { onClicked, async setBadgeText() {} },
+    debugger: { onEvent, onDetach: event(), async attach() {}, async detach() {}, async sendCommand() { return {}; } },
+  };
+  const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
+  runInNewContext(source, { chrome, console, Promise, URL });
+  await onClicked.emit();
+
+  // Create background agent tab 2 while user is on tab 1
+  await onMessage.emit({ id: 1, method: "createBlankTab" });
+  await Promise.resolve();
+
+  // Case A: Chrome fires onActivated BEFORE onCreated for active popup tab 3 from agent tab 2 -> must restore user tab 1
+  const popup3 = { id: 3, windowId: 10, openerTabId: 2, active: true, url: "https://example.com/p3" };
+  openTabs.set(3, popup3);
+  await tabsActivated.emit({ tabId: 3, windowId: 10 });
+  await tabsCreated.emit(popup3);
+  assert.deepEqual(updatedTabs, [{ tabId: 1, active: true }]);
+
+  // Case B: User switches onto agent tab 2 themselves, then agent opens popup 4 -> must NOT rip user back to tab 1
+  updatedTabs.length = 0;
+  await tabsActivated.emit({ tabId: 2, windowId: 10 });
+  const popup4 = { id: 4, windowId: 10, openerTabId: 2, active: true, url: "https://example.com/p4" };
+  openTabs.set(4, popup4);
+  await tabsCreated.emit(popup4);
+  assert.deepEqual(updatedTabs, []);
+});
+
+test("extension targets normal window on createBlankTab, reuses & uncollapses groups by title, deduplicates deliverable URLs, and cleans finished groups", async () => {
+  const onEvent = event();
+  const onMessage = event();
+  const onClicked = event();
+  const onTabRemoved = event();
+  const onGroupRemoved = event();
+  const replies = [];
+  const createCalls = [];
+  const removedTabs = [];
+  const updatedTabs = [];
+  const groupUpdates = [];
+  const ungroupedCalls = [];
+
+  let nextTabId = 200;
+  let nextGroupId = 500;
+  const openTabs = new Map([
+    [10, { id: 10, windowId: 7, active: true, groupId: 400, url: "https://mail.google.com", title: "Gmail" }],
+  ]);
+  const tabGroups = new Map([
+    [400, { id: 400, windowId: 7, title: "Hero QA", color: "blue", collapsed: true }],
+  ]);
+
+  const port = { onMessage, onDisconnect: event(), postMessage: (r) => replies.push(r) };
+  const chrome = {
+    runtime: { connectNative: () => port },
+    windows: {
+      async getLastFocused(opts) {
+        assert.deepEqual(JSON.parse(JSON.stringify(opts)), { windowTypes: ["normal"] });
+        return { id: 7, focused: true };
+      },
+    },
+    tabs: {
+      onRemoved: onTabRemoved,
+      async create(opts) {
+        createCalls.push(opts);
+        const tab = { id: nextTabId++, windowId: opts.windowId ?? 7, active: Boolean(opts.active), groupId: -1, url: opts.url || "about:blank", title: "Blank" };
+        openTabs.set(tab.id, tab);
+        return tab;
+      },
+      async get(id) { return openTabs.get(id); },
+      async query(q = {}) {
+        return [...openTabs.values()].filter((t) => {
+          if (q.windowId !== undefined && t.windowId !== q.windowId) return false;
+          if (q.groupId !== undefined && t.groupId !== q.groupId) return false;
+          return true;
+        });
+      },
+      async remove(id) {
+        removedTabs.push(id);
+        openTabs.delete(id);
+        await onTabRemoved.emit(id);
+      },
+      async update(id, props) {
+        updatedTabs.push({ id, ...props });
+        const cur = openTabs.get(id);
+        if (cur) Object.assign(cur, props);
+        return cur;
+      },
+      async group(opts) {
+        const gid = opts.groupId ?? nextGroupId++;
+        if (!tabGroups.has(gid)) {
+          tabGroups.set(gid, { id: gid, windowId: 7, title: "", color: "grey", collapsed: false });
+        }
+        for (const tid of opts.tabIds) {
+          const cur = openTabs.get(tid);
+          if (cur) cur.groupId = gid;
+        }
+        return gid;
+      },
+      async ungroup(ids) {
+        ungroupedCalls.push([...ids]);
+        for (const tid of ids) {
+          const cur = openTabs.get(tid);
+          if (cur) cur.groupId = -1;
+        }
+      },
+    },
+    tabGroups: {
+      onRemoved: onGroupRemoved,
+      async get(id) {
+        const g = tabGroups.get(id);
+        if (!g) throw new Error(`No group with id: ${id}`);
+        return g;
+      },
+      async query(q = {}) {
+        return [...tabGroups.values()].filter((g) => (q.windowId === undefined || g.windowId === q.windowId));
+      },
+      async update(id, props) {
+        groupUpdates.push({ id, ...props });
+        const g = tabGroups.get(id);
+        if (g) Object.assign(g, props);
+        return g;
+      },
+    },
+    action: { onClicked, async setBadgeText() {} },
+    debugger: { onEvent, onDetach: event(), async attach() {}, async detach() {}, async sendCommand() { return {}; } },
+  };
+
+  let nextReq = 1;
+  async function request(args) {
+    const id = nextReq++;
+    await onMessage.emit({ id, ...args });
+    return replies.find((r) => r.id === id);
+  }
+
+  const source = await readFile(new URL("../extension/background.js", import.meta.url), "utf8");
+  runInNewContext(source, { chrome, console, Promise, URL });
+  await onClicked.emit();
+
+  // 1. createBlankTab targets normal window 7
+  const t1 = (await request({ method: "createBlankTab" })).value;
+  assert.equal(createCalls[0].windowId, 7);
+  openTabs.get(t1.id).url = "http://127.0.0.1:5173/";
+
+  // 2. groupTabs matches existing collapsed group 400 ("hero qa") and auto-uncollapses it instead of duplicating
+  const g1 = await request({ method: "groupTabs", details: { tabIds: [t1.id], title: "hero qa", color: "blue", sessionId: "s-1" } });
+  assert.equal(g1.value.groupId, 400);
+  assert.equal(tabGroups.get(400).collapsed, false);
+  assert.ok(groupUpdates.some((u) => u.id === 400 && u.collapsed === false));
+
+  // 3. Re-collapsing group 400 and focusing deliverable tab uncollapses + activates it; duplicate deliverable URL closes older tab
+  await request({ method: "markTab", tabId: t1.id, details: { status: "deliverable", focus: true } });
+  await request({ method: "releaseTab", tabId: t1.id });
+  assert.ok(openTabs.has(t1.id));
+
+  const t2 = (await request({ method: "createBlankTab" })).value;
+  openTabs.get(t2.id).url = "http://127.0.0.1:5173/#top";
+  await request({ method: "groupTabs", details: { tabIds: [t2.id], title: "Hero QA", color: "blue", sessionId: "s-1" } });
+  tabGroups.get(400).collapsed = true;
+  await request({ method: "markTab", tabId: t2.id, details: { status: "deliverable", focus: true } });
+
+  // Older duplicate 127.0.0.1:5173 deliverable tab t1 was removed automatically while user tab 10 stayed intact!
+  assert.ok(removedTabs.includes(t1.id));
+  assert.equal(openTabs.has(t2.id), true);
+  assert.equal(openTabs.has(10), true);
+  assert.equal(tabGroups.get(400).collapsed, false);
+  assert.ok(updatedTabs.some((u) => u.id === t2.id && u.active === true));
+
+  // 4. listTabGroups & ungroupTabs dissolve finished group cleanly
+  const listed = (await request({ method: "listTabGroups" })).value;
+  assert.equal(listed[0].agentManaged, true);
+  const ung = await request({ method: "ungroupTabs", details: { tabIds: [t2.id] } });
+  assert.equal(ung.ok, true);
+  assert.equal(ung.value.ungrouped, 1);
+  assert.ok(ungroupedCalls.some((ids) => ids.includes(t2.id)));
+});

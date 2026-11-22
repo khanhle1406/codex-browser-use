@@ -169,6 +169,21 @@ export class BrowserScriptSession {
     );
   }
 
+  /** @param {import("./bridge-browser.js").BridgeBrowser} browser */
+  syncActiveTab(browser) {
+    if (this.currentTabId != null) {
+      const num = Number(this.currentTabId);
+      if (!Number.isSafeInteger(num) || !browser?.ownedTabs?.has(num)) {
+        this.currentTabId = browser?.activeTabId != null && browser?.ownedTabs?.has(browser.activeTabId)
+          ? String(browser.activeTabId)
+          : null;
+      }
+    }
+    if (this.currentTabId === null && browser?.activeTabId != null && browser?.ownedTabs?.has(browser.activeTabId)) {
+      this.currentTabId = String(browser.activeTabId);
+    }
+  }
+
   #timeoutMessage(run) {
     const during = run?.lastAction ? ` (during ${run.lastAction})` : "";
     return `browser_run timed out after ${run?.timeoutMs ?? 45_000}ms${during}`;
@@ -352,8 +367,14 @@ export class BrowserScriptSession {
     return { path: target, bytes: buf.byteLength, mimeType: cap.mimeType, tab_id: cap.tab_id };
   }
 
-  #keepTab(mode = "deliverable", id) {
+  #keepTab(mode = "deliverable", idOrOpts, maybeOpts) {
     const run = this.#requireRun();
+    let id = idOrOpts;
+    let opts = maybeOpts;
+    if (isPlainObject(idOrOpts)) {
+      opts = idOrOpts;
+      id = idOrOpts.tabId ?? idOrOpts.tab_id;
+    }
     const resolved = id !== undefined && id !== null && id !== ""
       ? String(id)
       : this.#activeTabId();
@@ -361,22 +382,28 @@ export class BrowserScriptSession {
       throw new Error("No browser tab is active to keep; navigate or open a tab first");
     }
     const normalized = mode === "handoff" ? "handoff" : "deliverable";
-    run.keptTabs.set(resolved, normalized);
-    return { tab_id: resolved, mode: normalized };
+    const focus = opts?.focus === true;
+    const prev = run.keptTabs.get(resolved);
+    const effectiveFocus = focus || (opts?.focus === undefined && prev?.focus === true);
+    run.keptTabs.set(resolved, { mode: normalized, ...(effectiveFocus ? { focus: true } : {}) });
+    return { tab_id: resolved, mode: normalized, ...(effectiveFocus ? { focus: true } : {}) };
   }
 
   #requestEndTurn(optsOrMode, fixedTabId = null) {
     const run = this.#requireRun();
     run.endTurnRequested = true;
+    if (isPlainObject(optsOrMode) && optsOrMode.ungroup === true) {
+      run.ungroupOnEndTurn = true;
+    }
     const targetKeep = (optsOrMode && typeof optsOrMode === "object" && !Array.isArray(optsOrMode))
       ? optsOrMode.keep
       : optsOrMode;
     if (typeof targetKeep === "string") {
-      this.#keepTab(targetKeep, fixedTabId);
+      this.#keepTab(targetKeep, fixedTabId, isPlainObject(optsOrMode) ? { focus: optsOrMode.focus } : undefined);
     } else if (Array.isArray(targetKeep)) {
       for (const entry of targetKeep) {
         if (entry && typeof entry === "object" && entry.tab_id != null) {
-          this.#keepTab(entry.mode ?? "deliverable", entry.tab_id);
+          this.#keepTab(entry.mode ?? "deliverable", entry.tab_id, { focus: entry.focus });
         } else if (typeof entry === "string" || typeof entry === "number") {
           this.#keepTab("deliverable", entry);
         }
@@ -384,7 +411,11 @@ export class BrowserScriptSession {
     }
     return {
       scheduled: true,
-      keep: [...run.keptTabs.entries()].map(([tab_id, mode]) => ({ tab_id, mode })),
+      keep: [...run.keptTabs.entries()].map(([tab_id, cfg]) => ({
+        tab_id,
+        mode: cfg.mode,
+        ...(cfg.focus === true ? { focus: true } : {}),
+      })),
     };
   }
 
@@ -434,7 +465,10 @@ export class BrowserScriptSession {
       selector,
       frame,
       tabId: boundTabId,
-      locator: (sub) => this.#createLocator([...chain, String(sub)], frame, boundTabId),
+      locator: (sub, opts) => {
+        const loc = this.#createLocator([...chain, String(sub)], frame, boundTabId);
+        return isPlainObject(opts) ? loc.filter(opts) : loc;
+      },
       getByRole: (role, opts) => this.#createLocator([...chain, buildRoleStep(role, opts)], frame, boundTabId),
       getByText: (text, opts) => this.#createLocator([...chain, buildTextStep(text, opts)], frame, boundTabId),
       getByLabel: (text) => this.#createLocator([...chain, `label=${JSON.stringify(String(text))}`], frame, boundTabId),
@@ -544,21 +578,37 @@ export class BrowserScriptSession {
         force: opts?.force === true,
         timeoutMs: timeoutOpt(opts),
       }), `locator.hover(${selector})`, guardOpts),
-      screenshot: (opts = {}) => this.#guard((b) => b.elementScreenshot(selector, {
-        tabId: tabFor(opts),
-        frame: opts?.frame ?? frame ?? undefined,
-        force: opts?.force === true,
-        padding: opts?.padding,
-        format: opts?.format ?? "jpeg",
-        quality: opts?.quality ?? 75,
-        scale: opts?.scale ?? "css",
-        timeoutMs: timeoutOpt(opts),
-      }), `locator.screenshot(${selector})`, guardOpts),
+      screenshot: (opts = {}) => {
+        const format = opts?.format ?? opts?.type ?? "jpeg";
+        if (typeof opts?.path === "string" && opts.path.length > 0) {
+          return this.#saveScreenshot(opts.path, {
+            ...opts,
+            format,
+            selector,
+            frame: opts?.frame ?? frame ?? undefined,
+          }, boundTabId);
+        }
+        return this.#guard((b) => b.elementScreenshot(selector, {
+          tabId: tabFor(opts),
+          frame: opts?.frame ?? frame ?? undefined,
+          force: opts?.force === true,
+          padding: opts?.padding,
+          format,
+          quality: opts?.quality ?? 75,
+          scale: opts?.scale ?? "css",
+          timeoutMs: timeoutOpt(opts),
+        }), `locator.screenshot(${selector})`, guardOpts);
+      },
       saveScreenshot: (filePath, opts = {}) => this.#saveScreenshot(filePath, {
         ...opts,
         selector,
         frame: opts?.frame ?? frame ?? undefined,
       }, boundTabId),
+      scrollIntoViewIfNeeded: (opts = {}) => this.#guard((b) => b.locatorScrollIntoView(selector, {
+        tabId: tabFor(opts),
+        frame: opts?.frame ?? frame ?? undefined,
+        timeoutMs: timeoutOpt(opts),
+      }), `locator.scrollIntoViewIfNeeded(${selector})`, guardOpts),
       setInputFiles: (files, opts = {}) => this.#guard((b) => b.uploadFiles(files, {
         tabId: tabFor(opts),
         selector,
@@ -662,7 +712,10 @@ export class BrowserScriptSession {
     const sel = String(frameSelector);
     return {
       frameLocator: (sub) => this.#createFrameLocator(`${sel} >> ${String(sub)}`, boundTabId),
-      locator: (sub) => this.#createLocator([String(sub)], sel, boundTabId),
+      locator: (sub, opts) => {
+        const loc = this.#createLocator([String(sub)], sel, boundTabId);
+        return isPlainObject(opts) ? loc.filter(opts) : loc;
+      },
       getByRole: (role, opts) => this.#createLocator([buildRoleStep(role, opts)], sel, boundTabId),
       getByText: (text, opts) => this.#createLocator([buildTextStep(text, opts)], sel, boundTabId),
       getByLabel: (text) => this.#createLocator([`label=${JSON.stringify(String(text))}`], sel, boundTabId),
@@ -746,16 +799,22 @@ export class BrowserScriptSession {
           mode: opts?.mode ?? "compact",
         }), "ariaSnapshot", guardOpts)).text;
       },
-      screenshot: (opts = {}) => self.#guard((b) => b.screenshot(resolveTab(opts), {
-        fullPage: opts?.fullPage ?? opts?.full_page ?? false,
-        format: opts?.format ?? "jpeg",
-        quality: opts?.quality ?? 75,
-        ...(opts?.maxWidth !== undefined || opts?.max_width !== undefined
-          ? { maxWidth: opts?.maxWidth ?? opts?.max_width }
-          : {}),
-        clip: opts?.clip,
-        scale: opts?.scale ?? "css",
-      }), "screenshot", guardOpts),
+      screenshot: (opts = {}) => {
+        const format = opts?.format ?? opts?.type ?? "jpeg";
+        if (typeof opts?.path === "string" && opts.path.length > 0) {
+          return self.#saveScreenshot(opts.path, { ...opts, format }, boundId);
+        }
+        return self.#guard((b) => b.screenshot(resolveTab(opts), {
+          fullPage: opts?.fullPage ?? opts?.full_page ?? false,
+          format,
+          quality: opts?.quality ?? 75,
+          ...(opts?.maxWidth !== undefined || opts?.max_width !== undefined
+            ? { maxWidth: opts?.maxWidth ?? opts?.max_width }
+            : {}),
+          clip: opts?.clip,
+          scale: opts?.scale ?? "css",
+        }), "screenshot", guardOpts);
+      },
       elementScreenshot: (selector, opts = {}) => self.#guard((b) => b.elementScreenshot(selector, {
         tabId: resolveTab(opts),
         frame: opts?.frame,
@@ -810,14 +869,71 @@ export class BrowserScriptSession {
         limit: opts?.limit ?? 100,
         clear: opts?.clear === true,
       }), "networkLogs", guardOpts),
-      setViewport: (opts = {}) => self.#guard((b) => b.setViewport({
-        tabId: resolveTab(opts),
-        width: opts.width,
-        height: opts.height,
-        deviceScaleFactor: opts.deviceScaleFactor ?? opts.device_scale_factor ?? 1,
-        mobile: opts.mobile === true,
-      }), "setViewport", guardOpts),
+      setViewport: (optsOrWidth = {}, maybeHeight, maybeOpts = {}) => {
+        const opts = typeof optsOrWidth === "number"
+          ? { ...(isPlainObject(maybeOpts) ? maybeOpts : {}), width: optsOrWidth, height: maybeHeight }
+          : (optsOrWidth || {});
+        return self.#guard((b) => b.setViewport({
+          tabId: resolveTab(opts),
+          width: opts.width,
+          height: opts.height,
+          deviceScaleFactor: opts.deviceScaleFactor ?? opts.device_scale_factor ?? 1,
+          mobile: opts.mobile === true,
+        }), "setViewport", guardOpts);
+      },
+      setViewportSize: (...args) => tabApi.setViewport(...args),
       resetViewport: (opts = {}) => self.#guard((b) => b.resetViewport(resolveTab(opts)), "resetViewport", guardOpts),
+      keyboard: {
+        press: (key, opts) => tabApi.press(key, opts),
+        type: (text, opts) => tabApi.type(text, opts),
+        insertText: (text, opts) => tabApi.type(text, opts),
+      },
+      mouse: {
+        move: (x, y, opts) => tabApi.hover({ x, y }, opts),
+        click: (x, y, opts) => tabApi.click({ x, y }, opts),
+        wheel: (dx, dy, opts = {}) => tabApi.scroll((Number(dy) || 0) >= 0 ? "down" : "up", {
+          ...opts,
+          pages: Math.max(1, Math.round(Math.abs(Number(dy) || 500) / 500)),
+        }),
+      },
+      on: (eventName, handler) => {
+        if (eventName !== "console" && eventName !== "pageerror") {
+          throw new Error(`Unsupported page event listener: ${String(eventName)} (supported: console, pageerror)`);
+        }
+        if (typeof handler !== "function") return tabApi;
+        const run = self.#requireRun();
+        const unsub = run.browser.addEventListener((ev) => {
+          if (boundId != null && String(ev.tabId) !== String(boundId)) return;
+          if (boundId == null) {
+            const cur = self.#activeTabId();
+            if (cur != null && String(ev.tabId) !== String(cur)) return;
+          }
+          if (eventName === "console" && ev.kind === "console") {
+            handler({
+              type: () => ev.entry?.level ?? "log",
+              text: () => ev.entry?.message ?? "",
+              ...ev.entry,
+            });
+          } else if (eventName === "pageerror" && ev.kind === "pageerror") {
+            handler(ev.error ?? new Error(ev.entry?.message || "Page error"));
+          }
+        });
+        run.eventCleanups.set(handler, unsub);
+        const activeId = boundId ?? self.#activeTabId();
+        if (activeId != null && run.browser.attached.has(Number(activeId))) {
+          void run.browser.enableRuntime(activeId).catch(() => {});
+        }
+        return tabApi;
+      },
+      off: (_eventName, handler) => {
+        const run = self.activeRun;
+        const unsub = run?.eventCleanups?.get(handler);
+        if (typeof unsub === "function") {
+          unsub();
+          run.eventCleanups.delete(handler);
+        }
+        return tabApi;
+      },
       evaluate: async (...args) => {
         const [exprOrFn, argOrOpts, maybeOpts] = args;
         const parsed = self.#parsePageEvalArgs(exprOrFn, argOrOpts, maybeOpts, args.length);
@@ -831,7 +947,10 @@ export class BrowserScriptSession {
         }), "evaluate", guardOpts);
         return res?.value;
       },
-      locator: (sel) => self.#createLocator([String(sel)], null, boundId),
+      locator: (sel, opts) => {
+        const loc = self.#createLocator([String(sel)], null, boundId);
+        return isPlainObject(opts) ? loc.filter(opts) : loc;
+      },
       frameLocator: (sel) => self.#createFrameLocator(sel, boundId),
       getByRole: (role, opts) => self.#createLocator([buildRoleStep(role, opts)], null, boundId),
       getByText: (text, opts) => self.#createLocator([buildTextStep(text, opts)], null, boundId),
@@ -939,13 +1058,26 @@ export class BrowserScriptSession {
         return self.#guard((b) => b.hover({ tabId, elementIndex: target }), `hover(${target})`, guardOpts);
       },
       drag: (opts) => self.#guard((b) => b.drag({ tabId: resolveTab(opts), ...opts }), "drag", guardOpts),
-      scroll: (direction, opts = {}) => self.#guard((b) => b.scroll(direction, {
-        tabId: resolveTab(opts),
-        elementIndex: opts?.elementIndex ?? opts?.element_index,
-        pages: opts?.pages ?? 1,
-        x: opts?.x,
-        y: opts?.y,
-      }), `scroll(${direction})`, guardOpts),
+      scroll: (dirOrOpts, optsOrPages = {}) => {
+        if (isPlainObject(dirOrOpts)) {
+          const opts = dirOrOpts;
+          return self.#guard((b) => b.scroll(opts.direction ?? "down", {
+            tabId: resolveTab(opts),
+            elementIndex: opts.elementIndex ?? opts.element_index,
+            pages: opts.pages ?? 1,
+            x: opts.x,
+            y: opts.y,
+          }), `scroll(${opts.direction ?? "down"})`, guardOpts);
+        }
+        const opts = typeof optsOrPages === "number" ? { pages: optsOrPages } : (optsOrPages || {});
+        return self.#guard((b) => b.scroll(dirOrOpts, {
+          tabId: resolveTab(opts),
+          elementIndex: opts?.elementIndex ?? opts?.element_index,
+          pages: opts?.pages ?? 1,
+          x: opts?.x,
+          y: opts?.y,
+        }), `scroll(${dirOrOpts})`, guardOpts);
+      },
       selectOption: (targetOrOpts, valOrOpts) => {
         if (targetOrOpts && typeof targetOrOpts === "object" && !Array.isArray(targetOrOpts)) {
           return self.#guard((b) => b.selectOption({ tabId: resolveTab(targetOrOpts), ...targetOrOpts }), "selectOption", guardOpts);
@@ -1038,9 +1170,19 @@ export class BrowserScriptSession {
         promptText: opts?.promptText ?? opts?.prompt_text,
       }), "handleDialog", guardOpts),
       getJsDialog: (opts = {}) => self.#guard((b) => b.getJsDialog(resolveTab(opts)), "getJsDialog", guardOpts),
-      keepTab: (mode, id) => self.#keepTab(mode, id ?? boundId),
-      markDeliverable: (id) => self.#keepTab("deliverable", id ?? boundId),
-      markHandoff: (id) => self.#keepTab("handoff", id ?? boundId),
+      keepTab: (mode, idOrOpts, maybeOpts) => self.#keepTab(mode, idOrOpts ?? boundId, maybeOpts),
+      markDeliverable: (idOrOpts, maybeOpts) => {
+        if (isPlainObject(idOrOpts)) {
+          return self.#keepTab("deliverable", idOrOpts.tabId ?? idOrOpts.tab_id ?? boundId, idOrOpts);
+        }
+        return self.#keepTab("deliverable", idOrOpts ?? boundId, maybeOpts);
+      },
+      markHandoff: (idOrOpts, maybeOpts) => {
+        if (isPlainObject(idOrOpts)) {
+          return self.#keepTab("handoff", idOrOpts.tabId ?? idOrOpts.tab_id ?? boundId, idOrOpts);
+        }
+        return self.#keepTab("handoff", idOrOpts ?? boundId, maybeOpts);
+      },
       endTurn: (opts) => self.#requestEndTurn(opts, boundId),
       end_turn: (opts) => self.#requestEndTurn(opts, boundId),
       dev: {
@@ -1143,7 +1285,9 @@ export class BrowserScriptSession {
         },
         scroll: (targetOrDir, dirOrOpts = "down", pagesOrOpts) => {
           if (typeof targetOrDir === "string") {
-            const opts = isPlainObject(dirOrOpts) ? dirOrOpts : {};
+            const opts = typeof dirOrOpts === "number"
+              ? { pages: dirOrOpts }
+              : (isPlainObject(dirOrOpts) ? dirOrOpts : {});
             return tabApi.scroll(targetOrDir, opts);
           }
           const pages = typeof pagesOrOpts === "number" ? pagesOrOpts : (pagesOrOpts?.pages ?? 1);
@@ -1262,6 +1406,11 @@ export class BrowserScriptSession {
       const opts = typeof colorOrOpts === "string" ? { color: colorOrOpts } : (colorOrOpts || {});
       return self.#guard((b) => b.nameSession(name, opts), "nameSession", { trackActiveTab: false });
     };
+    api.groups = {
+      list: () => self.#guard((b) => b.listTabGroups(), "groups.list", { trackActiveTab: false }),
+      ungroup: (tabIds) => self.#guard((b) => b.ungroupTabs(tabIds), "groups.ungroup", { trackActiveTab: false }),
+      cleanup: (opts = {}) => self.#guard((b) => b.cleanupGroups(opts), "groups.cleanup", { trackActiveTab: false }),
+    };
     return api;
   }
 
@@ -1281,8 +1430,8 @@ export class BrowserScriptSession {
 
     if (options.tabId !== undefined && options.tabId !== null && options.tabId !== "") {
       this.currentTabId = String(options.tabId);
-    } else if (this.currentTabId === null && browser.activeTabId != null) {
-      this.currentTabId = String(browser.activeTabId);
+    } else {
+      this.syncActiveTab(browser);
     }
 
     const run = {
@@ -1294,7 +1443,9 @@ export class BrowserScriptSession {
       touchedTabs: new Set(this.currentTabId ? [this.currentTabId] : []),
       keptTabs: new Map(),
       savedFiles: new Map(),
+      eventCleanups: new Map(),
       endTurnRequested: false,
+      ungroupOnEndTurn: false,
       logs: [],
       logChars: 0,
       images: [],
@@ -1361,14 +1512,23 @@ export class BrowserScriptSession {
         savedFiles: [...run.savedFiles.values()],
         notifications,
         activeTabId: finalActive,
-        keptTabs: [...run.keptTabs.entries()].map(([tab_id, mode]) => ({ tab_id, mode })),
+        keptTabs: [...run.keptTabs.entries()].map(([tab_id, cfg]) => ({
+          tab_id,
+          mode: cfg.mode,
+          ...(cfg.focus === true ? { focus: true } : {}),
+        })),
         endTurnRequested: run.endTurnRequested,
+        ungroupOnEndTurn: run.ungroupOnEndTurn,
       };
     } finally {
       run.aborted = true;
       clearTimeout(deadlineTimer);
       for (const timer of run.activeTimers) clearTimeout(timer);
       run.activeTimers.clear();
+      for (const unsub of run.eventCleanups.values()) {
+        try { unsub(); } catch { /* Ignore cleanup failure */ }
+      }
+      run.eventCleanups.clear();
       if (this.activeRun === run) this.activeRun = null;
     }
   }

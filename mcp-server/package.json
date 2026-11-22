@@ -1,7 +1,7 @@
 {
-  "name": "agent-browser-use",
-  "version": "3.0.0",
-  "description": "Let any coding agent control your real Chrome browser — a fast, open-source clone of Codex Browser Use.",
+  "name": "codex-browser-use",
+  "version": "4.8.1",
+  "description": "Fast, token-efficient local MCP server that gives any coding agent your real Chrome browser.",
   "type": "module",
   "main": "src/server.js",
   "license": "MIT",
@@ -9,16 +9,17 @@
     "type": "git",
     "url": "git+https://github.com/khanhle1406/codex-browser-use.git"
   },
-  "homepage": "https://github.com/khanhle1406/codex-browser-use",
+  "homepage": "https://codex-browser-use.vercel.app",
   "bugs": {
     "url": "https://github.com/khanhle1406/codex-browser-use/issues"
   },
-  "keywords": ["browser-use", "browser-automation", "mcp", "chrome", "accessibility-tree", "agent", "cdp"],
-  "files": ["src", "bin", "extension", "README.md"],
+  "keywords": ["codex-browser-use", "browser-use", "browser-automation", "mcp", "mcp-server", "chrome", "claude-code", "cursor", "codex", "antigravity", "windsurf", "accessibility-tree", "agent", "cdp"],
+  "files": ["src", "bin", "extension", "skill", "rules", "README.md", "LICENSE"],
   "publishConfig": {
     "access": "public"
   },
   "bin": {
+    "codex-browser-use": "bin/browser-use.js",
     "browser-use": "bin/browser-use.js"
   },
   "engines": {
@@ -26,6 +27,8 @@
   },
   "scripts": {
     "start": "node src/server.js",
+    "prepack": "node scripts/stage-package.mjs pack",
+    "postpack": "node scripts/stage-package.mjs clean",
     "test": "node --test test/*.test.js",
     "lint": "eslint src/*.js bin test",
     "bench": "node bench/perf-benchmark.mjs",

@@ -8,16 +8,19 @@
 
 **Codex's Browser Use feature is so good — so I cloned it and made a faster, open-source version for every coding agent.**
 
+**English** · [Tiếng Việt](docs/i18n/README_vi.md) · [简体中文](docs/i18n/README_zh-CN.md) · [日本語](docs/i18n/README_ja.md) · [한국어](docs/i18n/README_ko.md)
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
+[![npm](https://img.shields.io/npm/v/codex-browser-use?style=flat-square&color=cb3837)](https://www.npmjs.com/package/codex-browser-use)
 [![Website](https://img.shields.io/badge/Website-codex--browser--use.vercel.app-2563EB?style=flat-square)](https://codex-browser-use.vercel.app)
 [![Node.js](https://img.shields.io/badge/Node.js-26.12.1%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#quick-start)
-[![Version](https://img.shields.io/badge/MCP-v4.8.0%20%7C%2036%20tools-5B8DEF?style=flat-square)](#why-its-better)
-[![Extension](https://img.shields.io/badge/Extension-v0.6.2-34D399?style=flat-square)](#quick-start)
+[![Version](https://img.shields.io/badge/MCP-v4.8.1%20%7C%2036%20tools-5B8DEF?style=flat-square)](#why-its-better)
+[![Extension](https://img.shields.io/badge/Extension-v0.6.4-34D399?style=flat-square)](#quick-start)
 [![GitHub stars](https://img.shields.io/github/stars/khanhle1406/codex-browser-use?style=flat-square)](https://github.com/khanhle1406/codex-browser-use/stargazers)
 
 [Website](https://codex-browser-use.vercel.app) · [Quick start](#quick-start) · [How it works](#how-it-works) · [What you can do](#what-you-can-do) · [Why it's better](#why-its-better) · [FAQ](#faq) · [Documentation](#documentation)
 
-<code>node mcp-server/bin/browser-use.js install --client antigravity --write --skill</code>
+<code>npx -y codex-browser-use install --client antigravity --write --skill</code>
 
 </div>
 
@@ -43,7 +46,21 @@ You need **Node.js 26.12.1 or newer**, npm, and Chrome (or Chromium, Edge, or Br
 
 ### Set up your agent
 
-Run these commands from the repo folder:
+**Option 1 — 1-command install via npm (fastest):**
+
+```sh
+# Quick run via npx (or install globally with `npm install -g codex-browser-use` for a permanent binary path)
+npx -y codex-browser-use install --client antigravity --write --skill
+npx -y codex-browser-use doctor --json
+```
+
+Install just the Agent Skill (`SKILL.md` + cookbook) into any compatible client via [`skills.sh`](https://skills.sh):
+
+```sh
+npx skills add https://github.com/khanhle1406/codex-browser-use
+```
+
+**Option 2 — From source (`git clone`):**
 
 ```sh
 npm --prefix mcp-server ci
@@ -51,7 +68,7 @@ node mcp-server/bin/browser-use.js install --client antigravity --write --skill
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-`install --skill` copies the Chrome extension (`v0.6.2`), registers the local Chrome Native Messaging host, writes your client's MCP config (saving a `.bak` backup first), installs the full skill bundle (`skill/SKILL.md` + `skill/references/cookbook.md` + `skill/references/tools.md`), and automatically installs the always-on rules file (`rules/browser_use.md`, or `.cursor/rules/browser_use.mdc` for Cursor) when supported (pass `--no-rules` to skip, or `--rules` standalone).
+`install --skill` copies the Chrome extension (`v0.6.4`), registers the local Chrome Native Messaging host, writes your client's MCP config (saving a `.bak` backup first), installs the full skill bundle (`skill/SKILL.md` + `skill/references/cookbook.md` + `skill/references/tools.md`), and automatically installs the always-on rules file (`rules/browser_use.md`, or `.cursor/rules/browser_use.mdc` for Cursor) when supported (pass `--no-rules` to skip, or `--rules` standalone).
 
 <details>
 <summary><strong>Supported clients &amp; tool profiles (<code>--profile auto | compact | standard | full</code>)</strong></summary>
@@ -105,7 +122,7 @@ and leave the final tab open for me to check.
 
 ### 1. Everything stays on your computer
 
-Your agent talks to a local MCP server (`v4.8.0`), which sends commands straight into your running Chrome browser through a lightweight extension (`v0.6.2`). There is no cloud service, no Playwright browser download, and no hidden background server.
+Your agent talks to a local MCP server (`v4.8.1`), which sends commands straight into your running Chrome browser through a lightweight extension (`v0.6.4`). There is no cloud service, no Playwright browser download, and no hidden background server.
 
 <img src="docs/assets/how-it-works-architecture.png" alt="4-layer local flow from AI Agent to MCP Server to Local Bridge to Chrome Tab" width="100%" />
 
@@ -113,7 +130,7 @@ Your agent talks to a local MCP server (`v4.8.0`), which sends commands straight
 
 Instead of taking one tiny step per AI message, your agent can run a whole multi-step flow (up to `300,000` ms / `5` min per `browser_run` call) and even process up to `10` URLs in parallel (`browser.tabs.content()`). Page snapshots default to `mode: "compact"` (with `"full"` and `"interactive"` available) across `browser_run`, `browser_batch`, and `ariaSnapshot()`, share a unified AX diff baseline across `ariaSnapshot()` and `getState()`, support scoped `locator.ariaSnapshot()` subtrees (such as a single dialog or card), structured content export (`browser_get_content` & `page.content.export()` / `.tables()` / `.links()`), CSS-scaled screenshots (`max_width` default `1280` px, JPEG quality `75`), and diff-only updates — keeping token usage tiny.
 
-In `v4.7.0`–`v4.8.0`, `browser_run` adds zero-bloat local file helpers (`saveFile`, `readFile`, `saveScreenshot` with `emit: true`, `nodeRepl` alias) that auto-report `saved_files` metadata, tightly clipped `locator.screenshot()` / `page.elementScreenshot()`, `tab.ax.paste()` / `tab.ax.selectText()`, `page.innerText()` / `page.textContent()` / `page.check()` shorthands, read-only `evaluate()` support for local `{}`/`[]` container builds, network response body capture via `tab.dev.enableNetwork({ captureBodies: true })` + `tab.dev.responseBody(requestId)`, and `--profile auto` client selection.
+In `v4.7.0`–`v4.8.1`, `browser_run` adds zero-bloat local file helpers (`saveFile`, `readFile`, `saveScreenshot` with `emit: true`, `nodeRepl` alias) that auto-report `saved_files` metadata, tightly clipped `locator.screenshot()` / `page.elementScreenshot()`, `tab.ax.paste()` / `tab.ax.selectText()`, `page.innerText()` / `page.textContent()` / `page.check()` shorthands, read-only `evaluate()` support for local `{}`/`[]` container builds, network response body capture via `tab.dev.enableNetwork({ captureBodies: true })` + `tab.dev.responseBody(requestId)`, consolidated auto-uncollapsing Chrome Tab Groups, and `--profile auto` client selection.
 
 <img src="docs/assets/how-it-works-workflow.png" alt="One-call workflow: run script, read only what changed, and act without timer polling" width="100%" />
 
@@ -163,7 +180,7 @@ Your agent can open fresh tabs in its own colored Chrome Tab Group (with `target
 | Named Chrome Tab Groups | ❌ | ✅ | ✅ |
 | Fast local speed without timer polling | ❌ Slow per-step wait | ✅ | ✅ Up to 6.83x faster in parallel |
 
-Under the hood, commands run in parallel over the local bridge and wait directly on Chrome page events instead of polling on timers — making 4-tab parallel runs **6.83x faster** and full page + iframe + screenshot reads **~3x faster**. Across `v4.6.0`–`v4.8.0`, the persistent in-page locator runtime cache (`globalThis.__buRt` v2) cuts 10 warm locator payloads from `379,520` bytes to `1,260` bytes (**99.7% reduction**), `compact` AX snapshots shrink output by **81.7%** (`3,812` → `699` chars), `markdown` content extraction shrinks raw text by **94.1%** (`1,524` → `90` chars), and `--profile compact` cuts MCP tool schema size by **75.4%**. In a live end-to-end Chrome agent benchmark on the exact same model (`gpt-6.1-terra`, medium), `codex-browser-use` (`--profile compact`) completed the 4-task suite **28.8% faster** (`55.79s` vs `78.38s`) with **3.80x faster** browser execution (`3.48s` vs `13.21s`) and **51.9% fewer total input tokens** (`305,934` vs `636,008`) than Codex's built-in Chrome plugin.
+Under the hood, commands run in parallel over the local bridge and wait directly on Chrome page events instead of polling on timers — making 4-tab parallel runs **6.83x faster** and full page + iframe + screenshot reads **~3x faster**. Across `v4.6.0`–`v4.8.1`, the persistent in-page locator runtime cache (`globalThis.__buRt` v2) cuts 10 warm locator payloads from `379,520` bytes to `1,260` bytes (**99.7% reduction**), `compact` AX snapshots shrink output by **81.7%** (`3,812` → `699` chars), `markdown` content extraction shrinks raw text by **94.1%** (`1,524` → `90` chars), and `--profile compact` cuts MCP tool schema size by **75.4%**. In a live end-to-end Chrome agent benchmark on the exact same model (`gpt-6.1-terra`, medium), `codex-browser-use` (`--profile compact`) completed the 4-task suite **28.8% faster** (`55.79s` vs `78.38s`) with **3.80x faster** browser execution (`3.48s` vs `13.21s`) and **51.9% fewer total input tokens** (`305,934` vs `636,008`) than Codex's built-in Chrome plugin.
 
 <details>
 <summary><strong>See full benchmark numbers &amp; run it yourself</strong></summary>
@@ -172,7 +189,7 @@ Under the hood, commands run in parallel over the local bridge and wait directly
 
 Measured end-to-end with [agent-benchmark.mjs](mcp-server/bench/agent-benchmark.mjs) against a deterministic 4-task Chrome portal (2-page modal scraping, Shadow DOM + `contenteditable` form submission, screenshot Proof of Work, and token audit; both scored **100/100**):
 
-| Metric | Codex Built-in Chrome Plugin (`node_repl:js`) | `codex-browser-use v4.8.0` (`--profile compact`) | Verified Gain |
+| Metric | Codex Built-in Chrome Plugin (`node_repl:js`) | `codex-browser-use v4.8.1` (`--profile compact`) | Verified Gain |
 | --- | ---: | ---: | --- |
 | **Grade** | `100 / 100` | **`100 / 100`** | Equal accuracy (`8/8` modals, `1` submit) |
 | **Total Wall-Clock** | `78.38s` (`78,380 ms`) | **`55.79s`** (`55,792 ms`) | **28.8% faster** (`-22.59s`) |
@@ -279,7 +296,7 @@ npm --prefix mcp-server run bench:agents -- --mode same-model
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-- [Agent Skill Instructions](skill/SKILL.md) — workflow guide and v4.8.0 API reference installed for your coding agent
+- [Agent Skill Instructions](skill/SKILL.md) — workflow guide and v4.8.1 API reference installed for your coding agent
 - [Workflow Cookbook](skill/references/cookbook.md) — copy-paste recipes for pagination, passive reads, `responseBody()`, and screenshots
 - [Tool Profiles & Inventory](skill/references/tools.md) — `--profile auto|compact|standard|full` comparison and full 36-tool list
 - [Browser Policy Rule](rules/browser_use.md) — always-on safety and token-efficiency rules
