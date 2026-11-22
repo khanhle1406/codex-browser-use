@@ -1,0 +1,37 @@
+# codex-browser-use
+
+> Fast, free, MIT open-source local Chrome MCP server that lets AI coding agents control your real signed-in Chrome browser.
+
+## Core Capabilities
+
+- Runs inside your active Chrome browser with existing cookies, logins, and developer extensions ready.
+- Cuts token usage by ~52% by replacing heavy HTML dumps with compact accessibility outlines and scoped subtree snapshots.
+- Isolates agent tabs inside named, color-coded Chrome Tab Groups while keeping your personal tabs untouched.
+- Executes multi-step flows inside a single persistent `browser_run` call (up to 300s timeout) with local file export helpers.
+- Pauses cleanly on login walls, 2FA, or CAPTCHAs via tab handoff without attempting security bypasses.
+- 100% local on Node.js 26+ and Chrome, Edge, or Brave with zero cloud accounts or telemetry.
+
+## Supported Coding Agents
+
+- Antigravity
+- Claude Code
+- OpenAI Codex
+- Cursor
+- Windsurf
+- GitHub Copilot CLI
+- Command Code
+- OpenCode
+
+## Quick Install
+
+```sh
+node mcp-server/bin/browser-use.js install --skill
+```
+
+## Links
+
+- Website: https://codex-browser-use.vercel.app/
+- Source Repository: https://github.com/khanhle1406/codex-browser-use
+- Agent Skill Guide: https://github.com/khanhle1406/codex-browser-use/blob/main/skill/SKILL.md
+- Workflow Cookbook: https://github.com/khanhle1406/codex-browser-use/blob/main/skill/references/cookbook.md
+- Tool Reference: https://github.com/khanhle1406/codex-browser-use/blob/main/skill/references/tools.md

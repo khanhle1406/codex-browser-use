@@ -9,12 +9,13 @@
 **Codex's Browser Use feature is so good — so I cloned it and made a faster, open-source version for every coding agent.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
+[![Website](https://img.shields.io/badge/Website-codex--browser--use.vercel.app-2563EB?style=flat-square)](https://codex-browser-use.vercel.app)
 [![Node.js](https://img.shields.io/badge/Node.js-26.12.1%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#quick-start)
 [![Version](https://img.shields.io/badge/MCP-v4.8.0%20%7C%2036%20tools-5B8DEF?style=flat-square)](#why-its-better)
-[![Extension](https://img.shields.io/badge/Extension-v0.6.1-34D399?style=flat-square)](#quick-start)
+[![Extension](https://img.shields.io/badge/Extension-v0.6.2-34D399?style=flat-square)](#quick-start)
 [![GitHub stars](https://img.shields.io/github/stars/khanhle1406/codex-browser-use?style=flat-square)](https://github.com/khanhle1406/codex-browser-use/stargazers)
 
-[Quick start](#quick-start) · [How it works](#how-it-works) · [What you can do](#what-you-can-do) · [Why it's better](#why-its-better) · [FAQ](#faq) · [Documentation](#documentation)
+[Website](https://codex-browser-use.vercel.app) · [Quick start](#quick-start) · [How it works](#how-it-works) · [What you can do](#what-you-can-do) · [Why it's better](#why-its-better) · [FAQ](#faq) · [Documentation](#documentation)
 
 <code>node mcp-server/bin/browser-use.js install --client antigravity --write --skill</code>
 
@@ -50,7 +51,7 @@ node mcp-server/bin/browser-use.js install --client antigravity --write --skill
 node mcp-server/bin/browser-use.js doctor --json
 ```
 
-`install --skill` copies the Chrome extension (`v0.6.1`), registers the local Chrome Native Messaging host, writes your client's MCP config (saving a `.bak` backup first), installs the full skill bundle (`skill/SKILL.md` + `skill/references/cookbook.md` + `skill/references/tools.md`), and automatically installs the always-on rules file (`rules/browser_use.md`, or `.cursor/rules/browser_use.mdc` for Cursor) when supported (pass `--no-rules` to skip, or `--rules` standalone).
+`install --skill` copies the Chrome extension (`v0.6.2`), registers the local Chrome Native Messaging host, writes your client's MCP config (saving a `.bak` backup first), installs the full skill bundle (`skill/SKILL.md` + `skill/references/cookbook.md` + `skill/references/tools.md`), and automatically installs the always-on rules file (`rules/browser_use.md`, or `.cursor/rules/browser_use.mdc` for Cursor) when supported (pass `--no-rules` to skip, or `--rules` standalone).
 
 <details>
 <summary><strong>Supported clients &amp; tool profiles (<code>--profile auto | compact | standard | full</code>)</strong></summary>
@@ -104,7 +105,7 @@ and leave the final tab open for me to check.
 
 ### 1. Everything stays on your computer
 
-Your agent talks to a local MCP server (`v4.8.0`), which sends commands straight into your running Chrome browser through a lightweight extension (`v0.6.1`). There is no cloud service, no Playwright browser download, and no hidden background server.
+Your agent talks to a local MCP server (`v4.8.0`), which sends commands straight into your running Chrome browser through a lightweight extension (`v0.6.2`). There is no cloud service, no Playwright browser download, and no hidden background server.
 
 <img src="docs/assets/how-it-works-architecture.png" alt="4-layer local flow from AI Agent to MCP Server to Local Bridge to Chrome Tab" width="100%" />
 

@@ -1,0 +1,17 @@
+{
+  "name": "codex-browser-use",
+  "short_name": "browser-use",
+  "description": "Fast local Chrome MCP bridge for AI coding agents including Claude Code, Codex, Cursor, Windsurf, and Antigravity.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#090e1a",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/assets/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

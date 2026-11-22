@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://codex-browser-use.vercel.app/sitemap.xml
