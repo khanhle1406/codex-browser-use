@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, writeFile, rm, realpath } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm, realpath, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -161,4 +161,21 @@ test("recommendedProfileForClient and --profile auto select compact for CLI host
   const opts = { nodePath: "/node", serverPath: "/srv.js", bridgeFile: "/b.json", profile: "auto" };
   assert.deepEqual(buildConfig("codex", opts).mcp_servers["browser-use"].args, ["/srv.js", "--profile", "compact"]);
   assert.deepEqual(buildConfig("antigravity", opts).mcpServers["browser-use"].args, ["/srv.js"]);
+});
+
+test("CLI entrypoint executes when invoked through an npm/npx bin symlink", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "browser-bin-link-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cli = fileURLToPath(new URL("../bin/browser-use.js", import.meta.url));
+  const link = path.join(root, "codex-browser-use");
+  await symlink(cli, link);
+
+  const help = spawnSync(process.execPath, [link, "--help"], { encoding: "utf8" });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /Usage:/);
+  assert.match(help.stdout, /codex/);
+
+  const cfg = spawnSync(process.execPath, [link, "config", "--client", "claude_code", "--profile", "auto"], { encoding: "utf8" });
+  assert.equal(cfg.status, 0, cfg.stderr);
+  assert.deepEqual(JSON.parse(cfg.stdout).mcpServers["browser-use"].args.slice(-2), ["--profile", "compact"]);
 });

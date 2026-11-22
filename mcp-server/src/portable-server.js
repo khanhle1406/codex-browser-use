@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -223,7 +224,19 @@ export async function main() {
   process.stdin.once("end", stop);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/** @param {string} metaUrl @returns {boolean} */
+function isExecutedDirectly(metaUrl) {
+  if (!process.argv[1]) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  if (path.resolve(process.argv[1]) === selfPath) return true;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isExecutedDirectly(import.meta.url)) {
   main().catch((error) => {
     console.error("Fatal portable server error:", error);
     process.exitCode = 1;

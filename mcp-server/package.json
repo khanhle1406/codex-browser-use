@@ -1,6 +1,6 @@
 {
   "name": "codex-browser-use",
-  "version": "4.8.1",
+  "version": "4.8.2",
   "description": "Fast, token-efficient local MCP server that gives any coding agent your real Chrome browser.",
   "type": "module",
   "main": "src/server.js",

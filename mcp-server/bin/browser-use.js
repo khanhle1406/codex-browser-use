@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { lstat, mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -192,7 +193,19 @@ export async function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/** @param {string} metaUrl @returns {boolean} */
+function isExecutedDirectly(metaUrl) {
+  if (!process.argv[1]) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  if (path.resolve(process.argv[1]) === selfPath) return true;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isExecutedDirectly(import.meta.url)) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
     process.stderr.write(`browser-use: ${error.message}\n`);
     process.exitCode = 1;
