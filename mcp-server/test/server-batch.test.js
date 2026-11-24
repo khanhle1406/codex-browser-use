@@ -1042,15 +1042,124 @@ test("browser_run honors end_turn=false with keep, scroll(dir, pages), Playwrigh
   assert.equal(seen[0].entry.message, "boom");
   assert.equal(seen[1].kind, "pageerror");
 
-  const focusEnd = await client.callTool({
+  const prevEnv = process.env.BROWSER_USE_ALLOW_TAB_FOCUS;
+  delete process.env.BROWSER_USE_ALLOW_TAB_FOCUS;
+  try {
+    const blockedFocusEnd = await client.callTool({
+      name: "browser_run",
+      arguments: {
+        code: `
+          await page.goto("https://example.com/final");
+          page.markDeliverable({ focus: true });
+          await browser.endTurn({ keep: [{ tab_id: page.id, mode: "deliverable", focus: true }] });
+        `,
+      },
+    });
+    assert.notEqual(blockedFocusEnd.isError, true);
+    assert.equal(calls.some((c) => c.kind === "cdp" && c.method === "Page.bringToFront"), false);
+
+    process.env.BROWSER_USE_ALLOW_TAB_FOCUS = "1";
+    const focusEnd = await client.callTool({
+      name: "browser_run",
+      arguments: {
+        code: `
+          await page.goto("https://example.com/final-opt-in");
+          page.markDeliverable({ focus: true });
+        `,
+      },
+    });
+    assert.notEqual(focusEnd.isError, true);
+    assert.equal(calls.some((c) => c.kind === "cdp" && c.method === "Page.bringToFront"), true);
+  } finally {
+    if (prevEnv === undefined) delete process.env.BROWSER_USE_ALLOW_TAB_FOCUS;
+    else process.env.BROWSER_USE_ALLOW_TAB_FOCUS = prevEnv;
+  }
+});
+
+test("browser_run contains dangling async rejections from unawaited calls/timeouts and BridgeBrowser.isClosed tracks socket state", async (t) => {
+  const { browser } = richMockBridge();
+  const originalUrl = browser.url.bind(browser);
+  let delayMs = 30;
+  browser.url = async (...args) => {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    return await originalUrl(...args);
+  };
+
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  t.after(() => process.off("unhandledRejection", onUnhandled));
+
+  const server = createStandaloneServer({ getBrowser: async () => browser, resetBrowser: async () => {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-dangling-rejection", version: "1.0.0" });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+
+  // 1. Exact matchheat regression: calling `tab.url()` without `await` throws synchronously inside script
+  const badUrl = await client.callTool({
     name: "browser_run",
     arguments: {
+      return_state: "none",
       code: `
-        await page.goto("https://example.com/final");
-        page.markDeliverable({ focus: true });
+        await page.goto("https://example.com/pr-14");
+        const url = page.url();
+        if (url.includes("/login")) return true;
+        return false;
       `,
     },
   });
-  assert.notEqual(focusEnd.isError, true);
-  assert.equal(calls.some((c) => c.kind === "cdp" && c.method === "Page.bringToFront"), true);
+  assert.equal(badUrl.isError, true);
+  assert.match(badUrl.content[0].text, /url\.includes is not a function/);
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(unhandled.length, 0, `Unexpected unhandledRejection: ${unhandled.map(String).join("; ")}`);
+
+  const followUp = await client.callTool({
+    name: "browser_run",
+    arguments: {
+      return_state: "none",
+      code: `return await page.url();`,
+    },
+  });
+  assert.notEqual(followUp.isError, true, JSON.stringify(followUp));
+  assert.equal(JSON.parse(followUp.content[0].text).result, "https://example.com/pr-14");
+
+  // 2. Timeout race with an unawaited in-flight guarded call
+  delayMs = 650;
+  const timedOut = await client.callTool({
+    name: "browser_run",
+    arguments: {
+      timeout_ms: 500,
+      return_state: "none",
+      code: `
+        page.url();
+        await sleep(1000);
+      `,
+    },
+  });
+  assert.equal(timedOut.isError, true);
+  assert.match(timedOut.content[0].text, /timed out after 500ms/);
+
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(unhandled.length, 0, `Unexpected unhandledRejection after timeout: ${unhandled.map(String).join("; ")}`);
+
+  // 3. BridgeBrowser.isClosed() reflects underlying socket/client health
+  let connected = true;
+  const tracked = new BridgeBrowser({
+    request: async () => ({}),
+    close: async () => {},
+    isConnected: () => connected,
+    sessionId: "s-conn",
+    turnId: "t-conn",
+  });
+  assert.equal(tracked.isClosed(), false);
+  connected = false;
+  assert.equal(tracked.isClosed(), true);
+  connected = true;
+  tracked.closed = true;
+  assert.equal(tracked.isClosed(), true);
 });

@@ -1,9 +1,9 @@
 ---
 name: codex-browser-use
-description: Fast, token-efficient Chrome automation (v4.8.1 / extension v0.6.4; 36 tools in full profile, 7 core tools in compact profile). Run 300s persistent multi-step and multi-tab browser_run scripts with Probe-1-then-Batch loops, scoped locator.ariaSnapshot(), local saveFile/readFile/saveScreenshot with auto-reported saved_files, parallel browser.tabs.content(), network responseBody() capture, elementScreenshot(), ax.paste/selectText, zero-debugger passive user tab reads, consolidated auto-uncollapsing Chrome tab groups, auto-waiting locators with rich-text smart fill, and compact-first AX compression.
+description: Fast, token-efficient Chrome automation (v4.8.3 / extension v0.6.5; 36 tools in full profile, 7 core tools in compact profile). Run 300s persistent multi-step and multi-tab browser_run scripts with Probe-1-then-Batch loops, scoped locator.ariaSnapshot(), local saveFile/readFile/saveScreenshot with auto-reported saved_files, parallel browser.tabs.content(), network responseBody() capture, elementScreenshot(), ax.paste/selectText, zero-debugger passive user tab reads, consolidated auto-uncollapsing Chrome tab groups, auto-waiting locators with rich-text smart fill, and compact-first AX compression.
 ---
 
-# codex-browser-use (v4.8.1)
+# codex-browser-use (v4.8.3)
 
 Control the user's real Chrome browser over a local MCP bridge while preserving cookies/logins, grouping agent tabs cleanly, and leaving personal tabs untouched. Prefer `curl`, CLI, or API calls when no browser UI interaction is needed.
 
@@ -39,7 +39,8 @@ Control the user's real Chrome browser over a local MCP bridge while preserving 
 
 ## 3. Session, Tab & Group Hygiene
 
-- Use **1** concise task name per job via `browser.nameSession("Task QA", "blue")`; across turns, new/claimed tabs reuse the same Chrome Tab Group and automatically uncollapse it so tabs stay visible on the Chrome bar.
+- **Never steal focus from user tabs**: keep all agent tabs in the background — do **not** pass `focus: true` to `endTurn()`/`markDeliverable()`/`markHandoff()`, and do **not** try to switch Chrome's active tab to an agent tab (Chrome background automation works without activating the tab visually).
+- Use **1** concise task name per job via `browser.nameSession("Task QA", "blue")`; across turns, new/claimed tabs reuse the same Chrome Tab Group and automatically uncollapse it so tabs stay visible on the Chrome bar without taking focus.
 - **Reuse before opening**: check `await browser.user.openTabs()` or `browser.tabs.list()` for an already-open tab matching your URL and reuse it (`user.claimTab(match)` / `tab.reload()`) instead of spawning duplicate localhost/preview tabs.
 - For read-only inspection of open user tabs, prefer `await browser.tabs.read(id)` / `await browser.user.getTabContext(id)` (zero debugger attach, zero group clutter).
 - Popups (`target="_blank"`) auto-claim (`const [popup] = await Promise.all([page.waitForEvent("popup"), link.click()])`). Finish via `end_turn: true`, `tab.markDeliverable()` / `tab.markHandoff()`, or `await browser.endTurn({ keep, ungroup })` (pass `ungroup: true` to dissolve finished group labels, or call `browser.groups.cleanup({ ungroupFinished: true })` / `browser.groups.ungroup()`).
@@ -47,7 +48,7 @@ Control the user's real Chrome browser over a local MCP bridge while preserving 
 ## 4. `browser_run` Essential API (Shadow-DOM Auto-Wait Locators)
 
 - **Locators (3000ms auto-wait, pierces open Shadow DOM)**: `tab.getByRole(role, { name, exact })`, `tab.getByLabel()`, `tab.getByPlaceholder()`, `tab.getByTestId()`, `tab.getByText()`, `tab.locator("css=...")`, `tab.frameLocator("iframe#x")`.
-- **Actions & Queries**: `.click()`, `.dblclick()`, `.fill()` (inputs, `<textarea>`, `contenteditable`, CKEditor/TinyMCE/Quill), `.check()`, `.uncheck()`, `.selectOption()`, `.clear()`, `.press()`, `.setInputFiles()`, `.innerText()`, `.textContent()`, `.allInnerTexts()`, `.allTextContents()`, `.getAttribute()`, `.inputValue()`, `.isVisible()`, `.isEnabled()`, `.count()`, plus direct `page.innerText(sel)` / `page.textContent(sel)` / `page.inputValue(sel)` / `page.getAttribute(sel, name)` / `page.check(sel)` shorthands.
+- **Actions & Queries**: `.click()`, `.dblclick()`, `.fill()` (inputs, `<textarea>`, `contenteditable`, CKEditor/TinyMCE/Quill), `.check()`, `.uncheck()`, `.selectOption()`, `.clear()`, `.press()`, `.setInputFiles()`, `await tab.url()` / `await tab.title()` (async — always `await`), `.innerText()`, `.textContent()`, `.allInnerTexts()`, `.allTextContents()`, `.getAttribute()`, `.inputValue()`, `.isVisible()`, `.isEnabled()`, `.count()`, plus direct `page.innerText(sel)` / `page.textContent(sel)` / `page.inputValue(sel)` / `page.getAttribute(sel, name)` / `page.check(sel)` shorthands.
 - **Waits & Snapshots**: `tab.waitFor({ text | selector | state })`, `locator.waitFor({ state: "visible" | "hidden" })`, `tab.ariaSnapshot({ mode, maxLines, selector })`, `locator.ariaSnapshot({ mode, maxLines })` (`compact` default), `tab.ax.write()` / `click(idx)` / `setValue(idx, v)` / `paste(idx, v)` / `selectText(idx, text)`.
 - **Local Files & Screenshots (require absolute paths)**: `await saveFile(absPath, data)`, `await readFile(absPath, opts)`, `await saveScreenshot(absPath, { emit, fullPage, format, quality, selector })`, `await locator.saveScreenshot(absPath, opts)`, `await locator.screenshot()`.
 - **Batch Content & DevTools**: `await browser.tabs.content(urls, { format: "markdown" | "tables" | "links" | "text" })` (returns structured `.links`/`.tables`), `tab.content.export()`, `tab.dev.enableNetwork({ captureBodies: true })`, `tab.dev.responseBody(reqId)`.

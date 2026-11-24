@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Portable Browser Bridge",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "Connect the local Browser Use adapter to Chrome tabs with live virtual cursor and tab badges.",
   "icons": {
     "16": "icons/icon-16.png",

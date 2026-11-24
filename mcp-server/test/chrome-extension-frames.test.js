@@ -603,7 +603,7 @@ test("extension targets normal window on createBlankTab, reuses & uncollapses gr
   assert.equal(tabGroups.get(400).collapsed, false);
   assert.ok(groupUpdates.some((u) => u.id === 400 && u.collapsed === false));
 
-  // 3. Re-collapsing group 400 and focusing deliverable tab uncollapses + activates it; duplicate deliverable URL closes older tab
+  // 3. By default allowTabFocus is false: markTab uncollapses group 400 and cleans duplicates without stealing user focus
   await request({ method: "markTab", tabId: t1.id, details: { status: "deliverable", focus: true } });
   await request({ method: "releaseTab", tabId: t1.id });
   assert.ok(openTabs.has(t1.id));
@@ -614,11 +614,16 @@ test("extension targets normal window on createBlankTab, reuses & uncollapses gr
   tabGroups.get(400).collapsed = true;
   await request({ method: "markTab", tabId: t2.id, details: { status: "deliverable", focus: true } });
 
-  // Older duplicate 127.0.0.1:5173 deliverable tab t1 was removed automatically while user tab 10 stayed intact!
+  // Older duplicate 127.0.0.1:5173 deliverable tab t1 was removed automatically while user tab 10 kept focus!
   assert.ok(removedTabs.includes(t1.id));
   assert.equal(openTabs.has(t2.id), true);
   assert.equal(openTabs.has(10), true);
   assert.equal(tabGroups.get(400).collapsed, false);
+  assert.equal(updatedTabs.some((u) => u.id === t2.id && u.active === true), false);
+
+  // Explicit opt-in allowTabFocus=true allows focusing deliverable tab when requested
+  await request({ method: "setConfig", details: { allowTabFocus: true } });
+  await request({ method: "markTab", tabId: t2.id, details: { status: "deliverable", focus: true } });
   assert.ok(updatedTabs.some((u) => u.id === t2.id && u.active === true));
 
   // 4. listTabGroups & ungroupTabs dissolve finished group cleanly

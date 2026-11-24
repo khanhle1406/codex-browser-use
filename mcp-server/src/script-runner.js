@@ -224,21 +224,31 @@ export class BrowserScriptSession {
     return this.currentTabId ?? (browser?.activeTabId != null ? String(browser.activeTabId) : null);
   }
 
-  async #guard(fn, label = null, { trackActiveTab = true } = {}) {
+  #trackPending(run, promise) {
+    run.pendingPromises?.add(promise);
+    const cleanup = () => run.pendingPromises?.delete(promise);
+    promise.then(cleanup, cleanup);
+    return promise;
+  }
+
+  #guard(fn, label = null, { trackActiveTab = true } = {}) {
     const run = this.#requireRun();
     if (label) run.lastAction = label;
-    const res = await fn(run.browser);
-    if (run.aborted || run !== this.activeRun) {
-      throw new Error(this.#timeoutMessage(run));
-    }
-    if (res && typeof res === "object" && res.tab_id != null) {
-      const tid = String(res.tab_id);
-      run.touchedTabs.add(tid);
-      if (trackActiveTab) this.currentTabId = tid;
-    } else if (trackActiveTab && run.browser.activeTabId != null && this.currentTabId === null) {
-      this.currentTabId = String(run.browser.activeTabId);
-    }
-    return res;
+    const promise = (async () => {
+      const res = await fn(run.browser);
+      if (run.aborted || run !== this.activeRun) {
+        throw new Error(this.#timeoutMessage(run));
+      }
+      if (res && typeof res === "object" && res.tab_id != null) {
+        const tid = String(res.tab_id);
+        run.touchedTabs.add(tid);
+        if (trackActiveTab) this.currentTabId = tid;
+      } else if (trackActiveTab && run.browser.activeTabId != null && this.currentTabId === null) {
+        this.currentTabId = String(run.browser.activeTabId);
+      }
+      return res;
+    })();
+    return this.#trackPending(run, promise);
   }
 
   #log(...args) {
@@ -253,7 +263,7 @@ export class BrowserScriptSession {
 
   #sleep(ms) {
     const run = this.#requireRun();
-    return new Promise((resolve, reject) => {
+    const promise = new Promise((resolve, reject) => {
       const waitMs = Math.max(0, Number(ms) || 0);
       const timer = setTimeout(() => {
         run.activeTimers.delete(timer);
@@ -262,6 +272,7 @@ export class BrowserScriptSession {
       }, waitMs);
       run.activeTimers.add(timer);
     });
+    return this.#trackPending(run, promise);
   }
 
   async #viewImage(captureOrOpts, fixedTabId = null) {
@@ -1444,6 +1455,7 @@ export class BrowserScriptSession {
       keptTabs: new Map(),
       savedFiles: new Map(),
       eventCleanups: new Map(),
+      pendingPromises: new Set(),
       endTurnRequested: false,
       ungroupOnEndTurn: false,
       logs: [],
@@ -1490,9 +1502,23 @@ export class BrowserScriptSession {
       }, timeoutMs);
     });
 
+    const runnerPromise = runner(
+      api,
+      api,
+      log,
+      sleep,
+      viewImage,
+      saveFile,
+      readFile,
+      saveScreenshot,
+      nodeRepl,
+      consoleFacade,
+      this.scope,
+    );
+
     try {
       const rawValue = await Promise.race([
-        runner(api, api, log, sleep, viewImage, saveFile, readFile, saveScreenshot, nodeRepl, consoleFacade, this.scope),
+        runnerPromise,
         timeoutPromise,
       ]);
       const notifications = [];
@@ -1523,6 +1549,9 @@ export class BrowserScriptSession {
     } finally {
       run.aborted = true;
       clearTimeout(deadlineTimer);
+      runnerPromise.catch(() => {});
+      for (const pending of run.pendingPromises) pending.catch(() => {});
+      run.pendingPromises.clear();
       for (const timer of run.activeTimers) clearTimeout(timer);
       run.activeTimers.clear();
       for (const unsub of run.eventCleanups.values()) {

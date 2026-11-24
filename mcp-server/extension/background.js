@@ -214,6 +214,7 @@ function connect() {
   let activeVisualTabId = null;
   /** @type {"fast"|"smooth"|"off"} */
   let cursorMode = "fast";
+  let allowTabFocus = false;
   let moveSeq = 0;
   let disconnected = false;
   /** @type {Map<number, {current:{tabId:number,wasUserTab:boolean}|null, previous:{tabId:number,wasUserTab:boolean}|null}>} */
@@ -726,7 +727,10 @@ function connect() {
       if (details?.cursorMode === "fast" || details?.cursorMode === "smooth" || details?.cursorMode === "off") {
         cursorMode = details.cursorMode;
       }
-      return {ok: true, cursorMode};
+      if (typeof details?.allowTabFocus === "boolean") {
+        allowTabFocus = details.allowTabFocus;
+      }
+      return {ok: true, cursorMode, allowTabFocus};
     }
     if (method === "readTabContext") {
       if (!Number.isSafeInteger(tabId) || typeof chrome.tabs?.get !== "function") {
@@ -950,7 +954,7 @@ function connect() {
           if (tab && Number.isSafeInteger(tab.groupId) && tab.groupId >= 0 && typeof chrome.tabGroups?.update === "function") {
             await chrome.tabGroups.update(tab.groupId, {collapsed: false}).catch(() => {});
           }
-          if (typeof chrome.tabs?.update === "function") {
+          if (allowTabFocus && typeof chrome.tabs?.update === "function") {
             await chrome.tabs.update(tabId, {active: true}).catch(() => {});
           }
         }

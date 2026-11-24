@@ -979,7 +979,7 @@ test("endTurn clears attached/owned state cleanly and #cdp auto-reattaches after
   assert.equal(fresh.tab_id, "2");
 });
 
-test("endTurn forwards focus and ungroup flags and group helpers delegate cleanly", async () => {
+test("endTurn suppresses focus stealing by default, honors opt-in BROWSER_USE_ALLOW_TAB_FOCUS=1, and delegates group helpers", async () => {
   const { browser, calls } = browserFixture();
   const extraCalls = [];
   const origRequest = browser.request;
@@ -994,28 +994,51 @@ test("endTurn forwards focus and ungroup flags and group helpers delegate cleanl
 
   browser.sessionName = { name: "QA", color: "blue" };
   await browser.getState({ screenshot: false });
-  const beforeTurn = browser.turnId;
-  const endRes = await browser.endTurn({
-    keep: [{ tab_id: "1", mode: "deliverable", focus: true }],
-    ungroup: true,
-  });
-  assert.equal(endRes.ungrouped, true);
-  assert.equal(browser.sessionName, null);
+  const prevEnv = process.env.BROWSER_USE_ALLOW_TAB_FOCUS;
+  delete process.env.BROWSER_USE_ALLOW_TAB_FOCUS;
+  try {
+    const beforeTurn = browser.turnId;
+    const endRes = await browser.endTurn({
+      keep: [{ tab_id: "1", mode: "deliverable", focus: true }],
+      ungroup: true,
+    });
+    assert.equal(endRes.ungrouped, true);
+    assert.equal(browser.sessionName, null);
 
-  const markCall = calls.find((c) => c.kind === "rpc" && c.method === "markTab");
-  assert.deepEqual(markCall.params, {
-    session_id: "session-1",
-    turn_id: beforeTurn,
-    tabId: 1,
-    status: "deliverable",
-    focus: true,
-  });
-  const endedCall = calls.find((c) => c.kind === "rpc" && c.method === "turnEnded");
-  assert.deepEqual(endedCall.params, {
-    session_id: "session-1",
-    turn_id: beforeTurn,
-    ungroup: true,
-  });
+    const markCall = calls.find((c) => c.kind === "rpc" && c.method === "markTab");
+    assert.deepEqual(markCall.params, {
+      session_id: "session-1",
+      turn_id: beforeTurn,
+      tabId: 1,
+      status: "deliverable",
+    });
+    assert.equal(calls.some((c) => c.kind === "cdp" && c.method === "Page.bringToFront"), false);
+    const endedCall = calls.find((c) => c.kind === "rpc" && c.method === "turnEnded");
+    assert.deepEqual(endedCall.params, {
+      session_id: "session-1",
+      turn_id: beforeTurn,
+      ungroup: true,
+    });
+
+    process.env.BROWSER_USE_ALLOW_TAB_FOCUS = "1";
+    await browser.getState({ screenshot: false });
+    const optTurn = browser.turnId;
+    await browser.endTurn({
+      keep: [{ tab_id: "1", mode: "deliverable", focus: true }],
+    });
+    const optMarkCall = calls.filter((c) => c.kind === "rpc" && c.method === "markTab").at(-1);
+    assert.deepEqual(optMarkCall.params, {
+      session_id: "session-1",
+      turn_id: optTurn,
+      tabId: 1,
+      status: "deliverable",
+      focus: true,
+    });
+    assert.equal(calls.some((c) => c.kind === "cdp" && c.method === "Page.bringToFront"), true);
+  } finally {
+    if (prevEnv === undefined) delete process.env.BROWSER_USE_ALLOW_TAB_FOCUS;
+    else process.env.BROWSER_USE_ALLOW_TAB_FOCUS = prevEnv;
+  }
 
   const groups = await browser.listTabGroups();
   assert.equal(groups.length, 1);

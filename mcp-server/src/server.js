@@ -13,7 +13,6 @@ const tabGroupColorEnum = z.enum(["grey", "blue", "red", "yellow", "green", "pin
 const keepEntrySchema = z.object({
   tab_id: stringOrNumber,
   mode: z.enum(["handoff", "deliverable"]).optional(),
-  focus: z.boolean().optional(),
 });
 const keepParamSchema = z.union([
   z.enum(["handoff", "deliverable"]),
@@ -22,17 +21,19 @@ const keepParamSchema = z.union([
 
 /**
  * Normalize inline `keep` parameter + script-tracked kept tabs into unique keep entries.
+ * Never activates or steals focus from the user's tab unless `BROWSER_USE_ALLOW_TAB_FOCUS=1`.
  * @param {"handoff"|"deliverable"|Array<{tab_id:unknown, mode?:string, focus?:boolean}>|undefined} keep
  * @param {unknown} fallbackTabId
  * @param {Array<{tab_id:unknown, mode?:string, focus?:boolean}>} [extraKept]
  */
 function resolveKeepEntries(keep, fallbackTabId, extraKept = []) {
+  const allowFocus = process.env.BROWSER_USE_ALLOW_TAB_FOCUS === "1";
   const merged = new Map();
   for (const entry of extraKept) {
     if (entry?.tab_id != null) {
       merged.set(String(entry.tab_id), {
         mode: entry.mode === "deliverable" ? "deliverable" : "handoff",
-        ...(entry.focus === true ? { focus: true } : {}),
+        ...(allowFocus && entry.focus === true ? { focus: true } : {}),
       });
     }
   }
@@ -41,7 +42,7 @@ function resolveKeepEntries(keep, fallbackTabId, extraKept = []) {
       const prev = merged.get(String(fallbackTabId));
       merged.set(String(fallbackTabId), {
         mode: keep,
-        ...(prev?.focus === true ? { focus: true } : {}),
+        ...(allowFocus && prev?.focus === true ? { focus: true } : {}),
       });
     }
   } else if (Array.isArray(keep)) {
@@ -50,7 +51,7 @@ function resolveKeepEntries(keep, fallbackTabId, extraKept = []) {
         const prev = merged.get(String(entry.tab_id));
         merged.set(String(entry.tab_id), {
           mode: entry.mode === "deliverable" ? "deliverable" : "handoff",
-          ...(entry.focus === true || (entry.focus === undefined && prev?.focus === true) ? { focus: true } : {}),
+          ...(allowFocus && (entry.focus === true || (entry.focus === undefined && prev?.focus === true)) ? { focus: true } : {}),
         });
       }
     }
@@ -58,7 +59,7 @@ function resolveKeepEntries(keep, fallbackTabId, extraKept = []) {
   return [...merged.entries()].map(([tab_id, cfg]) => ({
     tab_id,
     mode: cfg.mode,
-    ...(cfg.focus === true ? { focus: true } : {}),
+    ...(allowFocus && cfg.focus === true ? { focus: true } : {}),
   }));
 }
 
@@ -94,8 +95,16 @@ function shouldAttachErrorState(error, msg) {
 let browserPromise = null;
 
 /** @returns {Promise<BridgeBrowser>} */
-function defaultGetBrowser() {
-  browserPromise ??= BridgeBrowser.connect({ bridgeFile }).catch((error) => {
+async function defaultGetBrowser() {
+  if (browserPromise) {
+    const existing = await browserPromise.catch(() => null);
+    if (!existing || existing.isClosed?.() || existing.closed) {
+      browserPromise = null;
+    } else {
+      return existing;
+    }
+  }
+  browserPromise = BridgeBrowser.connect({ bridgeFile }).catch((error) => {
     browserPromise = null;
     throw error;
   });
@@ -1083,11 +1092,11 @@ export function registerTools(server, deps = {}) {
 export function createStandaloneServer(deps = {}) {
   const profile = deps.profile ?? resolveToolProfile();
   const server = new McpServer(
-    { name: "browser-use", version: "4.8.2" },
+    { name: "browser-use", version: "4.8.3" },
     {
       instructions: [
         "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.tabs.read()` / `browser.user.claimTab()` in `browser_run`). Claimed user tabs join the session Chrome Tab Group and are released (kept open & grouped) when a turn ends.",
-        "Tab & Group Hygiene: Use 1 concise task name via `browser.nameSession()` for an entire workflow so tabs across turns consolidate into 1 Chrome Tab Group (avoid spawning separate groups per turn). Before opening a new tab (`tabs.new(url)`), check `browser.user.openTabs()` / `tabs.list()` and reuse an existing tab for the same URL. Close ephemeral tabs with `keep: []` and pass `ungroup: true` when finishing if kept tabs no longer need a group label.",
+        "Tab & Group Hygiene: Use 1 concise task name via `browser.nameSession()` for an entire workflow so tabs across turns consolidate into 1 Chrome Tab Group (avoid spawning separate groups per turn). Before opening a new tab (`tabs.new(url)`), check `browser.user.openTabs()` / `tabs.list()` and reuse an existing tab for the same URL. Keep all agent tabs in the background and never pass `focus: true` or steal focus from the user's active tab. Close ephemeral tabs with `keep: []` and pass `ungroup: true` when finishing if kept tabs no longer need a group label.",
         "Speed & efficiency (Probe 1 -> Batch Loop All): When facing repetitive UI rows/modals/pages, inspect 1 sample item first, then pack the full loop (clicks, chunked reads, `saveFile()`, pagination) or known deterministic click sequence into ONE `browser_run` call (up to 300000ms) instead of repeating small calls. Includes persistent variables (`const`/`let`/`class`), bound tabs (`browser.tabs.new()` / `browser.tabs.get(id)` / parallel `browser.tabs.content(urls)` returning structured `.links`/`.tables`), `browser.nameSession()`, `browser.groups`, auto-waiting locators (including async CKEditor sync), `locator.screenshot()` / `saveScreenshot()`, `dev.enableNetwork({ captureBodies: true })` + `dev.responseBody(id)`, `markDeliverable`/`markHandoff`, and `browser.endTurn()`/`browser.end_turn()`.",
         "Diff-first & inspect-first: Start with `ariaSnapshot({ mode: \"compact\" })` or `browser_get_state` / `ax.write()` before guessing selectors; narrow multi-matches with `.first()`/`.nth(i)` and use `reload()` rather than `goto(sameUrl)`. Request `screenshot: true` / `ax.write('screenshot')` / `saveScreenshot(..., { emit: true })` when visual inspection or Proof of Work is needed.",
         "Pass end_turn/keep/ungroup to browser_run or browser_batch (or call `browser.endTurn()`/`markDeliverable()` inside `browser_run`), `browser_name_session` / `browser.nameSession()` to group tabs visually, and `browser_end_turn` at the end for tabs that must survive cleanup.",
@@ -1099,6 +1108,13 @@ export function createStandaloneServer(deps = {}) {
 }
 
 export async function main() {
+  process.on("unhandledRejection", (reason) => {
+    console.error(
+      "Browser-use unhandled rejection (contained):",
+      reason instanceof Error ? reason.stack || reason.message : String(reason),
+    );
+  });
+
   const server = createStandaloneServer();
   await server.connect(new StdioServerTransport());
 

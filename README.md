@@ -14,8 +14,8 @@
 [![npm](https://img.shields.io/npm/v/codex-browser-use?style=flat-square&color=cb3837)](https://www.npmjs.com/package/codex-browser-use)
 [![Website](https://img.shields.io/badge/Website-codex--browser--use.vercel.app-2563EB?style=flat-square)](https://codex-browser-use.vercel.app)
 [![Node.js](https://img.shields.io/badge/Node.js-26.12.1%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#quick-start)
-[![Version](https://img.shields.io/badge/MCP-v4.8.2%20%7C%2036%20tools-5B8DEF?style=flat-square)](#why-its-better)
-[![Extension](https://img.shields.io/badge/Extension-v0.6.4-34D399?style=flat-square)](#quick-start)
+[![Version](https://img.shields.io/badge/MCP-v4.8.3%20%7C%2036%20tools-5B8DEF?style=flat-square)](#why-its-better)
+[![Extension](https://img.shields.io/badge/Extension-v0.6.5-34D399?style=flat-square)](#quick-start)
 [![GitHub stars](https://img.shields.io/github/stars/khanhle1406/codex-browser-use?style=flat-square)](https://github.com/khanhle1406/codex-browser-use/stargazers)
 
 [Website](https://codex-browser-use.vercel.app) · [Quick start](#quick-start) · [How it works](#how-it-works) · [What you can do](#what-you-can-do) · [Why it's better](#why-its-better) · [FAQ](#faq) · [Documentation](#documentation)

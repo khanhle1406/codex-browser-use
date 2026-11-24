@@ -164,6 +164,11 @@ function splitIndices(value) {
   return String(value).split(/[,;\s]+/u).map((entry) => entry.trim()).filter(Boolean);
 }
 
+/** @returns {boolean} */
+function allowTabFocus() {
+  return process.env.BROWSER_USE_ALLOW_TAB_FOCUS === "1";
+}
+
 /** @param {unknown} ms @returns {Promise<void>} */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -185,11 +190,12 @@ function formatConsoleArgs(params) {
  */
 export class BridgeBrowser {
   /**
-   * @param {{request:(method:string,params?:Record<string,unknown>)=>Promise<unknown>, close:()=>Promise<void>, sessionId:string, turnId:string, info?:Record<string,unknown>, frameSessions?:Map<number, Map<string,string>>}} options
+   * @param {{request:(method:string,params?:Record<string,unknown>)=>Promise<unknown>, close:()=>Promise<void>, isConnected?:()=>boolean, sessionId:string, turnId:string, info?:Record<string,unknown>, frameSessions?:Map<number, Map<string,string>>}} options
    */
-  constructor({ request, close, sessionId, turnId, info = {}, frameSessions = new Map() }) {
+  constructor({ request, close, isConnected, sessionId, turnId, info = {}, frameSessions = new Map() }) {
     this.request = request;
     this.closeFn = close;
+    this.isConnectedFn = isConnected ?? null;
     this.sessionId = sessionId;
     this.turnId = turnId;
     this.info = info;
@@ -229,6 +235,11 @@ export class BridgeBrowser {
     this.closed = false;
   }
 
+  /** @returns {boolean} */
+  isClosed() {
+    return this.closed || (typeof this.isConnectedFn === "function" && !this.isConnectedFn());
+  }
+
   /**
    * @param {{bridgeFile:string, sessionId?:string, turnId?:string, requestTimeoutMs?:number}} options
    * @returns {Promise<BridgeBrowser>}
@@ -253,10 +264,22 @@ export class BridgeBrowser {
     });
     const info = await request("getInfo", { session_id: sessionId, turn_id: turnId });
     const envCursorMode = process.env.BROWSER_USE_CURSOR_MODE;
-    if (envCursorMode === "fast" || envCursorMode === "smooth" || envCursorMode === "off") {
-      await request("setConfig", { session_id: sessionId, turn_id: turnId, cursorMode: envCursorMode }).catch(() => {});
-    }
-    browserRef = new BridgeBrowser({ request, close: () => client.close(), sessionId, turnId, info: info ?? {}, frameSessions });
+    const configPatch = {
+      ...(envCursorMode === "fast" || envCursorMode === "smooth" || envCursorMode === "off"
+        ? { cursorMode: envCursorMode }
+        : {}),
+      allowTabFocus: allowTabFocus(),
+    };
+    await request("setConfig", { session_id: sessionId, turn_id: turnId, ...configPatch }).catch(() => {});
+    browserRef = new BridgeBrowser({
+      request,
+      close: () => client.close(),
+      isConnected: () => !client.closed && Boolean(client.socket && !client.socket.destroyed),
+      sessionId,
+      turnId,
+      info: info ?? {},
+      frameSessions,
+    });
     return browserRef;
   }
 
@@ -3194,17 +3217,19 @@ export class BridgeBrowser {
 
   /** @param {Array<{tab_id:unknown, mode?:string, focus?:boolean}>} [entries] */
   async markTabs(entries = []) {
+    const canFocus = allowTabFocus();
     const marked = [];
     for (const entry of entries) {
       const id = await this.#resolveTab(entry?.tab_id);
       const mode = entry?.mode === "deliverable" ? "deliverable" : "handoff";
-      if (mode === "deliverable" && entry?.focus === true && this.attached.has(id)) {
+      const focusTab = canFocus && entry?.focus === true;
+      if (mode === "deliverable" && focusTab && this.attached.has(id)) {
         await this.#cdp(id, "Page.bringToFront").catch(() => {});
       }
       await this.#rpc("markTab", {
         tabId: id,
         status: mode,
-        ...(entry?.focus === true ? { focus: true } : {}),
+        ...(focusTab ? { focus: true } : {}),
       });
       marked.push({ tab_id: String(id), mode });
     }
@@ -3213,18 +3238,20 @@ export class BridgeBrowser {
 
   /** @param {{keep?:Array<{tab_id:unknown, mode?:string, focus?:boolean}>, ungroup?:boolean}} [options] */
   async endTurn({ keep = [], ungroup = false } = {}) {
+    const canFocus = allowTabFocus();
     const handoffIds = new Set();
     for (const entry of keep) {
       const id = await this.#resolveTab(entry?.tab_id);
       const mode = entry?.mode === "deliverable" ? "deliverable" : "handoff";
+      const focusTab = canFocus && entry?.focus === true;
       if (mode === "handoff") handoffIds.add(id);
-      if (mode === "deliverable" && entry?.focus === true && this.attached.has(id)) {
+      if (mode === "deliverable" && focusTab && this.attached.has(id)) {
         await this.#cdp(id, "Page.bringToFront").catch(() => {});
       }
       await this.#rpc("markTab", {
         tabId: id,
         status: mode,
-        ...(entry?.focus === true ? { focus: true } : {}),
+        ...(focusTab ? { focus: true } : {}),
       });
     }
     await this.#rpc("turnEnded", { ...(ungroup === true ? { ungroup: true } : {}) });
