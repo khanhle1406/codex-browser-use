@@ -20,9 +20,45 @@ const SHARED_DOM_HELPERS = `
     if (!el || el.nodeType !== 1) return false;
     const win = el.ownerDocument?.defaultView || window;
     const style = win.getComputedStyle(el);
-    if (!style || style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    const isCustomControl = el.tagName === "INPUT" && ["checkbox", "radio", "file"].includes((el.getAttribute("type") || "").toLowerCase());
+    if (!style || style.display === "none" || style.visibility === "hidden" || (style.opacity === "0" && !isCustomControl)) return false;
     const rect = el.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
+  };
+
+  const collectShadowRoots = (root) => {
+    const roots = [];
+    const seen = new Set();
+    const walk = (scope) => {
+      if (!scope || seen.has(scope)) return;
+      seen.add(scope);
+      const doc = scope.ownerDocument || (scope.nodeType === 9 ? scope : document);
+      if (typeof doc.createTreeWalker === "function" && typeof NodeFilter !== "undefined") {
+        const tw = doc.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT);
+        for (let cur = scope.nodeType === 1 ? scope : tw.nextNode(); cur; cur = tw.nextNode()) {
+          if (cur.shadowRoot && !seen.has(cur.shadowRoot)) {
+            roots.push(cur.shadowRoot);
+            walk(cur.shadowRoot);
+          }
+        }
+        return;
+      }
+      const stack = [scope];
+      while (stack.length > 0) {
+        const cur = stack.pop();
+        if (!cur) continue;
+        if (cur.nodeType === 1 && cur.shadowRoot && !seen.has(cur.shadowRoot)) {
+          roots.push(cur.shadowRoot);
+          stack.push(cur.shadowRoot);
+        }
+        const children = cur.children || (cur.documentElement ? [cur.documentElement] : null);
+        if (children) {
+          for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+        }
+      }
+    };
+    walk(root);
+    return roots;
   };
 
   const deepElements = (root) => {
@@ -52,22 +88,18 @@ const SHARED_DOM_HELPERS = `
   const querySelectorAllDeep = (root, css) => {
     const matches = [];
     const seen = new Set();
-    const visitRoot = (scope) => {
+    const runScope = (scope, isRoot) => {
       try {
         for (const el of scope.querySelectorAll(css)) {
           if (!seen.has(el)) { seen.add(el); matches.push(el); }
         }
       } catch (err) {
-        if (scope === root) throw err;
-      }
-      for (const el of deepElements(scope)) {
-        if (el.shadowRoot && !seen.has(el.shadowRoot)) {
-          seen.add(el.shadowRoot);
-          visitRoot(el.shadowRoot);
-        }
+        if (isRoot) throw err;
       }
     };
-    visitRoot(root);
+    runScope(root, true);
+    const shadows = collectShadowRoots(root);
+    for (let i = 0; i < shadows.length; i++) runScope(shadows[i], false);
     return matches;
   };
 
@@ -305,6 +337,21 @@ const SHARED_LOCATOR_RESOLVER = `
         cur += ch;
         continue;
       }
+      if (ch === "/" && /(?:text|name|has-text|has-not-text|label|placeholder|alt|title)=$/.test(cur)) {
+        cur += ch;
+        let rxEsc = false;
+        while (++i < input.length) {
+          const rch = input[i];
+          cur += rch;
+          if (rxEsc) { rxEsc = false; continue; }
+          if (rch === "\\\\") { rxEsc = true; continue; }
+          if (rch === "/") break;
+        }
+        while (i + 1 < input.length && /[dgimsuvy]/.test(input[i + 1])) {
+          cur += input[++i];
+        }
+        continue;
+      }
       if (ch === "(") {
         parenDepth++;
         cur += ch;
@@ -329,19 +376,109 @@ const SHARED_LOCATOR_RESOLVER = `
 
   const unquote = (s) => {
     const t = s.trim();
-    if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
-      return t.slice(1, -1);
+    if (t.startsWith('"') && t.endsWith('"')) {
+      try { return JSON.parse(t); } catch { return t.slice(1, -1); }
+    }
+    if (t.startsWith("'") && t.endsWith("'")) {
+      return t.slice(1, -1).replace(/\\\\(['\\\\])/g, "$1");
     }
     return t;
   };
 
+  const parseValueMatcher = (rawSpec, defaultExactWhenUnflagged) => {
+    const trimmed = String(rawSpec || "").trim();
+    const flagMatch = /^(.*?)\\[exact=(true|false)\\]$/.exec(trimmed);
+    const hasExactFlag = Boolean(flagMatch);
+    const explicitExact = flagMatch?.[2] === "true";
+    const body = (flagMatch ? flagMatch[1] : trimmed).trim();
+    const regex = parseRegexLiteral(body);
+    if (regex) {
+      return {
+        regex,
+        exact: false,
+        target: "",
+        targetLower: "",
+        test: (val) => regex.test(String(val || "")),
+      };
+    }
+    const hadQuotes = (body.startsWith('"') && body.endsWith('"')) || (body.startsWith("'") && body.endsWith("'"));
+    const target = unquote(body);
+    const targetLower = target.toLowerCase();
+    const exact = hasExactFlag ? explicitExact : (hadQuotes || defaultExactWhenUnflagged);
+    return {
+      regex: null,
+      exact,
+      target,
+      targetLower,
+      test: (val) => {
+        const s = String(val || "").trim();
+        return exact ? s === target : s.toLowerCase().includes(targetLower);
+      },
+    };
+  };
+
+  const ROLE_HINT_SELECTORS = {
+    button: 'button,summary,input[type="button"],input[type="submit"],input[type="reset"],input[type="image"],[role="button"]',
+    link: 'a[href],area[href],[role="link"]',
+    textbox: 'textarea,input:not([type]),input[type="text"],input[type="email"],input[type="password"],input[type="search"],input[type="tel"],input[type="url"],[role="textbox"]',
+    checkbox: 'input[type="checkbox"],[role="checkbox"]',
+    radio: 'input[type="radio"],[role="radio"]',
+    combobox: 'select,[role="combobox"]',
+    listbox: 'select,[role="listbox"]',
+    option: 'option,[role="option"]',
+    heading: 'h1,h2,h3,h4,h5,h6,[role="heading"]',
+    tab: '[role="tab"]',
+    listitem: 'li,[role="listitem"]',
+    row: 'tr,[role="row"]',
+    cell: 'td,[role="cell"]',
+    columnheader: 'th,[role="columnheader"]',
+    img: 'img,[role="img"]',
+    dialog: 'dialog,[role="dialog"]',
+    navigation: 'nav,[role="navigation"]',
+    main: 'main,[role="main"]',
+    form: 'form,[role="form"]',
+    menuitem: '[role="menuitem"]',
+    switch: '[role="switch"]',
+    slider: 'input[type="range"],[role="slider"]',
+    spinbutton: 'input[type="number"],[role="spinbutton"]',
+  };
+
   const querySingle = (scope, step) => {
     if (step.startsWith("text=")) {
-      const rawText = step.slice(5).trim();
-      const regex = parseRegexLiteral(rawText);
-      const exact = !regex && ((rawText.startsWith('"') && rawText.endsWith('"')) || (rawText.startsWith("'") && rawText.endsWith("'")));
-      const target = regex ? null : unquote(rawText);
-      const matchesText = (val) => regex ? regex.test(val) : (exact ? val === target : val.includes(target));
+      const matcher = parseValueMatcher(step.slice(5), false);
+      const { regex, exact, target, targetLower } = matcher;
+      const matchesText = (val) => regex ? regex.test(val) : (exact ? val === target : val.toLowerCase().includes(targetLower));
+      const leafTextMatches = [];
+      const doc = scope.ownerDocument || (scope.nodeType === 9 ? scope : document);
+      if ((regex || target !== "") && typeof doc.createTreeWalker === "function" && typeof NodeFilter !== "undefined") {
+        const candidateSet = new Set();
+        const collectTextMatches = (treeScope) => {
+          const tw = doc.createTreeWalker(treeScope, NodeFilter.SHOW_TEXT);
+          for (let tn = tw.nextNode(); tn; tn = tw.nextNode()) {
+            const raw = tn.nodeValue;
+            if (!raw || !raw.trim()) continue;
+            if (!regex && !(exact ? raw.includes(target) : raw.toLowerCase().includes(targetLower))) continue;
+            let el = tn.parentElement;
+            for (let hops = 0; el && el.nodeType === 1 && hops < 4; hops++, el = el.parentElement) {
+              candidateSet.add(el);
+              if (el === treeScope) break;
+            }
+          }
+        };
+        collectTextMatches(scope);
+        const shadows = collectShadowRoots(scope);
+        for (let i = 0; i < shadows.length; i++) collectTextMatches(shadows[i]);
+        for (const el of candidateSet) {
+          const val = (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
+          if (matchesText(val)) leafTextMatches.push(el);
+        }
+        if (leafTextMatches.length > 0 || !regex) {
+          return leafTextMatches.filter((el) => !Array.from(el.children || []).some((child) => {
+            const val = (child.innerText || child.textContent || "").replace(/\\s+/g, " ").trim();
+            return matchesText(val);
+          }));
+        }
+      }
       const all = deepElements(scope).filter((el) => {
         const val = (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
         return matchesText(val);
@@ -352,14 +489,50 @@ const SHARED_LOCATOR_RESOLVER = `
       }));
     }
     if (step.startsWith("role=")) {
-      const match = /^role=([a-zA-Z0-9_-]+)(?:\\[name=(?:"([^"]*)"|'([^']*)'|(\\/(?:\\\\.|[^/])+\\/[dgimsuvy]*))\\])?(?:\\[exact=(true|false)\\])?$/.exec(step);
-      if (!match) throw new Error("Invalid role locator: " + step);
-      const role = match[1].toLowerCase();
-      const nameRegex = match[4] ? parseRegexLiteral(match[4]) : null;
-      const name = nameRegex ? null : (match[2] !== undefined ? match[2] : match[3]);
-      const exact = match[5] !== "false";
-      return deepElements(scope).filter((el) => {
+      const roleHead = /^([a-zA-Z0-9_-]+)/.exec(step.slice(5));
+      if (!roleHead) throw new Error("Invalid role locator: " + step);
+      const role = roleHead[1].toLowerCase();
+      let rest = step.slice(5 + roleHead[1].length);
+      const attrs = Object.create(null);
+      while (rest.length > 0) {
+        const m = /^\\[([a-zA-Z0-9_-]+)=("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|\\/(?:\\\\.|[^/])+\\/[dgimsuvy]*|[^\\]]+)\\]/.exec(rest);
+        if (!m) throw new Error("Invalid role locator: " + step);
+        attrs[m[1]] = m[2];
+        rest = rest.slice(m[0].length);
+      }
+      const nameRegex = attrs.name ? parseRegexLiteral(attrs.name) : null;
+      const name = !nameRegex && attrs.name !== undefined ? unquote(attrs.name) : undefined;
+      const exact = attrs.exact !== "false";
+      const hintSel = ROLE_HINT_SELECTORS[role];
+      const candidates = hintSel ? querySelectorAllDeep(scope, hintSel) : deepElements(scope);
+      return candidates.filter((el) => {
         if (implicitRoleOf(el) !== role) return false;
+        if (attrs.level !== undefined) {
+          const tagLvl = /^H([1-6])$/.exec(el.tagName || "");
+          const lvl = el.getAttribute("aria-level") || (tagLvl ? tagLvl[1] : null);
+          if (String(lvl) !== String(attrs.level)) return false;
+        }
+        if (attrs.checked !== undefined) {
+          const ariaC = el.getAttribute("aria-checked");
+          const actualC = ariaC !== null ? ariaC === "true" : Boolean(el.checked);
+          if (String(actualC) !== attrs.checked) return false;
+        }
+        if (attrs.selected !== undefined) {
+          const actualS = el.getAttribute("aria-selected") === "true" || Boolean(el.selected);
+          if (String(actualS) !== attrs.selected) return false;
+        }
+        if (attrs.expanded !== undefined) {
+          const actualE = el.getAttribute("aria-expanded") === "true" || (el.tagName === "DETAILS" && el.open);
+          if (String(actualE) !== attrs.expanded) return false;
+        }
+        if (attrs.pressed !== undefined) {
+          const actualP = el.getAttribute("aria-pressed") === "true";
+          if (String(actualP) !== attrs.pressed) return false;
+        }
+        if (attrs.disabled !== undefined) {
+          const actualD = isDisabledEl(el);
+          if (String(actualD) !== attrs.disabled) return false;
+        }
         if (nameRegex) return nameRegex.test(accessibleNameOf(el));
         if (name === undefined) return true;
         const actual = accessibleNameOf(el);
@@ -372,12 +545,33 @@ const SHARED_LOCATOR_RESOLVER = `
       return querySelectorAllDeep(scope, '[data-testid="' + escaped + '"],[data-test-id="' + escaped + '"],[data-test="' + escaped + '"]');
     }
     if (step.startsWith("label=")) {
-      const wanted = unquote(step.slice(6));
-      return deepElements(scope).filter((el) => labelTextFor(el) === wanted || (el.getAttribute("aria-label") || "").trim() === wanted);
+      const matcher = parseValueMatcher(step.slice(6), true);
+      const out = [];
+      const seen = new Set();
+      for (const el of querySelectorAllDeep(scope, '[aria-label],[aria-labelledby],input,select,textarea,button,[role="textbox"],[role="combobox"]')) {
+        if (!seen.has(el) && (matcher.test(labelTextFor(el)) || matcher.test(el.getAttribute("aria-label") || ""))) {
+          seen.add(el);
+          out.push(el);
+        }
+      }
+      if (out.length > 0) return out;
+      return deepElements(scope).filter((el) => matcher.test(labelTextFor(el)) || matcher.test(el.getAttribute("aria-label") || ""));
     }
     if (step.startsWith("placeholder=")) {
-      const wanted = unquote(step.slice(12));
-      return querySelectorAllDeep(scope, '[placeholder="' + CSS.escape(wanted) + '"]');
+      const rawSpec = step.slice(12);
+      const matcher = parseValueMatcher(rawSpec, true);
+      if (!matcher.regex && matcher.exact) {
+        return querySelectorAllDeep(scope, '[placeholder="' + CSS.escape(matcher.target) + '"]');
+      }
+      return querySelectorAllDeep(scope, "[placeholder]").filter((el) => matcher.test(el.getAttribute("placeholder") || ""));
+    }
+    if (step.startsWith("alt=")) {
+      const matcher = parseValueMatcher(step.slice(4), false);
+      return querySelectorAllDeep(scope, "[alt]").filter((el) => matcher.test(el.getAttribute("alt") || ""));
+    }
+    if (step.startsWith("title=")) {
+      const matcher = parseValueMatcher(step.slice(6), false);
+      return querySelectorAllDeep(scope, "[title]").filter((el) => matcher.test(el.getAttribute("title") || ""));
     }
     return querySelectorAllDeep(scope, step.startsWith("css=") ? step.slice(4) : step);
   };
@@ -837,6 +1031,8 @@ const SHARED_RUNNER_CORE = `
       const control = element instanceof HTMLInputElement || element instanceof HTMLButtonElement ||
         element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement ? element : null;
       const accepted = new Set([element, ...(control?.labels ? Array.from(control.labels) : [])]);
+      const rootInteractive = element.closest?.('a,button,input,select,textarea,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="menuitem"],[role="tab"],[role="option"]');
+      if (rootInteractive) accepted.add(rootInteractive);
       const matchesTarget = (node) => {
         for (let cur = node; cur; cur = cur.parentNode || cur.host) {
           if (accepted.has(cur)) return true;
@@ -853,17 +1049,24 @@ const SHARED_RUNNER_CORE = `
         { x: boxRight - dx, y: boxBottom - dy },
       ];
       let chosen = null;
-      let firstHitTag = null;
+      let firstHitEl = null;
       for (const pt of points) {
         const hit = elementFromPointDeep(doc, pt.x, pt.y);
-        if (firstHitTag === null) firstHitTag = hit?.tagName?.toLowerCase() ?? null;
+        if (firstHitEl === null) firstHitEl = hit ?? null;
         if (hit && matchesTarget(hit)) {
           chosen = pt;
           break;
         }
       }
+      const firstHitTag = firstHitEl?.tagName?.toLowerCase() ?? null;
       if (!force && !chosen) {
-        return fail("Locator element is covered by <" + (firstHitTag || "unknown") + ">: " + raw, "covered", true);
+        const hitTag = firstHitTag || "unknown";
+        const hitId = firstHitEl?.id ? "#" + firstHitEl.id : "";
+        const hitCls = typeof firstHitEl?.className === "string" && firstHitEl.className.trim()
+          ? "." + firstHitEl.className.trim().split(/\\s+/).slice(0, 2).join(".")
+          : "";
+        const hitRole = firstHitEl?.getAttribute?.("role") ? "[role=" + firstHitEl.getAttribute("role") + "]" : "";
+        return fail("Locator element is covered by <" + hitTag + hitId + hitCls + hitRole + ">: " + raw, "covered", true);
       }
 
       const pt = chosen || { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
@@ -1146,11 +1349,31 @@ export function hitTestFunctionDeclaration() {
     const oy = vv?.offsetTop ?? 0;
     const vw = vv?.width ?? win.innerWidth;
     const vh = vv?.height ?? win.innerHeight;
-    const left = Math.max(rect.left, ox);
-    const right = Math.min(rect.right, ox + vw);
-    const top = Math.max(rect.top, oy);
-    const bottom = Math.min(rect.bottom, oy + vh);
-    if (right <= left || bottom <= top) return { offscreen: true, width: rect.width, height: rect.height };
+    let left = Math.max(rect.left, ox);
+    let right = Math.min(rect.right, ox + vw);
+    let top = Math.max(rect.top, oy);
+    let bottom = Math.min(rect.bottom, oy + vh);
+    if (right <= left || bottom <= top) {
+      if (typeof el.scrollIntoView === "function") {
+        el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        const scrolledRect = el.getBoundingClientRect();
+        if (scrolledRect && scrolledRect.width > 0 && scrolledRect.height > 0) {
+          rect = scrolledRect;
+          const nvv = win.visualViewport;
+          const nox = nvv?.offsetLeft ?? 0;
+          const noy = nvv?.offsetTop ?? 0;
+          const nvw = nvv?.width ?? win.innerWidth;
+          const nvh = nvv?.height ?? win.innerHeight;
+          left = Math.max(rect.left, nox);
+          right = Math.min(rect.right, nox + nvw);
+          top = Math.max(rect.top, noy);
+          bottom = Math.min(rect.bottom, noy + nvh);
+        }
+      }
+      if (right <= left || bottom <= top) {
+        return { offscreen: true, width: rect.width, height: rect.height };
+      }
+    }
 
     const control = el instanceof HTMLInputElement || el instanceof HTMLButtonElement ||
       el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement ? el : null;

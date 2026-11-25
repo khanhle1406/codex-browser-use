@@ -208,6 +208,8 @@ export class BridgeBrowser {
     this.activeTabId = null;
     /** @type {Set<number>} */
     this.attached = new Set();
+    /** @type {Set<number>} */
+    this.userCanceledTabs = new Set();
     /** @type {Map<number, Promise<void>>} */
     this.attaching = new Map();
     /** @type {Set<(event: Record<string, unknown>) => void>} */
@@ -224,7 +226,13 @@ export class BridgeBrowser {
     this.locatorRuntimeInstalled = new Map();
     /** @type {Set<string>} */
     this.statelessEvalTabs = new Set();
+    /** @type {Map<number, {clientWidth:number, clientHeight:number}>} */
+    this.viewportSizeCache = new Map();
+    /** @type {Map<number, number>} */
+    this.devicePixelRatioCache = new Map();
     this.supportsPassiveRead = Boolean(info?.apiSupportOverrides?.["BrowserUser.getTabContext"]);
+    this.supportsCdpBatch = Boolean(info?.apiSupportOverrides?.["Bridge.executeCdpBatch"]);
+    this.supportsAttachFocusAndPage = Boolean(info?.apiSupportOverrides?.["Bridge.attachFocusAndPage"]);
     /** @type {Map<number, Map<string,{backendDOMNodeId:number|null,role:string,name:string,frameId?:string|null,sessionId?:string|null,actions?:string[],dialogControl?:string}>>} */
     this.axCache = new Map();
     /** @type {Map<number, {documentKey:string, entries:Array<any>}>} */
@@ -258,6 +266,9 @@ export class BridgeBrowser {
         browserRef?.#clearTabCaches(tabId);
         browserRef?.attached.delete(tabId);
         browserRef?.autoAttached.delete(tabId);
+        if (params?.reason === "canceled_by_user") {
+          browserRef?.userCanceledTabs.add(tabId);
+        }
       } else if (method === "onTabCreated") {
         browserRef?.handleTabCreated(params);
       }
@@ -715,6 +726,9 @@ export class BridgeBrowser {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       if (!/Debugger unattached/i.test(msg)) throw error;
+      if (this.userCanceledTabs.has(tabId)) {
+        throw new Error(`Browser debugging on tab ${tabId} was canceled by the user. Select or re-claim the tab to resume.`);
+      }
       this.attached.delete(tabId);
       this.#clearTabCaches(tabId);
       this.autoAttached.delete(tabId);
@@ -739,6 +753,60 @@ export class BridgeBrowser {
     return sessionId ? this.#cdpIn(tabId, sessionId, method, params) : this.#cdp(tabId, method, params);
   }
 
+  /**
+   * Execute multiple CDP commands over a single bridge RTT when `Bridge.executeCdpBatch`
+   * is supported, falling back cleanly to sequential `#cdpTarget` calls otherwise.
+   * @param {number} tabId
+   * @param {Array<{method:string, params?:Record<string,unknown>, sessionId?:string|null, fireAndForget?:boolean, ignoreError?:boolean, batchOnly?:boolean}>} commands
+   * @param {string|null|undefined} [sessionId]
+   * @returns {Promise<Array<any>>}
+   */
+  async #cdpBatch(tabId, commands, sessionId = null) {
+    if (commands.length === 0) return [];
+    if (this.supportsCdpBatch) {
+      const target = sessionId ? { tabId, sessionId } : { tabId };
+      const rpcCommands = commands.map((cmd) => ({
+        method: cmd.method,
+        commandParams: cmd.params ?? {},
+        ...(cmd.sessionId ? { sessionId: cmd.sessionId } : {}),
+        ...(cmd.fireAndForget ? { fireAndForget: true } : {}),
+        ...(cmd.ignoreError ? { ignoreError: true } : {}),
+      }));
+      const res = await this.#rpc("executeCdpBatch", { target, commands: rpcCommands });
+      return Array.isArray(res?.results) ? res.results : [];
+    }
+    const results = [];
+    let lastObjectId = null;
+    for (const cmd of commands) {
+      if (cmd.batchOnly) {
+        results.push(null);
+        continue;
+      }
+      const params = { ...(cmd.params ?? {}) };
+      for (const [k, v] of Object.entries(params)) {
+        if (v === "$prev.object.objectId" || v === "$prev.result.objectId") {
+          if (!lastObjectId) throw new Error("CDP batch step missing previous objectId");
+          params[k] = lastObjectId;
+        }
+      }
+      if (cmd.fireAndForget) {
+        void this.#cdpTarget(tabId, cmd.sessionId ?? sessionId, cmd.method, params).catch(() => {});
+        results.push(null);
+        continue;
+      }
+      try {
+        const out = await this.#cdpTarget(tabId, cmd.sessionId ?? sessionId, cmd.method, params);
+        const nextId = out?.object?.objectId ?? out?.result?.objectId;
+        if (typeof nextId === "string" && nextId) lastObjectId = nextId;
+        results.push(out);
+      } catch (error) {
+        if (cmd.ignoreError) results.push({ error: error instanceof Error ? error.message : String(error) });
+        else throw error;
+      }
+    }
+    return results;
+  }
+
   /** @param {number} tabId @param {string|null} [sessionId] @returns {void} */
   #clearLocatorRuntime(tabId, sessionId = null) {
     if (sessionId !== null) {
@@ -756,7 +824,8 @@ export class BridgeBrowser {
     this.enabledDomains.delete(tabId);
     this.enablingDomains.delete(tabId);
     this.frameRouteCache.delete(tabId);
-    this.#clearLocatorRuntime(tabId);
+    this.viewportSizeCache.delete(tabId);
+    this.devicePixelRatioCache.delete(tabId);
     this.#clearLocatorRuntime(tabId);
     const frameMap = this.frameSessions.get(tabId);
     if (frameMap) {
@@ -829,6 +898,10 @@ export class BridgeBrowser {
     this.#assertOpen();
     const id = Number(tabId);
     if (!Number.isSafeInteger(id)) throw new Error("A numeric tab_id is required");
+    this.userCanceledTabs.delete(id);
+    const prevOwned = this.ownedTabs.has(id);
+    const prevTab = this.tabs.get(id);
+    const prevActive = this.activeTabId;
     let tab;
     try {
       tab = await this.#rpc("claimUserTab", { tabId: id });
@@ -839,7 +912,18 @@ export class BridgeBrowser {
     this.ownedTabs.add(tab.id);
     this.tabs.set(tab.id, { ...tab, owned: true, origin: tab.origin || "user" });
     this.activeTabId = tab.id;
-    await this.attach(tab.id);
+    try {
+      await this.attach(tab.id);
+    } catch (error) {
+      if (!prevOwned) {
+        await this.#rpc("releaseUserTab", { tabId: tab.id }).catch(() => {});
+        this.ownedTabs.delete(tab.id);
+        if (prevTab) this.tabs.set(tab.id, prevTab);
+        else this.tabs.delete(tab.id);
+        this.activeTabId = prevActive;
+      }
+      throw error;
+    }
     return {
       tab_id: String(tab.id),
       title: tab.title || "Untitled",
@@ -929,6 +1013,9 @@ export class BridgeBrowser {
   /** @param {number} tabId @returns {Promise<void>} */
   async attach(tabId) {
     if (this.attached.has(tabId)) return;
+    if (this.userCanceledTabs.has(tabId)) {
+      throw new Error(`Browser debugging on tab ${tabId} was canceled by the user. Select or re-claim the tab to resume.`);
+    }
     const inflight = this.attaching.get(tabId);
     if (inflight) {
       await inflight;
@@ -939,6 +1026,9 @@ export class BridgeBrowser {
         await this.#rpc("attach", { tabId });
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
+        if (/Another debugger is already attached/i.test(msg)) {
+          throw new Error(`Another debugger (such as Chrome DevTools) is already attached to tab ${tabId}. Close DevTools on that tab and retry.`);
+        }
         if (/Browser tab is unavailable to this session/i.test(msg)) {
           this.ownedTabs.delete(tabId);
           this.tabs.delete(tabId);
@@ -955,7 +1045,16 @@ export class BridgeBrowser {
       this.frameRouteCache.delete(tabId);
       this.#clearLocatorRuntime(tabId);
       this.#tabState(tabId);
-      await this.#cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+      if (this.supportsAttachFocusAndPage) {
+        let domains = this.enabledDomains.get(tabId);
+        if (!domains) {
+          domains = new Set();
+          this.enabledDomains.set(tabId, domains);
+        }
+        domains.add("Page");
+      } else {
+        await this.#cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+      }
     })().finally(() => {
       this.attaching.delete(tabId);
     });
@@ -1049,6 +1148,7 @@ export class BridgeBrowser {
   async selectTab(tabId) {
     const id = Number(tabId);
     if (!Number.isSafeInteger(id)) throw new Error("A numeric tab_id is required");
+    this.userCanceledTabs.delete(id);
     const resolved = await this.#resolveTab(id);
     this.activeTabId = resolved;
     await this.attach(resolved);
@@ -1084,6 +1184,7 @@ export class BridgeBrowser {
     this.lastAxSnapshots.delete(id);
     this.frameRouteCache.delete(id);
     const state = this.#tabState(id);
+    const startRev = state.navRevision;
     state.committed = false;
     state.ready = false;
     state.domContentLoaded = false;
@@ -1093,14 +1194,14 @@ export class BridgeBrowser {
     let committed = false;
     try {
       await this.#rpc("navigateTab", { tabId: id, url: target });
-      await this.#waitForCommit(id, target, Math.min(5_000, timeoutMs));
+      await this.#waitForCommit(id, target, Math.min(5_000, timeoutMs), startRev);
       committed = true;
     } catch {
       // Fall back to CDP navigation when the tab-level navigation does not commit.
     }
     if (!committed) {
       await this.#navigateWithCdp(id, target);
-      await this.#waitForCommit(id, target, timeoutMs);
+      await this.#waitForCommit(id, target, timeoutMs, startRev);
     }
     if (waitUntil !== "commit") {
       await this.#waitForLoad(id, { waitUntil, timeoutMs });
@@ -1210,16 +1311,23 @@ export class BridgeBrowser {
 
     let cssScale = 1;
     let metrics = null;
+    const cachedDpr = this.devicePixelRatioCache.get(id);
     if (scale === "css" && !clip) {
       const [dpr, layout] = await Promise.all([
-        this.#evaluateRaw(id, "window.devicePixelRatio").catch(() => 1),
+        cachedDpr !== undefined ? cachedDpr : this.#evaluateRaw(id, "window.devicePixelRatio").catch(() => 1),
         this.#cdp(id, "Page.getLayoutMetrics").catch(() => null),
       ]);
-      if (typeof dpr === "number" && Number.isFinite(dpr) && dpr > 1) cssScale = 1 / dpr;
+      if (typeof dpr === "number" && Number.isFinite(dpr) && dpr > 0) {
+        this.devicePixelRatioCache.set(id, dpr);
+        if (dpr > 1) cssScale = 1 / dpr;
+      }
       metrics = layout;
     } else if (scale === "css") {
-      const dpr = await this.#evaluateRaw(id, "window.devicePixelRatio").catch(() => 1);
-      if (typeof dpr === "number" && Number.isFinite(dpr) && dpr > 1) cssScale = 1 / dpr;
+      const dpr = cachedDpr !== undefined ? cachedDpr : await this.#evaluateRaw(id, "window.devicePixelRatio").catch(() => 1);
+      if (typeof dpr === "number" && Number.isFinite(dpr) && dpr > 0) {
+        this.devicePixelRatioCache.set(id, dpr);
+        if (dpr > 1) cssScale = 1 / dpr;
+      }
     }
 
     if (clip && Number.isFinite(clip.width) && Number.isFinite(clip.height)) {
@@ -1302,19 +1410,68 @@ export class BridgeBrowser {
       this.#ensureDomain(id, "Accessibility", "Accessibility.enable"),
     ]);
 
-    // Capture main frame AX tree, frame tree, location, and optional screenshot in parallel.
-    const [mainTree, frameTreeResp, location, cap] = await Promise.all([
+    const useDiff = diff && !full;
+    const prev = this.lastAxSnapshots.get(id);
+    if (
+      useDiff &&
+      !screenshot &&
+      prev &&
+      prev.hasIndexedBaseline &&
+      prev.mode === mode &&
+      prev.maxLines === maxLines &&
+      tabState.hasEvents &&
+      tabState.lastAxUpdateMs > 0 &&
+      prev.navRevision === tabState.navRevision &&
+      prev.lastAxUpdateMs === tabState.lastAxUpdateMs &&
+      this.axCache.has(id)
+    ) {
+      const cachedTitle = prev.title ?? this.tabs.get(id)?.title ?? "";
+      const cachedUrl = prev.url ?? tabState.url ?? this.tabs.get(id)?.url ?? "";
+      return {
+        tab_id: String(id),
+        title: cachedTitle,
+        url: cachedUrl,
+        mode: "unchanged",
+        axText: [
+          `Title: ${cachedTitle}`,
+          `URL: ${cachedUrl}`,
+          "<ax_state>",
+          "No accessibility changes.",
+          "</ax_state>",
+        ].join("\n"),
+        elementCount: prev.elementCount ?? this.axCache.get(id)?.size ?? 0,
+        screenshotBase64: null,
+        screenshotMimeType: null,
+        notifications: this.drainNotifications(id),
+      };
+    }
+
+    // Capture main frame AX tree, frame tree, and optional screenshot in parallel.
+    const [mainTree, frameTreeResp, cap] = await Promise.all([
       this.#cdp(id, "Accessibility.getFullAXTree"),
       this.#cdp(id, "Page.getFrameTree").catch(() => null),
-      this.#evaluateRaw(id, "({title: document.title, url: location.href})").catch(() => ({
-        title: this.tabs.get(id)?.title ?? "",
-        url: this.tabs.get(id)?.url ?? "",
-      })),
       screenshot ? this.screenshot(id, { fullPage, format, quality }).catch(() => null) : null,
     ]);
 
+    const mainNodes = mainTree?.nodes ?? [];
+    const rootAx = mainNodes.find((n) => n?.role?.value === "RootWebArea" || n?.role?.value === "WebArea");
+    const axTitle = typeof rootAx?.name?.value === "string" ? rootAx.name.value : null;
+    const ftUrl = typeof frameTreeResp?.frameTree?.frame?.url === "string" && frameTreeResp.frameTree.frame.url
+      ? frameTreeResp.frameTree.frame.url
+      : null;
+
+    let location;
+    if (axTitle !== null && ftUrl !== null) {
+      location = { title: axTitle, url: ftUrl };
+    } else {
+      location = await this.#evaluateRaw(id, "({title: document.title, url: location.href})").catch(() => ({
+        title: axTitle ?? this.tabs.get(id)?.title ?? "",
+        url: ftUrl ?? tabState.url ?? this.tabs.get(id)?.url ?? "",
+      }));
+    }
+
     const frameTrees = [{
-      nodes: mainTree?.nodes ?? [],
+      nodes: mainNodes,
       frameId: null,
       sessionId: null,
       depth: 0,
@@ -1330,10 +1487,8 @@ export class BridgeBrowser {
     const url = String(location?.url || "");
     const documentKey = `${tabState.loaderId ?? ""}:${url}`;
 
-    const useDiff = diff && !full;
-    const prev = this.lastAxSnapshots.get(id);
     let diffResult = useDiff
-      ? buildAxDiff(prev, { documentKey, lines: merged.lines, entries: merged.entries })
+      ? buildAxDiff(prev, { documentKey, lines: merged.lines, entries: merged.entries, mode })
       : { mode: "full", lines: merged.lines };
     if (useDiff && prev?.hasIndexedBaseline === false && diffResult.mode === "unchanged") {
       diffResult = allowUnindexedBaseline
@@ -1341,7 +1496,18 @@ export class BridgeBrowser {
         : { mode: "full", lines: merged.lines };
     }
 
-    this.lastAxSnapshots.set(id, { documentKey, entries: merged.entries, hasIndexedBaseline: true });
+    this.lastAxSnapshots.set(id, {
+      documentKey,
+      entries: merged.entries,
+      hasIndexedBaseline: true,
+      mode,
+      maxLines,
+      navRevision: tabState.navRevision,
+      lastAxUpdateMs: tabState.lastAxUpdateMs,
+      title,
+      url,
+      elementCount: merged.count,
+    });
 
     const image = cap?.data ?? null;
     const screenshotMimeType = cap?.mimeType ?? null;
@@ -1456,14 +1622,32 @@ export class BridgeBrowser {
       return { tab_id: String(id), ok: true, action: "set_value", index: String(elementIndex) };
     }
     const sessionId = node.sessionId ?? null;
-    const { object } = await this.#cdpTarget(id, sessionId, "DOM.resolveNode", { backendNodeId: node.backendDOMNodeId });
-    if (!object?.objectId) throw new Error("Browser element could not be resolved");
-    const response = await this.#cdpTarget(id, sessionId, "Runtime.callFunctionOn", {
-      objectId: object.objectId,
-      functionDeclaration: smartSetValueFunctionDeclaration(),
-      arguments: [{ value: String(value) }],
-      returnByValue: true,
+    const batchResults = await this.#cdpBatch(id, [
+      { method: "DOM.resolveNode", params: { backendNodeId: node.backendDOMNodeId } },
+      {
+        method: "Runtime.callFunctionOn",
+        params: {
+          objectId: "$prev.object.objectId",
+          functionDeclaration: smartSetValueFunctionDeclaration(),
+          arguments: [{ value: String(value) }],
+          returnByValue: true,
+        },
+      },
+      {
+        method: "Runtime.releaseObject",
+        params: { objectId: "$prev.object.objectId" },
+        fireAndForget: true,
+        batchOnly: true,
+      },
+    ], sessionId).catch((error) => {
+      if (/CDP batch step missing previous objectId/i.test(error?.message || "")) {
+        throw new Error("Browser element could not be resolved");
+      }
+      throw error;
     });
+    const resolved = batchResults[0];
+    if (!resolved?.object?.objectId) throw new Error("Browser element could not be resolved");
+    const response = batchResults[1];
     if (response?.exceptionDetails) {
       throw new Error(response.exceptionDetails.exception?.description || response.exceptionDetails.text || "Failed to set element value");
     }
@@ -1514,25 +1698,24 @@ export class BridgeBrowser {
       location: 0,
     };
     if (key.key === "Enter" && key.modifiers === 0) {
-      await this.#cdpTarget(tabId, sessionId, "Input.dispatchKeyEvent", {
-        type: "rawKeyDown",
-        ...base,
-        commands: ["insertNewline"],
-      });
-      await this.#cdpTarget(tabId, sessionId, "Input.dispatchKeyEvent", {
-        type: "char",
-        ...base,
-        text: key.text,
-        unmodifiedText: key.text,
-      });
+      await this.#cdpBatch(tabId, [
+        { method: "Input.dispatchKeyEvent", params: { type: "rawKeyDown", ...base, commands: ["insertNewline"] } },
+        { method: "Input.dispatchKeyEvent", params: { type: "char", ...base, text: key.text, unmodifiedText: key.text } },
+        { method: "Input.dispatchKeyEvent", params: { type: "keyUp", ...base } },
+      ], sessionId);
     } else {
-      await this.#cdpTarget(tabId, sessionId, "Input.dispatchKeyEvent", {
-        type: key.text ? "keyDown" : "rawKeyDown",
-        ...base,
-        ...(key.text ? { text: key.text, unmodifiedText: key.text } : {}),
-      });
+      await this.#cdpBatch(tabId, [
+        {
+          method: "Input.dispatchKeyEvent",
+          params: {
+            type: key.text ? "keyDown" : "rawKeyDown",
+            ...base,
+            ...(key.text ? { text: key.text, unmodifiedText: key.text } : {}),
+          },
+        },
+        { method: "Input.dispatchKeyEvent", params: { type: "keyUp", ...base } },
+      ], sessionId);
     }
-    await this.#cdpTarget(tabId, sessionId, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
     return key;
   }
 
@@ -1556,8 +1739,13 @@ export class BridgeBrowser {
       const box = await this.#boxModel(id, node, node.sessionId);
       point = { x: box.x, y: box.y };
     } else {
-      const metrics = await this.#cdp(id, "Page.getLayoutMetrics");
-      const viewport = metrics?.cssLayoutViewport ?? metrics?.layoutViewport ?? { clientWidth: 1280, clientHeight: 800 };
+      let viewport = this.viewportSizeCache.get(id);
+      if (!viewport) {
+        const metrics = await this.#cdp(id, "Page.getLayoutMetrics");
+        const vp = metrics?.cssLayoutViewport ?? metrics?.layoutViewport ?? { clientWidth: 1280, clientHeight: 800 };
+        viewport = { clientWidth: vp.clientWidth || 1280, clientHeight: vp.clientHeight || 800 };
+        this.viewportSizeCache.set(id, viewport);
+      }
       point = { x: Math.floor(viewport.clientWidth / 2), y: Math.floor(viewport.clientHeight / 2) };
     }
     await this.#cdp(id, "Input.dispatchMouseEvent", { type: "mouseWheel", x: point.x, y: point.y, ...deltas });
@@ -1619,22 +1807,28 @@ export class BridgeBrowser {
     if (!Number.isFinite(start.x) || !Number.isFinite(start.y) || !Number.isFinite(end.x) || !Number.isFinite(end.y)) {
       throw new Error("drag requires valid start and end coordinates or element indices");
     }
-    const count = Math.max(2, Math.min(30, Number(steps) || 8));
-    await this.#cdp(id, "Input.dispatchMouseEvent", { type: "mouseMoved", x: start.x, y: start.y, button: "none", buttons: 0, clickCount: 0, modifiers: 0 });
-    await this.#cdp(id, "Input.dispatchMouseEvent", { type: "mousePressed", x: start.x, y: start.y, button: "left", buttons: 1, clickCount: 1, modifiers: 0 });
+    const count = Math.max(2, Math.min(28, Number(steps) || 8));
+    const commands = [
+      { method: "Input.dispatchMouseEvent", params: { type: "mouseMoved", x: start.x, y: start.y, button: "none", buttons: 0, clickCount: 0, modifiers: 0 } },
+      { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: start.x, y: start.y, button: "left", buttons: 1, clickCount: 1, modifiers: 0 } },
+    ];
     for (let i = 1; i <= count; i++) {
       const ratio = i / count;
-      await this.#cdp(id, "Input.dispatchMouseEvent", {
-        type: "mouseMoved",
-        x: start.x + (end.x - start.x) * ratio,
-        y: start.y + (end.y - start.y) * ratio,
-        button: "left",
-        buttons: 1,
-        clickCount: 0,
-        modifiers: 0,
+      commands.push({
+        method: "Input.dispatchMouseEvent",
+        params: {
+          type: "mouseMoved",
+          x: start.x + (end.x - start.x) * ratio,
+          y: start.y + (end.y - start.y) * ratio,
+          button: "left",
+          buttons: 1,
+          clickCount: 0,
+          modifiers: 0,
+        },
       });
     }
-    await this.#cdp(id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: end.x, y: end.y, button: "left", buttons: 0, clickCount: 1, modifiers: 0 });
+    commands.push({ method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", x: end.x, y: end.y, button: "left", buttons: 0, clickCount: 1, modifiers: 0 } });
+    await this.#cdpBatch(id, commands);
     return { tab_id: String(id), ok: true, action: "drag", from: start, to: end };
   }
 
@@ -1732,7 +1926,7 @@ export class BridgeBrowser {
             throw err;
           }
         } finally {
-          await this.#cdpTarget(id, sessionId, "Runtime.releaseObject", { objectId }).catch(() => {});
+          void this.#cdpTarget(id, sessionId, "Runtime.releaseObject", { objectId }).catch(() => {});
         }
         if (shouldRetry) {
           await sleep(Math.min(50, Math.max(1, deadline - Date.now())));
@@ -2140,6 +2334,8 @@ export class BridgeBrowser {
       mobile: mob,
     });
     this.#tabState(id).viewportOverride = { width: w, height: h, deviceScaleFactor: dsf, mobile: mob };
+    this.viewportSizeCache.set(id, { clientWidth: w, clientHeight: h });
+    this.devicePixelRatioCache.set(id, dsf);
     return { tab_id: String(id), ok: true, width: w, height: h, deviceScaleFactor: dsf, mobile: mob };
   }
 
@@ -2152,6 +2348,8 @@ export class BridgeBrowser {
     await this.attach(id);
     await this.#cdp(id, "Emulation.clearDeviceMetricsOverride", {});
     this.#tabState(id).viewportOverride = null;
+    this.viewportSizeCache.delete(id);
+    this.devicePixelRatioCache.delete(id);
     return { tab_id: String(id), ok: true, reset: true };
   }
 
@@ -2507,7 +2705,7 @@ export class BridgeBrowser {
     const documentKey = `${tabState.loaderId ?? ""}:${url}`;
     const baseline = mergeFrameAxStates(frameTrees, { maxLines, mode });
     this.axCache.set(id, baseline.index);
-    this.lastAxSnapshots.set(id, { documentKey, entries: baseline.entries, hasIndexedBaseline: false });
+    this.lastAxSnapshots.set(id, { documentKey, entries: baseline.entries, hasIndexedBaseline: false, mode, maxLines });
     return { tab_id: String(id), ...snapshot };
   }
 
@@ -2527,7 +2725,11 @@ export class BridgeBrowser {
     if (!Number.isSafeInteger(backendNodeId)) {
       throw new Error(`Locator did not resolve to a DOM node: ${selector}`);
     }
-    await this.#cdpTarget(id, sessionId, "Accessibility.enable", {}).catch(() => {});
+    if (!sessionId) {
+      await this.#ensureDomain(id, "Accessibility", "Accessibility.enable").catch(() => {});
+    } else {
+      await this.#cdpTarget(id, sessionId, "Accessibility.enable", {}).catch(() => {});
+    }
     const tree = await this.#cdpTarget(id, sessionId, "Accessibility.getFullAXTree", {});
     let snapshot = formatAriaSnapshot(tree?.nodes ?? [], {
       maxLines,
@@ -2730,6 +2932,31 @@ export class BridgeBrowser {
     };
   }
 
+  /** @param {string} selector @param {{tabId?:unknown, frame?:string, force?:boolean, timeoutMs?:number}} [options] */
+  async locatorFocus(selector, { tabId, frame, force = false, timeoutMs } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    await this.#runLocatorWithAutoWait(id, selector, {
+      frame,
+      mutation: "focus",
+      force,
+      timeoutMs,
+    });
+    return { tab_id: String(id), ok: true, action: "locator_focus", selector, ...(frame ? { frame } : {}) };
+  }
+
+  /** @param {string} selector @param {{tabId?:unknown, frame?:string, timeoutMs?:number}} [options] */
+  async locatorBoundingBox(selector, { tabId, frame, timeoutMs } = {}) {
+    const id = await this.#resolveTab(tabId);
+    await this.attach(id);
+    const { result } = await this.#runLocatorWithAutoWait(id, selector, {
+      frame,
+      mutation: "box",
+      timeoutMs,
+    });
+    return result?.box ?? null;
+  }
+
   /** @param {string} selector @param {string} value @param {{tabId?:unknown, frame?:string, force?:boolean, timeoutMs?:number, settle?:boolean}} [options] */
   async locatorFill(selector, value, { tabId, frame, force = false, timeoutMs, settle = false } = {}) {
     const id = await this.#resolveTab(tabId);
@@ -2832,6 +3059,7 @@ export class BridgeBrowser {
     const hasExplicit = tabId !== undefined && tabId !== null && tabId !== "";
     const numId = hasExplicit ? Number(tabId) : NaN;
     if (this.supportsPassiveRead && Number.isSafeInteger(numId) &&
+        options?.format !== "tables" && options?.format !== "links" &&
         !this.attached.has(numId) && !this.ownedTabs.has(numId)) {
       try {
         const passive = await this.readTabContext(numId, {
@@ -2866,8 +3094,14 @@ export class BridgeBrowser {
         };
       }
     }
-    const text = await this.#evaluateRaw(id, "document.body ? document.body.innerText : ''");
-    return { tab_id: String(id), text: String(text ?? "") };
+    const raw = await this.#evaluateRaw(id, "document.body ? document.body.innerText : ''");
+    const text = String(raw ?? "");
+    const truncated = text.length > 16_000;
+    return {
+      tab_id: String(id),
+      text: truncated ? text.slice(0, 16_000) : text,
+      ...(truncated ? { truncated: true } : {}),
+    };
   }
 
   /** @param {string} source @param {{tabId?:unknown, arg?:unknown, hasArg?:boolean}} [options] */
@@ -3027,17 +3261,17 @@ export class BridgeBrowser {
               modifiers: step.modifiers,
               x: step.x,
               y: step.y,
-              settle: true,
+              settle: step.settle ?? false,
             });
             break;
           case "set_value":
-            result = await this.setValue(step.element_index, step.value, { tabId: stepTab, settle: true });
+            result = await this.setValue(step.element_index, step.value, { tabId: stepTab, settle: step.settle ?? false });
             break;
           case "type_text":
-            result = await this.typeText(step.text, { tabId: stepTab, elementIndex: step.element_index, settle: true });
+            result = await this.typeText(step.text, { tabId: stepTab, elementIndex: step.element_index, settle: step.settle ?? false });
             break;
           case "press_key":
-            result = await this.pressKey(step.key, { tabId: stepTab, elementIndex: step.element_index, settle: true });
+            result = await this.pressKey(step.key, { tabId: stepTab, elementIndex: step.element_index, settle: step.settle ?? false });
             break;
           case "select_option":
             result = await this.selectOption({
@@ -3089,7 +3323,7 @@ export class BridgeBrowser {
               modifiers: step.modifiers,
               force: step.force === true,
               timeoutMs: step.timeout_ms,
-              settle: true,
+              settle: step.settle ?? false,
             });
             break;
           case "locator_fill":
@@ -3098,7 +3332,7 @@ export class BridgeBrowser {
               frame: step.frame,
               force: step.force === true,
               timeoutMs: step.timeout_ms,
-              settle: true,
+              settle: step.settle ?? false,
             });
             break;
           case "set_viewport":
@@ -3260,6 +3494,7 @@ export class BridgeBrowser {
     }
     this.turnId = randomUUID();
     this.attached.clear();
+    this.userCanceledTabs.clear();
     this.attaching.clear();
     this.axCache.clear();
     this.enabledDomains.clear();
@@ -3271,6 +3506,8 @@ export class BridgeBrowser {
     this.autoAttached.clear();
     this.locatorRuntimeInstalled.clear();
     this.statelessEvalTabs.clear();
+    this.viewportSizeCache.clear();
+    this.devicePixelRatioCache.clear();
     for (const id of [...this.ownedTabs]) {
       if (!handoffIds.has(id)) {
         this.ownedTabs.delete(id);
@@ -3363,41 +3600,64 @@ export class BridgeBrowser {
 
     // Try fast Shadow-DOM-aware hit-test first; fall back cleanly to #boxModel on minimal mocks.
     let point = null;
-    let resolvedObjectId = null;
     try {
-      const quads = await this.#cdp(tabId, "DOM.getContentQuads", { backendNodeId: node.backendDOMNodeId });
-      if (Array.isArray(quads?.quads) && quads.quads.length > 0) {
-        const resolved = await this.#cdp(tabId, "DOM.resolveNode", { backendNodeId: node.backendDOMNodeId });
-        resolvedObjectId = resolved?.object?.objectId ?? null;
-        if (resolvedObjectId) {
-          let hit = await this.#cdp(tabId, "Runtime.callFunctionOn", {
-            objectId: resolvedObjectId,
+      const hitBatch = await this.#cdpBatch(tabId, [
+        { method: "DOM.resolveNode", params: { backendNodeId: node.backendDOMNodeId } },
+        {
+          method: "Runtime.callFunctionOn",
+          params: {
+            objectId: "$prev.object.objectId",
             functionDeclaration: hitTestFunctionDeclaration(),
             returnByValue: true,
-          });
-          let val = hit?.result?.value;
-          if (val && (val.offscreen || val.hitsTarget === false)) {
-            await this.#scrollIntoView(tabId, node).catch(() => {});
-            hit = await this.#cdp(tabId, "Runtime.callFunctionOn", {
-              objectId: resolvedObjectId,
-              functionDeclaration: hitTestFunctionDeclaration(),
-              returnByValue: true,
-            });
-            val = hit?.result?.value;
-          }
-          if (val?.hitsTarget && val.point) {
-            point = val.point;
-          } else if (val && val.hitsTarget === false) {
-            throw new Error(`Accessibility element (${node.role} "${node.name}") is covered by <${val.hitTag || "unknown"}> or not hittable`);
-          }
-        }
+          },
+        },
+        {
+          method: "Runtime.releaseObject",
+          params: { objectId: "$prev.object.objectId" },
+          fireAndForget: true,
+          batchOnly: true,
+        },
+      ]);
+      const resolvedObjectId = hitBatch[0]?.object?.objectId ?? null;
+      let hit = hitBatch[1];
+      let val = hit?.result?.value;
+      if (val && (val.offscreen || val.hitsTarget === false)) {
+        await this.#scrollIntoView(tabId, node).catch(() => {});
+        const retryBatch = await this.#cdpBatch(tabId, [
+          ...(resolvedObjectId && this.supportsCdpBatch
+            ? [{
+              method: "Runtime.callFunctionOn",
+              params: {
+                objectId: resolvedObjectId,
+                functionDeclaration: hitTestFunctionDeclaration(),
+                returnByValue: true,
+              },
+            }]
+            : [
+              { method: "DOM.resolveNode", params: { backendNodeId: node.backendDOMNodeId } },
+              {
+                method: "Runtime.callFunctionOn",
+                params: {
+                  objectId: "$prev.object.objectId",
+                  functionDeclaration: hitTestFunctionDeclaration(),
+                  returnByValue: true,
+                },
+              },
+            ]),
+        ]);
+        hit = retryBatch.at(-1);
+        val = hit?.result?.value;
+      }
+      if (!this.supportsCdpBatch && resolvedObjectId) {
+        void this.#cdp(tabId, "Runtime.releaseObject", { objectId: resolvedObjectId }).catch(() => {});
+      }
+      if (val?.hitsTarget && val.point) {
+        point = val.point;
+      } else if (val && val.hitsTarget === false) {
+        throw new Error(`Accessibility element (${node.role} "${node.name}") is covered by <${val.hitTag || "unknown"}> or not hittable`);
       }
     } catch (error) {
       if (error instanceof Error && error.message.includes("not hittable")) throw error;
-    } finally {
-      if (resolvedObjectId) {
-        await this.#cdp(tabId, "Runtime.releaseObject", { objectId: resolvedObjectId }).catch(() => {});
-      }
     }
 
     if (!point) {
@@ -3421,9 +3681,11 @@ export class BridgeBrowser {
   /** @param {number} tabId @param {number} x @param {number} y @param {{clickCount:number, button:string, modifiers?:number}} options */
   async #clickPoint(tabId, x, y, { clickCount, button, modifiers = 0 }) {
     const common = { x, y, button, clickCount, modifiers };
-    await this.#cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...common, button: "none", buttons: 0, clickCount: 0 });
-    await this.#cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...common, buttons: buttonMask(button) });
-    await this.#cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...common, buttons: 0 });
+    await this.#cdpBatch(tabId, [
+      { method: "Input.dispatchMouseEvent", params: { type: "mouseMoved", ...common, button: "none", buttons: 0, clickCount: 0 } },
+      { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", ...common, buttons: buttonMask(button) } },
+      { method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", ...common, buttons: 0 } },
+    ]);
   }
 
   /**
@@ -3712,9 +3974,10 @@ export class BridgeBrowser {
     const state = this.tabStates.get(tabId);
     if (!state || !state.hasEvents || state.dialog) return;
 
+    const settleStartMs = Date.now();
     const startRev = state.navRevision;
     if (expectNavigation && !state.loading) {
-      const detectDeadline = Date.now() + 30;
+      const detectDeadline = Date.now() + 10;
       while (Date.now() < detectDeadline) {
         if (state.dialog || state.loading || state.navRevision !== startRev) break;
         await this.#waitForTabWakeup(tabId, Math.max(1, detectDeadline - Date.now()));
@@ -3722,29 +3985,36 @@ export class BridgeBrowser {
     }
 
     const navTriggered = state.loading || state.navRevision !== startRev;
-    const effectiveWaitMs = navTriggered ? timeoutMs : Math.min(timeoutMs, 150);
+    const effectiveWaitMs = navTriggered ? timeoutMs : Math.min(timeoutMs, 100);
     const deadline = Date.now() + effectiveWaitMs;
     while (state.loading && !state.dialog && Date.now() < deadline) {
       await this.#waitForTabWakeup(tabId, Math.min(35, Math.max(1, deadline - Date.now())));
     }
 
-    // Wait briefly for AX updates to settle (60ms quiet window).
-    const quietCap = navTriggered ? 250 : 100;
-    const quietDeadline = Math.min(deadline, Date.now() + quietCap);
-    while (!state.dialog && Date.now() < quietDeadline) {
-      const sinceAx = Date.now() - Math.max(state.lastAxUpdateMs, 0);
-      if (state.lastAxUpdateMs === 0 || sinceAx >= 60) break;
-      await this.#waitForTabWakeup(tabId, Math.min(60 - sinceAx, Math.max(1, quietDeadline - Date.now())));
+    // Only settle AX briefly (20ms quiet window) when an AX update actually fired around this action.
+    if (state.lastAxUpdateMs >= settleStartMs - 15) {
+      const quietCap = navTriggered ? 120 : 25;
+      const quietDeadline = Math.min(deadline, Date.now() + quietCap);
+      while (!state.dialog && Date.now() < quietDeadline) {
+        const sinceAx = Date.now() - state.lastAxUpdateMs;
+        if (sinceAx >= 20) break;
+        await this.#waitForTabWakeup(tabId, Math.min(20 - sinceAx, Math.max(1, quietDeadline - Date.now())));
+      }
     }
   }
 
-  /** @param {number} tabId @param {string} target @param {number} [timeoutMs] */
-  async #waitForCommit(tabId, target, timeoutMs = DEFAULT_LOAD_TIMEOUT_MS) {
+  /** @param {number} tabId @param {string} target @param {number} [timeoutMs] @param {number} [startRev] */
+  async #waitForCommit(tabId, target, timeoutMs = DEFAULT_LOAD_TIMEOUT_MS, startRev) {
     const deadline = Date.now() + timeoutMs;
     const state = this.#tabState(tabId);
     let lastEvalAt = state.hasEvents ? Date.now() : 0;
+    const matchesTargetOrRedirect = (url) => {
+      if (!url || url === "about:blank") return false;
+      if (sameUrl(url, target)) return true;
+      return startRev !== undefined && state.hasEvents && state.committed && state.navRevision > startRev;
+    };
     while (Date.now() < deadline) {
-      if (state.committed && state.url && state.url !== "about:blank" && sameUrl(state.url, target)) return;
+      if (state.committed && matchesTargetOrRedirect(state.url)) return;
       const now = Date.now();
       if (!state.hasEvents || (!state.committed && now - lastEvalAt >= 400)) {
         lastEvalAt = now;

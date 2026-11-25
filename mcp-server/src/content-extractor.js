@@ -48,25 +48,27 @@ export function extractContentExpression({ format = "markdown", maxChars = 16_00
 
   const tagOf = (el) => String(el && el.tagName ? el.tagName : "").toUpperCase();
 
+  const ownHiddenCache = typeof WeakMap === "function" ? new WeakMap() : null;
   const isOwnHidden = (el) => {
     if (!el || el.nodeType !== 1) return false;
-    if (el.hidden === true) return true;
-    if (typeof el.getAttribute === "function") {
-      if (el.getAttribute("hidden") !== null) return true;
-      if (el.getAttribute("aria-hidden") === "true") return true;
-    }
-    if (el.style) {
-      if (el.style.display === "none" || el.style.visibility === "hidden") return true;
-    }
-    if (typeof getComputedStyle === "function") {
+    if (ownHiddenCache && ownHiddenCache.has(el)) return ownHiddenCache.get(el);
+    let hidden = false;
+    if (el.hidden === true) hidden = true;
+    else if (typeof el.getAttribute === "function" &&
+        (el.getAttribute("hidden") !== null || el.getAttribute("aria-hidden") === "true")) {
+      hidden = true;
+    } else if (el.style && (el.style.display === "none" || el.style.visibility === "hidden")) {
+      hidden = true;
+    } else if (typeof getComputedStyle === "function") {
       try {
         const cs = getComputedStyle(el);
-        if (cs && (cs.display === "none" || cs.visibility === "hidden")) return true;
+        if (cs && (cs.display === "none" || cs.visibility === "hidden")) hidden = true;
       } catch (_err) {
         // Ignore detached or cross-realm elements.
       }
     }
-    return false;
+    if (ownHiddenCache) ownHiddenCache.set(el, hidden);
+    return hidden;
   };
 
   const isElementVisible = (el) => {
@@ -235,8 +237,9 @@ export function extractContentExpression({ format = "markdown", maxChars = 16_00
   };
 
   const extractLinksList = (root) => {
-    const anchors = queryAll(root, "a[href]").length > 0
-      ? queryAll(root, "a[href]")
+    const queried = queryAll(root, "a[href]");
+    const anchors = queried.length > 0
+      ? queried
       : collectElementsByTags(root, ["A"]).filter((a) => getAttr(a, "href") !== null || Boolean(a.href));
     const seen = new Set();
     const links = [];
@@ -265,8 +268,9 @@ export function extractContentExpression({ format = "markdown", maxChars = 16_00
   };
 
   const countVisibleTables = (root) => {
-    const tables = queryAll(root, "table").length > 0
-      ? queryAll(root, "table")
+    const queried = queryAll(root, "table");
+    const tables = queried.length > 0
+      ? queried
       : collectElementsByTags(root, ["TABLE"]);
     return tables.filter((t) => isElementVisible(t));
   };
@@ -475,12 +479,42 @@ export function extractContentExpression({ format = "markdown", maxChars = 16_00
   );
   const body = (document && (document.body || document.documentElement)) || null;
   const visibleTables = body ? countVisibleTables(body) : [];
-  const allLinks = body ? extractLinksList(body) : [];
+  const allLinks = body && FORMAT === "links" ? extractLinksList(body) : null;
   const tablesCount = visibleTables.length;
-  const linksCount = allLinks.length;
+  const linksCount = allLinks
+    ? allLinks.length
+    : (body ? queryAll(body, "a[href]").length : 0);
 
   if (FORMAT === "tables") {
-    const tables = visibleTables.map((t) => extractTableData(t));
+    const allTables = visibleTables.map((t) => extractTableData(t));
+    const tables = [];
+    let usedTableChars = 0;
+    let tablesTruncated = false;
+    for (let i = 0; i < allTables.length; i++) {
+      const tbl = allTables[i];
+      const sz = JSON.stringify(tbl).length;
+      if (tables.length === 0 && sz > MAX_CHARS && Array.isArray(tbl.rows)) {
+        const rows = [];
+        let acc = JSON.stringify({ headers: tbl.headers || [], rows: [] }).length;
+        for (const row of tbl.rows) {
+          const rowLen = JSON.stringify(row).length + 1;
+          if (rows.length > 0 && acc + rowLen > MAX_CHARS) {
+            tablesTruncated = true;
+            break;
+          }
+          rows.push(row);
+          acc += rowLen;
+        }
+        tables.push({ ...tbl, rows });
+        break;
+      }
+      if (tables.length > 0 && usedTableChars + sz > MAX_CHARS) {
+        tablesTruncated = true;
+        break;
+      }
+      tables.push(tbl);
+      usedTableChars += sz;
+    }
     const rendered = tables
       .map((t) => renderTableMarkdown(t))
       .filter(Boolean)
@@ -492,7 +526,7 @@ export function extractContentExpression({ format = "markdown", maxChars = 16_00
       format: FORMAT,
       text: clipped.text,
       content: clipped.text,
-      truncated: clipped.truncated,
+      truncated: clipped.truncated || tablesTruncated,
       tablesCount,
       linksCount,
       tables,

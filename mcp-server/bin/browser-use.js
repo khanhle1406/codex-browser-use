@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { lstat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
 import { discoverEngine } from "../src/engine-discovery.js";
-import { defaultBridgeFile, readBackend } from "../src/backend-discovery.js";
+import { defaultBridgeFile, isSocketAlive, readBackend } from "../src/backend-discovery.js";
 import { buildConfig, codexToml, normalizeClient } from "../src/config.js";
-import { EXTENSION_ID } from "../src/extension.js";
-import { configureClient, installExtension, installNativeHost, installRules, installSkill } from "../src/install.js";
+import { EXTENSION_ID, EXTENSION_VERSION, HOST_NAME, installedExtensionDir, nativeHostLauncher } from "../src/extension.js";
+import { configureClient, installExtension, installNativeHost, installRules, installSkill, nativeMessagingDirs, resolveRuntimePaths } from "../src/install.js";
 
 export { buildConfig };
 
@@ -115,10 +116,21 @@ export async function main(argv = process.argv.slice(2)) {
   const bridgeFile = path.resolve(options.bridgeFile ?? defaultBridgeFile());
 
   if (options.command === "install") {
+    const runtime = await resolveRuntimePaths();
     const extension = await installExtension();
-    const nativeHost = await installNativeHost({ extensionId: options.extensionId ?? EXTENSION_ID, bridgeFile });
+    const nativeHost = await installNativeHost({
+      extensionId: options.extensionId ?? EXTENSION_ID,
+      bridgeFile,
+      nativeHostPath: runtime.nativeHostEntry,
+    });
     const client = options.client
-      ? await configureClient({ client: options.client, bridgeFile, profile: options.profile, write: options.write })
+      ? await configureClient({
+        client: options.client,
+        bridgeFile,
+        serverPath: runtime.serverPath,
+        profile: options.profile,
+        write: options.write,
+      })
       : null;
     const skill = options.skill
       ? await installSkill({ client: options.client ?? "generic" })
@@ -129,6 +141,7 @@ export async function main(argv = process.argv.slice(2)) {
       : null;
     const report = {
       ok: true,
+      stagedRuntime: runtime.staged,
       extension: { ...extension, loadUnpackedPath: extension.path },
       nativeHost,
       bridgeFile,
@@ -157,7 +170,12 @@ export async function main(argv = process.argv.slice(2)) {
       if (client) {
         if (client.written) process.stdout.write(`Updated ${client.file}\n`);
         else {
-          process.stdout.write(client.config ? `${JSON.stringify(client.config, null, 2)}\n` : "");
+          const rendered = client.config
+            ? (normalizeClient(options.client) === "codex"
+              ? codexToml(client.config)
+              : `${JSON.stringify(client.config, null, 2)}\n`)
+            : "";
+          process.stdout.write(rendered);
           process.stdout.write("Merge this fragment into the client's MCP settings.\n");
         }
       }
@@ -167,16 +185,54 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   if (options.command === "doctor") {
+    const checks = { extension: null, launcher: null, nativeManifests: [] };
+    try {
+      const extManifest = JSON.parse(await readFile(path.join(installedExtensionDir(), "manifest.json"), "utf8"));
+      checks.extension = {
+        installed: true,
+        version: extManifest.version ?? null,
+        matchesBundled: extManifest.version === EXTENSION_VERSION,
+        path: installedExtensionDir(),
+      };
+    } catch {
+      checks.extension = { installed: false, version: null, matchesBundled: false, path: installedExtensionDir() };
+    }
+    try {
+      await access(nativeHostLauncher(), constants.X_OK);
+      checks.launcher = { exists: true, path: nativeHostLauncher() };
+    } catch {
+      checks.launcher = { exists: false, path: nativeHostLauncher() };
+    }
+    for (const dir of nativeMessagingDirs()) {
+      const file = path.join(dir, `${HOST_NAME}.json`);
+      try {
+        await access(file);
+        checks.nativeManifests.push(file);
+      } catch {
+        // Skip absent browser dirs.
+      }
+    }
     try {
       const engine = options.enginePath ? await discoverEngine({ enginePath: options.enginePath }) : undefined;
-      const bridge = { descriptor: bridgeFile, socketPath: await readBackend(bridgeFile) };
-      const report = { ready: true, node: process.version, ...(engine ? { engine } : {}), bridge,
-        scope: "The bridge socket descriptor passed validation. Browser actions and provider permissions are not checked." };
+      const socketPath = await readBackend(bridgeFile);
+      const alive = await isSocketAlive(socketPath);
+      if (!alive) {
+        throw new Error(`Browser bridge socket exists at ${socketPath} but is not responding (stale socket — reload the Chrome extension).`);
+      }
+      const bridge = { descriptor: bridgeFile, socketPath, alive };
+      const report = {
+        ready: true,
+        node: process.version,
+        ...(engine ? { engine } : {}),
+        bridge,
+        checks,
+        scope: "The bridge socket accepted a live connection. Browser actions and provider permissions are not checked.",
+      };
       process.stdout.write(options.json ? `${JSON.stringify(report, null, 2)}\n` : `${report.scope}\n`);
       return 0;
     } catch (error) {
       if (!options.json) throw error;
-      process.stdout.write(`${JSON.stringify({ ready: false, node: process.version, error: error.message }, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify({ ready: false, node: process.version, checks, error: error.message }, null, 2)}\n`);
       return 1;
     }
   }

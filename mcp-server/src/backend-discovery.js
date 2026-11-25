@@ -16,13 +16,16 @@ async function privateDirectory(file, create) {
   const directory = path.dirname(file);
   if (create) await mkdir(directory, {recursive: true, mode: 0o700});
   const info = await lstat(directory);
-  if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0) {
+  if (!info.isDirectory()) {
+    throw new Error("Browser bridge descriptor requires an owner-only directory");
+  }
+  if (process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)) {
     throw new Error("Browser bridge descriptor requires an owner-only directory");
   }
 }
 
 /** @param {string} socketPath @returns {Promise<boolean>} */
-function isSocketAlive(socketPath) {
+export function isSocketAlive(socketPath) {
   return new Promise((resolve) => {
     let settled = false;
     const socket = net.createConnection({path: socketPath});
@@ -49,7 +52,7 @@ async function isDescriptorLive(file) {
     if (error?.code === "ENOENT") return false;
     throw error;
   }
-  if (!info.isFile() || info.uid !== process.getuid?.()) {
+  if (!info.isFile() || (process.platform !== "win32" && info.uid !== process.getuid?.())) {
     throw new Error("Refusing to replace non-regular or foreign browser bridge descriptor");
   }
   try {
@@ -105,17 +108,21 @@ export async function readBackend(file) {
   const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const info = await handle.stat();
-    if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0 || info.size > 4096) {
+    const invalidOwner = process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0);
+    if (!info.isFile() || invalidOwner || info.size > 4096) {
       throw new Error("Invalid browser bridge descriptor");
     }
     const descriptor = JSON.parse(await handle.readFile("utf8"));
     const socketPath = descriptor?.socketPath;
-    if (descriptor?.version !== 1 || typeof socketPath !== "string" || !path.isAbsolute(socketPath) || socketPath.includes(":")) {
+    const hasInvalidColon = process.platform !== "win32" && typeof socketPath === "string" && socketPath.includes(":");
+    if (descriptor?.version !== 1 || typeof socketPath !== "string" || !path.isAbsolute(socketPath) || hasInvalidColon) {
       throw new Error("Invalid browser bridge socket path");
     }
-    await privateDirectory(socketPath, false);
-    const socket = await lstat(socketPath);
-    if (!socket.isSocket() || socket.uid !== process.getuid?.()) throw new Error("Browser bridge socket is unavailable");
+    if (process.platform !== "win32") {
+      await privateDirectory(socketPath, false);
+      const socket = await lstat(socketPath);
+      if (!socket.isSocket() || socket.uid !== process.getuid?.()) throw new Error("Browser bridge socket is unavailable");
+    }
     return socketPath;
   } finally {
     await handle.close();

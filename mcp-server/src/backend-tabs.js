@@ -1,7 +1,7 @@
 import {validateNetworkPolicy, validatePageCommand} from "./backend-page-commands.js";
 
 /** @typedef {{id:number, title?:string, url?:string, active?:boolean, owned?:boolean, origin?:"agent"|"user"}} BrowserTab */
-/** @typedef {{createBlankTab:()=>Promise<BrowserTab>, listTabs?:()=>Promise<BrowserTab[]>, claimTab?:(id:number)=>Promise<BrowserTab>, readTab:(id:number)=>Promise<BrowserTab|null>, readTabContext?:(id:number,options?:{format?:string,maxChars?:number})=>Promise<unknown>, setConfig?:(config:{cursorMode?:string})=>Promise<unknown>, closeTab:(id:number)=>Promise<void>, releaseTab?:(id:number)=>Promise<void>, markTab?:(id:number,status:TabMark,markOptions?:{focus?:boolean})=>Promise<void>, moveCursor?:(id:number,x:number,y:number,waitForArrival?:boolean)=>Promise<void>, attach?:(id:number)=>Promise<void>, detach?:(id:number)=>Promise<void>, navigate?:(id:number,url:string)=>Promise<void>, watchDownloads?:(id:number)=>Promise<void>, unwatchDownloads?:(id:number)=>Promise<void>, groupTabs?:(tabIds:number[],options:{title?:string,color?:string,groupId?:number|null,sessionId?:string,collapsed?:boolean})=>Promise<{groupId:number|null,supported?:boolean}>, ungroupTabs?:(tabIds:number[])=>Promise<{ok?:boolean,ungrouped?:number,supported?:boolean}>, listTabGroups?:()=>Promise<Array<Record<string,unknown>>>, cleanupGroups?:(options?:{ungroupFinished?:boolean,closeDuplicateDeliverables?:boolean,keepTabIds?:number[]})=>Promise<Record<string,unknown>>, execute?:(id:number,method:string,params:RpcParams,childSession?:string)=>Promise<unknown>, onEvent?:(listener:(method:string, id:number, params:RpcParams)=>void)=>void}} TabDriver */
+/** @typedef {{createBlankTab:()=>Promise<BrowserTab>, listTabs?:()=>Promise<BrowserTab[]>, claimTab?:(id:number)=>Promise<BrowserTab>, readTab:(id:number)=>Promise<BrowserTab|null>, readTabContext?:(id:number,options?:{format?:string,maxChars?:number})=>Promise<unknown>, setConfig?:(config:{cursorMode?:string,allowTabFocus?:boolean})=>Promise<unknown>, closeTab:(id:number)=>Promise<void>, releaseTab?:(id:number)=>Promise<void>, markTab?:(id:number,status:TabMark,markOptions?:{focus?:boolean})=>Promise<void>, moveCursor?:(id:number,x:number,y:number,waitForArrival?:boolean)=>Promise<void>, attach?:(id:number)=>Promise<void>, detach?:(id:number)=>Promise<void>, navigate?:(id:number,url:string)=>Promise<void>, watchDownloads?:(id:number)=>Promise<void>, unwatchDownloads?:(id:number)=>Promise<void>, groupTabs?:(tabIds:number[],options:{title?:string,color?:string,groupId?:number|null,sessionId?:string,collapsed?:boolean})=>Promise<{groupId:number|null,supported?:boolean}>, ungroupTabs?:(tabIds:number[])=>Promise<{ok?:boolean,ungrouped?:number,supported?:boolean}>, listTabGroups?:()=>Promise<Array<Record<string,unknown>>>, cleanupGroups?:(options?:{ungroupFinished?:boolean,closeDuplicateDeliverables?:boolean,keepTabIds?:number[]})=>Promise<Record<string,unknown>>, execute?:(id:number,method:string,params:RpcParams,childSession?:string)=>Promise<unknown>, executeBatch?:(id:number,commands:Array<{method:string,params:RpcParams,childSession?:string,fireAndForget?:boolean,ignoreError?:boolean}>)=>Promise<{results:unknown[]}>, onEvent?:(listener:(method:string, id:number, params:RpcParams)=>void)=>void}} TabDriver */
 /** @typedef {"handoff"|"deliverable"} TabMark */
 /** @typedef {{id:string, turn:string|null, ended:Set<string>, tabs:Map<number,TabMark|null>, userTabs:Set<number>, attached:Set<number>, group:null|{title:string,color:string,groupId:number|null}, groupLock:Promise<void>, notify:Notify, cleanup?:Promise<void>}} TabSession */
 /** @typedef {Record<string,unknown>} RpcParams */
@@ -60,7 +60,12 @@ export function createTabHandlers(driver, options) {
       return;
     }
     if (!session?.attached.has(id)) return;
-    if (method === "onCDPDetach") session.attached.delete(id);
+    if (method === "onCDPDetach") {
+      session.attached.delete(id);
+      if (params?.reason === "canceled_by_user" && session.userTabs.has(id)) {
+        release(session, id);
+      }
+    }
     session.notify(method, params);
   });
 
@@ -104,9 +109,12 @@ export function createTabHandlers(driver, options) {
   /** @param {TabSession} session @param {boolean} disconnected @param {{ungroup?:boolean}} [cleanupOpts] @returns {Promise<void>} */
   async function cleanTabs(session, disconnected, { ungroup = false } = {}) {
     const entries = [...session.tabs];
-    const releasableIds = (!disconnected && ungroup && typeof driver.ungroupTabs === "function")
+    const releasableIds = (typeof driver.ungroupTabs === "function")
       ? entries
-        .filter(([id, status]) => status === "deliverable" || (status === null && session.userTabs.has(id)))
+        .filter(([id, status]) => {
+          if (disconnected) return session.userTabs.has(id);
+          return ungroup && (status === "deliverable" || (status === null && session.userTabs.has(id)));
+        })
         .map(([id]) => id)
       : [];
     const detachResults = await Promise.allSettled(entries.map(async ([id]) => {
@@ -162,9 +170,11 @@ export function createTabHandlers(driver, options) {
     if (session.turn !== turn) return;
     session.cleanup = cleanTabs(session, false, { ungroup: params?.ungroup === true });
     try { await session.cleanup; }
-    finally { session.cleanup = undefined; }
-    session.ended.add(turn);
-    session.turn = null;
+    finally {
+      session.cleanup = undefined;
+      session.ended.add(turn);
+      session.turn = null;
+    }
   }
 
   /** @type {Map<string,RpcHandler>} */
@@ -208,6 +218,7 @@ export function createTabHandlers(driver, options) {
           "Tab.ax": false,
           ...(typeof driver.listTabs === "function" ? {"BrowserUser.openTabs": true, "BrowserUser.claimTab": true} : {}),
           ...(typeof driver.readTabContext === "function" ? {"BrowserUser.getTabContext": true} : {}),
+          ...(typeof driver.executeBatch === "function" ? {"Bridge.executeCdpBatch": true, "Bridge.attachFocusAndPage": true} : {}),
         },
       };
     }],
@@ -325,6 +336,20 @@ export function createTabHandlers(driver, options) {
       }
       return {...tab, owned: true, origin: "user"};
     }],
+    ["releaseUserTab", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      const rawId = Number(params.tabId);
+      if (!Number.isSafeInteger(rawId) || !session.tabs.has(rawId) || !session.userTabs.has(rawId)) {
+        return { ok: true, released: false };
+      }
+      if (session.attached.has(rawId)) {
+        await driver.detach?.(rawId).catch(() => {});
+        session.attached.delete(rawId);
+      }
+      await driver.releaseTab?.(rawId).catch(() => {});
+      release(session, rawId);
+      return { ok: true, released: true };
+    }],
     ["readTabContext", async (params, signal) => {
       const session = activateTurn(params, signal);
       if (typeof driver.readTabContext !== "function") {
@@ -351,6 +376,7 @@ export function createTabHandlers(driver, options) {
       if (typeof driver.setConfig !== "function") return { ok: true, supported: false };
       return await driver.setConfig({
         ...(typeof params.cursorMode === "string" ? { cursorMode: params.cursorMode } : {}),
+        ...(typeof params.allowTabFocus === "boolean" ? { allowTabFocus: params.allowTabFocus } : {}),
       });
     }],
     ["getCommittedTabUrl", async (params, signal) => {
@@ -463,6 +489,66 @@ export function createTabHandlers(driver, options) {
       }
       validatePageCommand(params.method, params.commandParams);
       return await driver.execute(id, params.method, params.commandParams, childSession);
+    });
+    handlers.set("executeCdpBatch", async (params, signal) => {
+      const session = activateTurn(params, signal);
+      const id = requireOwnedTab(session, params.target?.tabId);
+      if (!session.attached.has(id)) throw new Error("Debugger unattached");
+      const defaultChild = params.target?.sessionId;
+      if (Object.keys(params.target ?? {}).some((key) => key !== "tabId" && key !== "sessionId") ||
+          (defaultChild !== undefined && (typeof defaultChild !== "string" || defaultChild.length < 1 || defaultChild.length > 128))) {
+        throw new Error("Portable browser targets must identify a tab or child debugger session");
+      }
+      const commands = Array.isArray(params.commands) ? params.commands : null;
+      if (!commands || commands.length === 0 || commands.length > 32) {
+        throw new Error("executeCdpBatch requires between 1 and 32 commands");
+      }
+      const validated = commands.map((cmd) => {
+        const childSession = cmd?.sessionId ?? defaultChild;
+        if (childSession !== undefined && (typeof childSession !== "string" || childSession.length < 1 || childSession.length > 128)) {
+          throw new Error("Portable browser targets must identify a tab or child debugger session");
+        }
+        if ((childSession !== undefined || cmd?.method === "Target.setAutoAttach") && !options.childFrames) {
+          throw new Error("Nested browser targets are disabled on this bridge");
+        }
+        validatePageCommand(cmd?.method, cmd?.commandParams ?? {});
+        return {
+          method: cmd.method,
+          params: cmd.commandParams ?? {},
+          childSession,
+          ...(cmd.fireAndForget === true ? { fireAndForget: true } : {}),
+          ...(cmd.ignoreError === true ? { ignoreError: true } : {}),
+        };
+      });
+      if (typeof driver.executeBatch === "function") {
+        return await driver.executeBatch(id, validated);
+      }
+      const results = [];
+      let lastObjectId = null;
+      for (const cmd of validated) {
+        const resolvedParams = { ...cmd.params };
+        for (const [k, v] of Object.entries(resolvedParams)) {
+          if (v === "$prev.object.objectId" || v === "$prev.result.objectId") {
+            if (!lastObjectId) throw new Error("CDP batch step missing previous objectId");
+            resolvedParams[k] = lastObjectId;
+          }
+        }
+        if (cmd.fireAndForget) {
+          void driver.execute(id, cmd.method, resolvedParams, cmd.childSession).catch(() => {});
+          results.push(null);
+          continue;
+        }
+        try {
+          const res = await driver.execute(id, cmd.method, resolvedParams, cmd.childSession);
+          const nextId = res?.object?.objectId ?? res?.result?.objectId;
+          if (typeof nextId === "string" && nextId) lastObjectId = nextId;
+          results.push(res);
+        } catch (error) {
+          if (cmd.ignoreError) results.push({ error: error instanceof Error ? error.message : String(error) });
+          else throw error;
+        }
+      }
+      return { results };
     });
   }
   if (driver.watchDownloads && driver.unwatchDownloads) {

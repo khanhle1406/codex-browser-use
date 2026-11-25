@@ -1,4 +1,4 @@
-# codex-browser-use Cookbook (v4.8.0)
+# codex-browser-use Cookbook (v4.9.0)
 
 Copy-paste patterns for `browser_run` and `browser_batch`. All local file paths passed to `saveFile`, `readFile`, and `saveScreenshot` must be **absolute paths**; parent directories are created automatically.
 
@@ -80,7 +80,7 @@ for (let pageIdx = 0; pageIdx < 10; pageIdx++) {
     }
     savedFiles.push(outPath);
 
-    await modal.getByRole("button", { name: "close", exact: true }).click();
+    await modal.getByRole("button", { name: "close" }).click();
     await modal.waitFor({ state: "hidden" });
   }
 
@@ -170,7 +170,7 @@ await tab.getByRole("button", { name: "Download Full Archive" }).click();
 const download = await dlPromise;
 const downloadedPath = await download.path();
 
-return { downloadedPath, suggestedFilename: download.suggestedFilename?.() };
+return { downloadedPath, suggestedFilename: download.suggestedFilename ?? null };
 ```
 
 ---

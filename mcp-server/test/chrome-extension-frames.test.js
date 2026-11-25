@@ -363,8 +363,9 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
   assert.equal(claimed.value.id, 10);
   assert.equal(claimed.value.origin, "user");
 
-  // 3. attach dynamically injects content-script.js on CONTENT_PING miss and sends TAB_FAVICON_BADGE + AGENT_CURSOR_STATE
+  // 3. attach dynamically injects content-script.js on CONTENT_PING miss and sends TAB_FAVICON_BADGE + AGENT_CURSOR_STATE (non-blocking)
   assert.equal((await request({ method: "attach", tabId: 10 })).ok, true);
+  await new Promise((r) => setTimeout(r, 10));
   assert.equal(scriptsInjected.filter((s) => Array.isArray(s.files)).length, 1);
   assert.ok(tabMessages.some((m) => m.tabId === 10 && m.msg.type === "TAB_FAVICON_BADGE" && m.msg.badge === "active"));
   assert.ok(tabMessages.some((m) => m.tabId === 10 && m.msg.type === "AGENT_CURSOR_STATE" && m.msg.state.isVisible === true));
@@ -408,6 +409,7 @@ test("extension lists and claims existing user tabs, renders virtual cursor and 
   assert.equal(created.ok, true);
   tabMessages.length = 0;
   assert.equal((await request({ method: "attach", tabId: 20 })).ok, true);
+  await new Promise((r) => setTimeout(r, 10));
   assert.ok(tabMessages.some((m) => m.tabId === 10 && m.msg.type === "TAB_FAVICON_BADGE" && m.msg.badge === null));
   assert.ok(tabMessages.some((m) => m.tabId === 20 && m.msg.type === "TAB_FAVICON_BADGE" && m.msg.badge === "active"));
 

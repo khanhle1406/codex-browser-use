@@ -2,9 +2,14 @@ import { endianness } from "node:os";
 import { FrameReader, encodeFrame } from "./frame-reader.js";
 
 const littleEndian = endianness() === "LE";
-const maxMessage = 2 * 1024 * 1024;
+const maxIncomingMessage = 16 * 1024 * 1024;
+const maxOutgoingMessage = 2 * 1024 * 1024;
 const maxChunkChars = 512 * 1024;
 const maxUnacknowledged = 128;
+const TAB_TIMEOUT_BYPASS_CDP_METHODS = new Set(["Page.handleJavaScriptDialog", "Page.close"]);
+const ISOLATED_TIMEOUT_METHODS = new Set([
+  "execute", "executeBatch", "readTabContext", "attach", "detach", "moveCursor", "markTab", "navigate",
+]);
 /** @typedef {{id:number,title?:string,url?:string,active?:boolean}} BrowserTab */
 /** @typedef {Record<string,unknown>} Params */
 /** @typedef {(method:string, id:number, params:Params)=>void} EventListener */
@@ -29,13 +34,21 @@ export function createNativeTabDriver(input, output, options = {}) {
   let nextId = 0;
   const reader = new FrameReader({
     littleEndian,
-    maxFrameBytes: maxMessage,
-    maxBufferedBytes: 4 * maxMessage,
+    maxFrameBytes: maxIncomingMessage,
+    maxBufferedBytes: 4 * maxIncomingMessage,
     overflowError: "Invalid Chrome native message size",
     lengthError: "Invalid Chrome native message size",
   });
   /** @type {Error | undefined} */
   let failure;
+
+  /** @param {number} tabId @returns {void} */
+  function clearTabTimeouts(tabId) {
+    expiredCountsByTab.delete(tabId);
+    for (const [reqId, expiredTabId] of expiredCommands) {
+      if (expiredTabId === tabId) expiredCommands.delete(reqId);
+    }
+  }
 
   /** @param {Error} error @returns {void} */
   function fail(error) {
@@ -59,6 +72,7 @@ export function createNativeTabDriver(input, output, options = {}) {
       while ((raw = reader.nextFrame()) !== null) {
         const reply = JSON.parse(raw.toString("utf8"));
         if (["onCDPEvent", "onCDPDetach", "onTabCreated"].includes(reply?.event) && Number.isSafeInteger(reply.tabId)) {
+          if (reply.event === "onCDPDetach") clearTabTimeouts(reply.tabId);
           onEvent?.(reply.event, reply.tabId, reply.params);
           continue;
         }
@@ -67,9 +81,9 @@ export function createNativeTabDriver(input, output, options = {}) {
         if (expiredTab !== undefined) {
           if (typeof reply?.ok === "boolean" || reply?.final === true) {
             expiredCommands.delete(reply.id);
-            const remaining = expiredCountsByTab.get(expiredTab) - 1;
-            if (remaining === 0) expiredCountsByTab.delete(expiredTab);
-            else expiredCountsByTab.set(expiredTab, remaining);
+            const cur = expiredCountsByTab.get(expiredTab) ?? 0;
+            if (cur <= 1) expiredCountsByTab.delete(expiredTab);
+            else expiredCountsByTab.set(expiredTab, cur - 1);
           }
           continue;
         }
@@ -100,9 +114,10 @@ export function createNativeTabDriver(input, output, options = {}) {
   /** @param {string} method @param {number} [tabId] @param {Params} [details] @returns {Promise<unknown>} */
   async function request(method, tabId, details) {
     if (failure) throw failure;
-    const isolateTimeout = method === "execute" && tabId !== undefined;
+    const isolateTimeout = tabId !== undefined && ISOLATED_TIMEOUT_METHODS.has(method);
+    const bypassLockout = method === "execute" && TAB_TIMEOUT_BYPASS_CDP_METHODS.has(details?.method);
     if (isolateTimeout) {
-      if (expiredCountsByTab.has(tabId)) {
+      if (!bypassLockout && expiredCountsByTab.has(tabId)) {
         throw new Error("A timed-out Chrome command is still in flight for this tab");
       }
       if (pending.size + expiredCommands.size >= maxUnacknowledged) {
@@ -112,7 +127,7 @@ export function createNativeTabDriver(input, output, options = {}) {
     const id = ++nextId;
     const packet = encodeFrame({ id, method, tabId, details }, {
       littleEndian,
-      maxFrameBytes: maxMessage,
+      maxFrameBytes: maxOutgoingMessage,
       overflowError: "Invalid Chrome native message size",
     });
     return new Promise((resolve, reject) => {
@@ -168,9 +183,15 @@ export function createNativeTabDriver(input, output, options = {}) {
       return await request("setConfig", undefined, config);
     },
     /** @param {number} id @returns {Promise<void>} */
-    async closeTab(id) { await request("closeTab", id); },
+    async closeTab(id) {
+      clearTabTimeouts(id);
+      await request("closeTab", id);
+    },
     /** @param {number} id @returns {Promise<void>} */
-    async releaseTab(id) { await request("releaseTab", id); },
+    async releaseTab(id) {
+      clearTabTimeouts(id);
+      await request("releaseTab", id);
+    },
     /** @param {number} id @param {string} status @param {{focus?:boolean}} [markOptions] @returns {Promise<void>} */
     async markTab(id, status, markOptions = {}) {
       await request("markTab", id, {status, ...(markOptions?.focus === true ? {focus: true} : {})});
@@ -182,9 +203,14 @@ export function createNativeTabDriver(input, output, options = {}) {
     /** @param {number} id @returns {Promise<void>} */
     async attach(id) { await request("attach", id); },
     /** @param {number} id @returns {Promise<void>} */
-    async detach(id) { await request("detach", id); },
+    async detach(id) {
+      clearTabTimeouts(id);
+      await request("detach", id);
+    },
     /** @param {number} id @param {string} method @param {Params} params @param {string} [childSession] @returns {Promise<unknown>} */
     async execute(id, method, params, childSession) { return await request("execute", id, {method, params, childSession}); },
+    /** @param {number} id @param {Array<{method:string,params:Params,childSession?:string,fireAndForget?:boolean,ignoreError?:boolean}>} commands @returns {Promise<{results:unknown[]}>} */
+    async executeBatch(id, commands) { return await request("executeBatch", id, {commands}); },
     /** @param {number} id @param {string} url @returns {Promise<void>} */
     async navigate(id, url) { await request("navigate", id, {url}); },
     /** @param {number} id @returns {Promise<void>} */

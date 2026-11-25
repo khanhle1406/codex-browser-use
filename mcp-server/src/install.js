@@ -10,10 +10,12 @@ import {
   defaultBridgeFile,
   extensionSource,
   installedExtensionDir,
+  installedRuntimeDir,
   nativeHostLauncher,
 } from "./extension.js";
-import { buildConfig, clientRuleTarget, clientSkillTarget, clientTarget, normalizeClient, stableNodePath } from "./config.js";
+import { buildConfig, clientRuleTarget, clientSkillTarget, clientTarget, isEphemeralPackagePath, normalizeClient, stableNodePath } from "./config.js";
 
+const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const nativeHostEntry = fileURLToPath(new URL("../bin/chrome-native-host.js", import.meta.url));
 const repoSkillSource = fileURLToPath(new URL("../../skill/SKILL.md", import.meta.url));
 const localSkillSource = fileURLToPath(new URL("../skill/SKILL.md", import.meta.url));
@@ -86,6 +88,7 @@ async function backupOnce(file) {
 
 /**
  * Copy the bundled extension to a stable path and report its pinned ID.
+ * Verifies critical bundle files in addition to version and rolls back on rename failure.
  * @param {{source?:string, destination?:string}} [options]
  */
 export async function installExtension({ source = extensionSource, destination = installedExtensionDir() } = {}) {
@@ -97,17 +100,146 @@ export async function installExtension({ source = extensionSource, destination =
   try {
     const existing = JSON.parse(await readFile(path.join(destination, "manifest.json"), "utf8"));
     changed = existing.version !== manifest.version;
+    if (!changed) {
+      for (const critical of ["background.js", "content-script.js"]) {
+        const srcStat = await stat(path.join(source, critical)).catch(() => null);
+        if (!srcStat?.isFile()) continue;
+        const dstStat = await stat(path.join(destination, critical));
+        if (!dstStat.isFile() || dstStat.size !== srcStat.size) {
+          changed = true;
+          break;
+        }
+      }
+    }
   } catch {
     changed = true;
   }
   if (changed) {
     const temporary = `${destination}.tmp-${randomUUID()}`;
-    await cp(source, temporary, { recursive: true });
-    const backup = await backupDirectory(destination);
-    await rename(temporary, destination);
+    await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+    let backup = null;
+    try {
+      await cp(source, temporary, { recursive: true });
+      backup = await backupDirectory(destination);
+      await rename(temporary, destination);
+    } catch (error) {
+      await rm(temporary, { recursive: true, force: true }).catch(() => {});
+      if (backup) {
+        await rename(backup, destination).catch(() => {});
+      }
+      throw error;
+    }
     return { path: destination, id: EXTENSION_ID, version: manifest.version, changed: true, backup };
   }
   return { path: destination, id: EXTENSION_ID, version: manifest.version, changed: false, backup: null };
+}
+
+/**
+ * Resolve runtime `node_modules` directory (package-local or hoisted parent for `_npx`)
+ * and copy only runtime dependencies + transitive packages into `destNodeModules`.
+ * @param {string} sourceRoot
+ * @param {string} destNodeModules
+ */
+async function copyRuntimeDependencies(sourceRoot, destNodeModules) {
+  const pkg = JSON.parse(await readFile(path.join(sourceRoot, "package.json"), "utf8"));
+  const roots = Object.keys(pkg.dependencies ?? {});
+  if (roots.length === 0) return;
+
+  const searchBases = [path.join(sourceRoot, "node_modules")];
+  let cur = path.dirname(sourceRoot);
+  for (let i = 0; i < 4; i++) {
+    const candidate = path.basename(cur) === "node_modules" ? cur : path.join(cur, "node_modules");
+    if (!searchBases.includes(candidate)) searchBases.push(candidate);
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+
+  /** @param {string} pkgName @param {string} fromDir @returns {Promise<string|null>} */
+  async function findPackageDir(pkgName, fromDir) {
+    const candidates = fromDir ? [path.join(fromDir, "node_modules", pkgName), ...searchBases.map((b) => path.join(b, pkgName))] : searchBases.map((b) => path.join(b, pkgName));
+    for (const dir of candidates) {
+      try {
+        const info = await stat(path.join(dir, "package.json"));
+        if (info.isFile()) return dir;
+      } catch {
+        // Try next candidate.
+      }
+    }
+    return null;
+  }
+
+  const visited = new Set();
+  const queue = roots.map((name) => ({ name, fromDir: sourceRoot }));
+  await mkdir(destNodeModules, { recursive: true, mode: 0o755 });
+  while (queue.length > 0) {
+    const { name, fromDir } = queue.shift();
+    if (visited.has(name)) continue;
+    const found = await findPackageDir(name, fromDir);
+    if (!found) continue;
+    visited.add(name);
+    const destPkg = path.join(destNodeModules, ...name.split("/"));
+    await mkdir(path.dirname(destPkg), { recursive: true, mode: 0o755 });
+    await cp(found, destPkg, {
+      recursive: true,
+      dereference: true,
+      filter: (src) => path.basename(src) !== ".bin",
+    });
+    try {
+      const depPkg = JSON.parse(await readFile(path.join(found, "package.json"), "utf8"));
+      for (const depName of [...Object.keys(depPkg.dependencies ?? {}), ...Object.keys(depPkg.optionalDependencies ?? {})]) {
+        if (!visited.has(depName)) queue.push({ name: depName, fromDir: found });
+      }
+    } catch {
+      // Ignore malformed dependency package.json.
+    }
+  }
+}
+
+/**
+ * Stage a persistent self-contained MCP + native host runtime so ephemeral `npx` caches
+ * can be pruned without breaking installed browser native messaging or MCP configs.
+ * @param {{sourceRoot?:string, destination?:string}} [options]
+ * @returns {Promise<{staged:boolean, dir:string, serverPath:string, nativeHostEntry:string}>}
+ */
+export async function stageRuntime({ sourceRoot = packageRoot, destination = installedRuntimeDir() } = {}) {
+  const temporary = `${destination}.tmp-${randomUUID()}`;
+  await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+  let backup = null;
+  try {
+    await mkdir(temporary, { recursive: true, mode: 0o755 });
+    await cp(path.join(sourceRoot, "package.json"), path.join(temporary, "package.json"));
+    await cp(path.join(sourceRoot, "bin"), path.join(temporary, "bin"), { recursive: true, dereference: true });
+    await cp(path.join(sourceRoot, "src"), path.join(temporary, "src"), { recursive: true, dereference: true });
+    await cp(path.join(sourceRoot, "extension"), path.join(temporary, "extension"), { recursive: true, dereference: true });
+    await copyRuntimeDependencies(sourceRoot, path.join(temporary, "node_modules"));
+    backup = await backupDirectory(destination);
+    await rename(temporary, destination);
+  } catch (error) {
+    await rm(temporary, { recursive: true, force: true }).catch(() => {});
+    if (backup) await rename(backup, destination).catch(() => {});
+    throw error;
+  }
+  return {
+    staged: true,
+    dir: destination,
+    serverPath: path.join(destination, "src", "server.js"),
+    nativeHostEntry: path.join(destination, "bin", "chrome-native-host.js"),
+  };
+}
+
+/**
+ * Resolve permanent entrypoints for `install`, auto-staging when running from `_npx` or temp dirs.
+ * @param {{stageIfEphemeral?:boolean, destination?:string}} [options]
+ * @returns {Promise<{staged:boolean, serverPath:string, nativeHostEntry:string}>}
+ */
+export async function resolveRuntimePaths({ stageIfEphemeral = true, destination = installedRuntimeDir() } = {}) {
+  const directServer = fileURLToPath(new URL("./server.js", import.meta.url));
+  if (stageIfEphemeral && isEphemeralPackagePath(nativeHostEntry)) {
+    const staged = await stageRuntime({ sourceRoot: packageRoot, destination });
+    return { staged: true, serverPath: staged.serverPath, nativeHostEntry: staged.nativeHostEntry };
+  }
+  return { staged: false, serverPath: directServer, nativeHostEntry };
 }
 
 /** @param {string} destination @returns {Promise<string|null>} */
@@ -131,17 +263,28 @@ export function nativeMessagingDirs() {
     const support = path.join(home, "Library", "Application Support");
     return [
       path.join(support, "Google", "Chrome", "NativeMessagingHosts"),
+      path.join(support, "Google", "Chrome Beta", "NativeMessagingHosts"),
+      path.join(support, "Google", "Chrome Canary", "NativeMessagingHosts"),
+      path.join(support, "Google", "Chrome Dev", "NativeMessagingHosts"),
+      path.join(support, "Google", "Chrome for Testing", "NativeMessagingHosts"),
       path.join(support, "Chromium", "NativeMessagingHosts"),
+      path.join(support, "Arc", "User Data", "NativeMessagingHosts"),
       path.join(support, "Microsoft Edge", "NativeMessagingHosts"),
       path.join(support, "BraveSoftware", "Brave-Browser", "NativeMessagingHosts"),
+      path.join(support, "Vivaldi", "NativeMessagingHosts"),
+      path.join(support, "com.operasoftware.Opera", "NativeMessagingHosts"),
     ];
   }
   if (process.platform === "linux") {
     return [
       path.join(home, ".config", "google-chrome", "NativeMessagingHosts"),
+      path.join(home, ".config", "google-chrome-beta", "NativeMessagingHosts"),
+      path.join(home, ".config", "google-chrome-unstable", "NativeMessagingHosts"),
       path.join(home, ".config", "chromium", "NativeMessagingHosts"),
       path.join(home, ".config", "microsoft-edge", "NativeMessagingHosts"),
       path.join(home, ".config", "BraveSoftware", "Brave-Browser", "NativeMessagingHosts"),
+      path.join(home, ".config", "vivaldi", "NativeMessagingHosts"),
+      path.join(home, ".config", "opera", "NativeMessagingHosts"),
     ];
   }
   throw new Error("Native host installation supports macOS and Linux; on Windows, register the host with the Chrome registry key manually");
@@ -149,11 +292,24 @@ export function nativeMessagingDirs() {
 
 /**
  * Write the launcher and native messaging manifests for every installed browser.
- * @param {{extensionId?:string, bridgeFile?:string}} [options]
+ * @param {{extensionId?:string, bridgeFile?:string, nativeHostPath?:string}} [options]
  */
-export async function installNativeHost({ extensionId = EXTENSION_ID, bridgeFile = defaultBridgeFile() } = {}) {
+export async function installNativeHost({ extensionId = EXTENSION_ID, bridgeFile = defaultBridgeFile(), nativeHostPath } = {}) {
   const launcher = nativeHostLauncher();
-  const script = `#!/bin/sh\nexec ${shellQuote(stableNodePath())} ${shellQuote(nativeHostEntry)} ${shellQuote(path.resolve(bridgeFile))}\n`;
+  const entry = nativeHostPath ?? nativeHostEntry;
+  const preferredNode = stableNodePath();
+  const script = [
+    "#!/bin/sh",
+    `NODE=${shellQuote(preferredNode)}`,
+    'if [ ! -x "$NODE" ]; then',
+    '  for c in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.volta/bin/node" "$HOME/.local/share/fnm/aliases/default/bin/node"; do',
+    '    if [ -x "$c" ]; then NODE="$c"; break; fi',
+    "  done",
+    "fi",
+    'if [ ! -x "$NODE" ]; then NODE="$(command -v node 2>/dev/null || echo node)"; fi',
+    `exec "$NODE" ${shellQuote(entry)} ${shellQuote(path.resolve(bridgeFile))}`,
+    "",
+  ].join("\n");
   await writeAtomic(launcher, script, 0o700);
   const manifest = {
     name: HOST_NAME,
@@ -163,7 +319,6 @@ export async function installNativeHost({ extensionId = EXTENSION_ID, bridgeFile
     allowed_origins: [`chrome-extension://${extensionId}/`],
   };
   const written = [];
-  let chromeWritten = false;
   for (const directory of nativeMessagingDirs()) {
     const browserRoot = path.dirname(directory);
     let exists = true;
@@ -172,38 +327,107 @@ export async function installNativeHost({ extensionId = EXTENSION_ID, bridgeFile
     } catch {
       exists = false;
     }
-    const isChrome = directory.includes(`${path.sep}Google${path.sep}Chrome${path.sep}`);
-    if (!exists && !isChrome) continue;
+    const isDefaultChrome = directory.includes(`${path.sep}Google${path.sep}Chrome${path.sep}`) ||
+      directory.includes(`${path.sep}google-chrome${path.sep}`);
+    if (!exists && !isDefaultChrome) continue;
     const file = path.join(directory, `${HOST_NAME}.json`);
     const backup = await backupOnce(file);
     await writeAtomic(file, `${JSON.stringify(manifest, null, 2)}\n`, 0o600);
     written.push({ file, backup });
-    if (isChrome) chromeWritten = true;
   }
-  if (!chromeWritten) throw new Error("Could not locate a Chrome native messaging directory");
-  return { launcher, manifests: written };
+  if (written.length === 0) throw new Error("Could not locate a Chrome native messaging directory");
+  return { launcher, entry, manifests: written };
+}
+
+/**
+ * Strip JS/JSONC `//` line comments, block comments, and trailing commas outside string literals.
+ * @param {string} raw
+ * @returns {string}
+ */
+export function stripJsonComments(raw) {
+  let out = "";
+  let inStr = false;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    const next = raw[i + 1];
+    if (lineComment) {
+      if (ch === "\n") {
+        lineComment = false;
+        out += ch;
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (ch === "*" && next === "/") {
+        blockComment = false;
+        i += 1;
+      }
+      continue;
+    }
+    if (inStr) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      lineComment = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      blockComment = true;
+      i += 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out.replace(/,\s*([}\]])/gu, "$1");
 }
 
 /**
  * Merge the browser-use entry into a client's MCP configuration.
- * @param {{client:string, bridgeFile?:string, profile?:string, write?:boolean, home?:string}} options
+ * @param {{client:string, bridgeFile?:string, serverPath?:string, profile?:string, write?:boolean, home?:string}} options
  */
-export async function configureClient({ client, bridgeFile = defaultBridgeFile(), profile, write = false, home = homedir() }) {
+export async function configureClient({ client, bridgeFile = defaultBridgeFile(), serverPath, profile, write = false, home = homedir() }) {
   const name = normalizeClient(client);
   const target = clientTarget(name, home);
-  const config = buildConfig(name, { bridgeFile, profile });
+  const config = buildConfig(name, { bridgeFile, serverPath, profile });
   if (!write || target.file === null) {
     return { written: false, file: target.file, config };
   }
   let existing = {};
   try {
-    existing = JSON.parse(await readFile(target.file, "utf8"));
+    const raw = await readFile(target.file, "utf8");
+    existing = raw.trim() ? JSON.parse(stripJsonComments(raw)) : {};
   } catch (error) {
     if (error.code !== "ENOENT") throw new Error(`${target.file} is not valid JSON: ${error.message}`);
   }
+  const mergeEntries = (prevServers = {}, nextServers = {}) => {
+    const out = { ...prevServers };
+    for (const [key, entry] of Object.entries(nextServers)) {
+      const prevEntry = prevServers[key];
+      if (prevEntry && typeof prevEntry === "object" && entry && typeof entry === "object") {
+        const mergedEnv = (prevEntry.env || entry.env) ? { ...(prevEntry.env ?? {}), ...(entry.env ?? {}) } : undefined;
+        out[key] = { ...entry, ...(mergedEnv ? { env: mergedEnv } : {}) };
+      } else {
+        out[key] = entry;
+      }
+    }
+    return out;
+  };
   const merged = target.key === "mcp.servers"
-    ? { ...existing, mcp: { ...existing.mcp, servers: { ...existing.mcp?.servers, ...config.mcp.servers } } }
-    : { ...existing, mcpServers: { ...existing.mcpServers, ...config.mcpServers } };
+    ? { ...existing, mcp: { ...existing.mcp, servers: mergeEntries(existing.mcp?.servers, config.mcp.servers) } }
+    : { ...existing, mcpServers: mergeEntries(existing.mcpServers, config.mcpServers) };
   const backup = await backupOnce(target.file);
   await writeAtomic(target.file, `${JSON.stringify(merged, null, 2)}\n`, 0o600);
   return { written: true, file: target.file, backup, config };

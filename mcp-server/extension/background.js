@@ -6,6 +6,8 @@ const CURSOR_TURN_ID = "active-turn";
 const COMPACT_EVENTS = new Set([
   "Target.attachedToTarget",
   "Target.detachedFromTarget",
+  "Accessibility.loadComplete",
+  "Accessibility.nodesUpdated",
   "Page.frameStartedLoading",
   "Page.frameStoppedLoading",
   "Page.frameNavigated",
@@ -22,6 +24,33 @@ const COMPACT_EVENTS = new Set([
   "Network.loadingFinished",
   "Network.loadingFailed",
 ]);
+const FORWARDED_CDP_EVENTS = new Set(COMPACT_EVENTS);
+const AX_NOTIFY_THROTTLE_MS = 20;
+const utf8Encoder = typeof TextEncoder === "function" ? new TextEncoder() : null;
+
+const NON_ASCII_RE = /[^\x00-\x7f]/;
+
+/** @param {string} value @returns {number} */
+function utf8ByteLength(value) {
+  if (!NON_ASCII_RE.test(value)) return value.length;
+  if (utf8Encoder) return utf8Encoder.encode(value).length;
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4;
+      i += 1;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/** @param {unknown} raw @param {number} [maxLen] @returns {unknown} */
+function truncateLongUrl(raw, maxLen = 4096) {
+  return typeof raw === "string" && raw.length > maxLen ? `${raw.slice(0, maxLen)}…` : raw;
+}
 /** @type {(() => void) | null} */
 let disconnectActive = null;
 let manualDisconnect = false;
@@ -190,6 +219,8 @@ function connect() {
   const agentGroups = new Set();
   /** @type {Map<string, number>} */
   const sessionGroups = new Map();
+  /** @type {Map<number, number>} */
+  const userOriginalGroups = new Map();
   /** @type {Map<number, {url:string|null,groupId:number|null,createdAt:number}>} */
   const deliveredAgentTabs = new Map();
   /** @type {Map<number, Map<string,{parentId:string|null,targetId:string}>>} */
@@ -208,6 +239,10 @@ function connect() {
   const preparingContentScripts = new Map();
   /** @type {Set<number>} */
   const contentScriptReadyTabs = new Set();
+  /** @type {Set<number>} */
+  const syncingVisualTabs = new Set();
+  /** @type {Map<number, number>} */
+  const lastAxNotifyAt = new Map();
   /** @type {Map<number, () => void>} */
   const cursorArrivalWaiters = new Map();
   /** @type {number|null} */
@@ -217,24 +252,46 @@ function connect() {
   let allowTabFocus = false;
   let moveSeq = 0;
   let disconnected = false;
-  /** @type {Map<number, {current:{tabId:number,wasUserTab:boolean}|null, previous:{tabId:number,wasUserTab:boolean}|null}>} */
+  /** @type {Map<number, {current:{tabId:number,wasUserTab:boolean}|null, previous:{tabId:number,wasUserTab:boolean}|null, recent:Array<{tabId:number,wasUserTab:boolean}>}>} */
   const windowActiveHistory = new Map();
   /** @type {Set<number>} */
+  const newlyCreatedPopups = new Set();
+  /** @type {Set<number>} */
   const restoringFocus = new Set();
+  /** @type {number|null} */
+  let lastUserWindowId = null;
 
   if (typeof chrome.tabs?.query === "function") {
     void Promise.resolve(chrome.tabs.query({active: true})).then((tabs) => {
       if (disconnected || !Array.isArray(tabs)) return;
       for (const tab of tabs) {
         if (!Number.isSafeInteger(tab?.id) || !Number.isSafeInteger(tab?.windowId)) continue;
+        if (!owned.has(tab.id) && lastUserWindowId === null) lastUserWindowId = tab.windowId;
         if (!windowActiveHistory.has(tab.windowId)) {
+          const entry = {tabId: tab.id, wasUserTab: !owned.has(tab.id)};
           windowActiveHistory.set(tab.windowId, {
-            current: {tabId: tab.id, wasUserTab: !owned.has(tab.id)},
+            current: entry,
             previous: null,
+            recent: [entry],
           });
         }
       }
     }).catch(() => {});
+  }
+
+  /** @param {number} windowId */
+  function onWindowFocusChanged(windowId) {
+    if (disconnected || !Number.isSafeInteger(windowId) || windowId < 0) return;
+    const hist = windowActiveHistory.get(windowId);
+    if (!hist?.current || hist.current.wasUserTab || !owned.has(hist.current.tabId)) {
+      lastUserWindowId = windowId;
+    }
+  }
+
+  /** @param {number} windowId */
+  function onWindowRemoved(windowId) {
+    windowActiveHistory.delete(windowId);
+    if (lastUserWindowId === windowId) lastUserWindowId = null;
   }
 
   /**
@@ -436,7 +493,11 @@ function connect() {
     };
     cursorStates.set(tabId, state);
     if (!canMessageTabs()) return;
-    const effectiveWait = cursorMode === "smooth" && waitForArrival && visible && animate && dist >= 4;
+    let effectiveWait = cursorMode === "smooth" && waitForArrival && visible && animate && dist >= 4;
+    if (effectiveWait && typeof chrome.tabs?.get === "function") {
+      const tabInfo = await chrome.tabs.get(tabId).catch(() => null);
+      if (tabInfo && tabInfo.active === false) effectiveWait = false;
+    }
     if (contentScriptReadyTabs.has(tabId) && !effectiveWait) {
       try {
         const res = chrome.tabs.sendMessage(tabId, {type: "AGENT_CURSOR_STATE", state});
@@ -476,29 +537,34 @@ function connect() {
 
   /** @param {number} tabId @returns {Promise<void>} */
   async function syncTabVisuals(tabId) {
-    if (!canMessageTabs()) return;
-    if (activeVisualTabId !== null && activeVisualTabId !== tabId) {
-      const prevId = activeVisualTabId;
-      activeVisualTabId = tabId;
-      await hideTabCursor(prevId).catch(() => {});
-      if (badgeStates.get(prevId) === "active") {
-        await updateTabFaviconBadge(prevId, null).catch(() => {});
-      }
-    } else {
-      activeVisualTabId = tabId;
-    }
-    const badge = badgeStates.get(tabId) ?? (attached.has(tabId) ? "active" : null);
-    if (badge) await updateTabFaviconBadge(tabId, badge);
-    if (attached.has(tabId) && cursorMode !== "off") {
-      const state = cursorStates.get(tabId);
-      if (state?.isVisible) {
-        if (await prepareContentScript(tabId)) {
-          const delivered = await withTimeout(chrome.tabs.sendMessage(tabId, {type: "AGENT_CURSOR_STATE", state}), 400);
-          if (!delivered) contentScriptReadyTabs.delete(tabId);
+    if (!canMessageTabs() || syncingVisualTabs.has(tabId)) return;
+    syncingVisualTabs.add(tabId);
+    try {
+      if (activeVisualTabId !== null && activeVisualTabId !== tabId) {
+        const prevId = activeVisualTabId;
+        activeVisualTabId = tabId;
+        await hideTabCursor(prevId).catch(() => {});
+        if (badgeStates.get(prevId) === "active") {
+          await updateTabFaviconBadge(prevId, null).catch(() => {});
         }
       } else {
-        await showTabCursor(tabId);
+        activeVisualTabId = tabId;
       }
+      const badge = badgeStates.get(tabId) ?? (attached.has(tabId) ? "active" : null);
+      if (badge) await updateTabFaviconBadge(tabId, badge);
+      if (attached.has(tabId) && cursorMode !== "off") {
+        const state = cursorStates.get(tabId);
+        if (state?.isVisible) {
+          if (await prepareContentScript(tabId)) {
+            const delivered = await withTimeout(chrome.tabs.sendMessage(tabId, {type: "AGENT_CURSOR_STATE", state}), 400);
+            if (!delivered) contentScriptReadyTabs.delete(tabId);
+          }
+        } else {
+          await showTabCursor(tabId);
+        }
+      }
+    } finally {
+      syncingVisualTabs.delete(tabId);
     }
   }
 
@@ -568,14 +634,22 @@ function connect() {
   function onTabActivated(activeInfo) {
     const tabId = activeInfo?.tabId;
     if (Number.isSafeInteger(tabId) && Number.isSafeInteger(activeInfo?.windowId)) {
-      const hist = windowActiveHistory.get(activeInfo.windowId) ?? {current: null, previous: null};
+      const wasUser = !owned.has(tabId);
+      if (wasUser) lastUserWindowId = activeInfo.windowId;
+      const hist = windowActiveHistory.get(activeInfo.windowId) ?? {current: null, previous: null, recent: []};
+      const recent = Array.isArray(hist.recent) ? hist.recent.filter((e) => e.tabId !== tabId) : [];
+      const entry = {tabId, wasUserTab: wasUser};
+      recent.push(entry);
+      if (recent.length > 10) recent.shift();
       if (hist.current?.tabId !== tabId) {
         windowActiveHistory.set(activeInfo.windowId, {
-          current: {tabId, wasUserTab: !owned.has(tabId)},
+          current: entry,
           previous: hist.current,
+          recent,
         });
       } else {
-        hist.current.wasUserTab = !owned.has(tabId);
+        hist.current.wasUserTab = wasUser;
+        hist.recent = recent;
       }
     }
     if (!Number.isSafeInteger(tabId) || attached.has(tabId)) return;
@@ -590,6 +664,7 @@ function connect() {
     owned.delete(id);
     userOwned.delete(id);
     attached.delete(id);
+    userOriginalGroups.delete(id);
     deliveredAgentTabs.delete(id);
     frames.delete(id);
     downloadWatchers.delete(id);
@@ -598,10 +673,15 @@ function connect() {
     faviconCache.delete(id);
     preparingContentScripts.delete(id);
     contentScriptReadyTabs.delete(id);
+    syncingVisualTabs.delete(id);
+    lastAxNotifyAt.delete(id);
+    newlyCreatedPopups.delete(id);
     restoringFocus.delete(id);
+    if (activeVisualTabId === id) activeVisualTabId = null;
     for (const hist of windowActiveHistory.values()) {
       if (hist.current?.tabId === id) hist.current = null;
       if (hist.previous?.tabId === id) hist.previous = null;
+      if (Array.isArray(hist.recent)) hist.recent = hist.recent.filter((e) => e.tabId !== id);
     }
   };
 
@@ -620,13 +700,34 @@ function connect() {
     const candidateUrl = tab.url || tab.pendingUrl || "";
     if (!isControllableTabUrl(candidateUrl)) return;
     owned.add(tab.id);
-    if (tab.active === true && Number.isSafeInteger(tab.windowId) &&
-        typeof chrome.tabs?.update === "function" && !restoringFocus.has(tab.id)) {
+    newlyCreatedPopups.add(tab.id);
+    if (tab.active === true && !allowTabFocus && Number.isSafeInteger(tab.windowId) &&
+        !restoringFocus.has(tab.id)) {
       const hist = windowActiveHistory.get(tab.windowId);
-      const candidate = hist?.current?.tabId === tab.id ? hist?.previous : hist?.current;
-      if (candidate && candidate.tabId !== tab.id && candidate.wasUserTab && !owned.has(candidate.tabId)) {
+      const recent = Array.isArray(hist?.recent) ? hist.recent : [];
+      let restoreEntry = null;
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const item = recent[i];
+        if (!item || item.tabId === tab.id || newlyCreatedPopups.has(item.tabId)) continue;
+        restoreEntry = item;
+        break;
+      }
+      if (!restoreEntry) {
+        const candidate = hist?.current?.tabId === tab.id ? hist?.previous : hist?.current;
+        if (candidate && candidate.tabId !== tab.id && !newlyCreatedPopups.has(candidate.tabId)) {
+          restoreEntry = candidate;
+        }
+      }
+      if (restoreEntry && restoreEntry.wasUserTab && !owned.has(restoreEntry.tabId) &&
+          typeof chrome.tabs?.update === "function") {
         restoringFocus.add(tab.id);
-        void Promise.resolve(chrome.tabs.update(candidate.tabId, {active: true}))
+        void Promise.resolve(chrome.tabs.update(restoreEntry.tabId, {active: true}))
+          .catch(() => {})
+          .finally(() => restoringFocus.delete(tab.id));
+      } else if (!restoreEntry && Number.isSafeInteger(lastUserWindowId) &&
+          lastUserWindowId !== tab.windowId && typeof chrome.windows?.update === "function") {
+        restoringFocus.add(tab.id);
+        void Promise.resolve(chrome.windows.update(lastUserWindowId, {focused: true}))
           .catch(() => {})
           .finally(() => restoringFocus.delete(tab.id));
       }
@@ -643,6 +744,8 @@ function connect() {
   chrome.tabs.onUpdated?.addListener(onTabUpdated);
   chrome.tabs.onActivated?.addListener(onTabActivated);
   chrome.tabGroups?.onRemoved?.addListener(onTabGroupRemoved);
+  chrome.windows?.onFocusChanged?.addListener(onWindowFocusChanged);
+  chrome.windows?.onRemoved?.addListener(onWindowRemoved);
   chrome.runtime.onMessage?.addListener(onRuntimeMessage);
 
   /** @param {number} gid @param {number|null} targetWindowId @returns {Promise<chrome.tabGroups.TabGroup|null>} */
@@ -662,11 +765,28 @@ function connect() {
     if (disconnected) throw new Error("Chrome bridge is disconnected");
     if (method === "createBlankTab") {
       let createOpts = {url: "about:blank", active: false};
+      let hasWindow = false;
       if (typeof chrome.windows?.getLastFocused === "function") {
         const win = await chrome.windows.getLastFocused({windowTypes: ["normal"]}).catch(() => null);
-        if (Number.isSafeInteger(win?.id)) createOpts = {...createOpts, windowId: win.id};
+        if (Number.isSafeInteger(win?.id)) {
+          createOpts = {...createOpts, windowId: win.id};
+          hasWindow = true;
+        }
       }
-      const tab = serializeTab(await chrome.tabs.create(createOpts));
+      let createdRaw = null;
+      if (hasWindow || typeof chrome.windows?.create !== "function") {
+        createdRaw = await chrome.tabs.create(createOpts).catch(async (err) => {
+          if (/No current window/i.test(err?.message || "") && typeof chrome.windows?.create === "function") {
+            const win = await chrome.windows.create({url: "about:blank", focused: false, type: "normal"});
+            return win?.tabs?.[0] ?? null;
+          }
+          throw err;
+        });
+      } else {
+        const win = await chrome.windows.create({url: "about:blank", focused: false, type: "normal"});
+        createdRaw = win?.tabs?.[0] ?? null;
+      }
+      const tab = serializeTab(createdRaw);
       if (disconnected) {
         await chrome.tabs.remove(tab.id);
         throw new Error("Chrome bridge disconnected during tab creation");
@@ -716,6 +836,9 @@ function connect() {
       if (!owned.has(tab.id)) {
         owned.add(tab.id);
         userOwned.add(tab.id);
+        if (Number.isSafeInteger(tab.groupId) && tab.groupId >= 0 && !agentGroups.has(tab.groupId)) {
+          userOriginalGroups.set(tab.id, tab.groupId);
+        }
       }
       return {
         ...serializeTab(tab),
@@ -781,9 +904,18 @@ function connect() {
       const sessionId = typeof details?.sessionId === "string" ? details.sessionId : null;
 
       let targetWindowId = null;
+      let windowTabIds = tabIds;
       if (typeof chrome.tabs?.get === "function") {
-        const firstTab = await chrome.tabs.get(tabIds[0]).catch(() => null);
-        if (Number.isSafeInteger(firstTab?.windowId)) targetWindowId = firstTab.windowId;
+        const tabObjects = await Promise.all(tabIds.map((id) => chrome.tabs.get(id).catch(() => null)));
+        const firstTab = tabObjects.find((t) => Number.isSafeInteger(t?.windowId)) ?? null;
+        if (firstTab && Number.isSafeInteger(firstTab.windowId)) {
+          targetWindowId = firstTab.windowId;
+          const sameWindow = tabIds.filter((_, idx) => {
+            const wid = tabObjects[idx]?.windowId;
+            return wid === undefined || wid === targetWindowId;
+          });
+          if (sameWindow.length > 0) windowTabIds = sameWindow;
+        }
       }
 
       let existingGroup = null;
@@ -811,12 +943,12 @@ function connect() {
       let groupId;
       if (targetGroupId !== null) {
         try {
-          groupId = await chrome.tabs.group({groupId: targetGroupId, tabIds});
+          groupId = await chrome.tabs.group({groupId: targetGroupId, tabIds: windowTabIds});
         } catch {
-          groupId = await chrome.tabs.group({tabIds});
+          groupId = await chrome.tabs.group({tabIds: windowTabIds});
         }
       } else {
-        groupId = await chrome.tabs.group({tabIds});
+        groupId = await chrome.tabs.group({tabIds: windowTabIds});
       }
 
       if (Number.isSafeInteger(groupId)) {
@@ -925,28 +1057,142 @@ function connect() {
     }
     if (!Number.isSafeInteger(tabId) || !owned.has(tabId)) {
       if (method === "readTab") return null;
-      if (method === "closeTab" || method === "releaseTab" || method === "markTab" || method === "moveCursor") return null;
+      if (method === "closeTab" || method === "releaseTab" || method === "markTab" ||
+          method === "moveCursor" || method === "detach" || method === "unwatchDownloads") return null;
       throw new Error("Unknown Chrome bridge request");
     }
+
+    /** @param {number} targetTabId @param {{method:string,params?:object,childSession?:string}} cmdDetails @returns {Promise<unknown>} */
+    async function executeSingleCdp(targetTabId, cmdDetails) {
+      if (!attached.has(targetTabId)) throw new Error("Debugger unattached");
+      const sessionId = cmdDetails.childSession;
+      if (sessionId !== undefined && !frames.get(targetTabId)?.has(sessionId)) {
+        throw new Error("Child debugger session is unavailable to this tab");
+      }
+      const target = sessionId === undefined ? {tabId: targetTabId} : {tabId: targetTabId, sessionId};
+      const cdpMethod = cmdDetails.method;
+      const cdpParams = cmdDetails.params ?? {};
+
+      if (canMessageTabs() && cursorMode !== "off") {
+        if (cdpMethod === "Input.dispatchMouseEvent" && Number.isFinite(cdpParams?.x) && Number.isFinite(cdpParams?.y)) {
+          const cx = Number(cdpParams.x);
+          const cy = Number(cdpParams.y);
+          if (cdpParams.type === "mouseMoved") {
+            const wait = cursorMode === "smooth" && !cdpParams.buttons;
+            if (wait) {
+              await updateCursorPosition(targetTabId, cx, cy, {
+                visible: true,
+                animate: true,
+                waitForArrival: true,
+              });
+            } else {
+              void updateCursorPosition(targetTabId, cx, cy, {
+                visible: true,
+                animate: true,
+                waitForArrival: false,
+              });
+            }
+          } else if (cdpParams.type === "mousePressed" || cdpParams.type === "mouseWheel") {
+            const prev = cursorStates.get(targetTabId)?.cursor;
+            const unchanged = cdpParams.type === "mousePressed" && cursorMode === "fast" &&
+              prev?.visible === true && Math.hypot(prev.x - cx, prev.y - cy) < 1;
+            if (!unchanged) {
+              void updateCursorPosition(targetTabId, cx, cy, {
+                visible: true,
+                animate: true,
+                waitForArrival: false,
+              });
+            }
+          }
+        } else if (cdpMethod === "DOM.focus" && cursorMode === "smooth" &&
+            (cdpParams?.objectId || Number.isSafeInteger(cdpParams?.backendNodeId))) {
+          const boxReq = cdpParams.objectId
+            ? {objectId: cdpParams.objectId}
+            : {backendNodeId: cdpParams.backendNodeId};
+          const box = await chrome.debugger.sendCommand(target, "DOM.getBoxModel", boxReq).catch(() => null);
+          const quad = box?.model?.border;
+          if (Array.isArray(quad) && quad.length === 8) {
+            const cx = (quad[0] + quad[2]) / 2;
+            const cy = (quad[1] + quad[5]) / 2;
+            if (Number.isFinite(cx) && Number.isFinite(cy)) {
+              await updateCursorPosition(targetTabId, cx, cy, {visible: true, animate: true, waitForArrival: true});
+            }
+          }
+        }
+      }
+
+      const result = await chrome.debugger.sendCommand(target, cdpMethod, cdpParams);
+
+      if (canMessageTabs() && cursorMode !== "off" &&
+          (cdpMethod === "Runtime.evaluate" || cdpMethod === "Runtime.callFunctionOn")) {
+        const val = result?.result?.value;
+        if (val && typeof val === "object" && Number.isFinite(val.x) && Number.isFinite(val.y) &&
+            (val.__cursorMove === true || val.hovered === true)) {
+          const wait = cursorMode === "smooth";
+          if (wait) {
+            await updateCursorPosition(targetTabId, Number(val.x), Number(val.y), {
+              visible: true,
+              animate: true,
+              waitForArrival: true,
+            });
+          } else {
+            void updateCursorPosition(targetTabId, Number(val.x), Number(val.y), {
+              visible: true,
+              animate: true,
+              waitForArrival: false,
+            });
+          }
+        }
+      }
+      return result;
+    }
+
+    /** @param {unknown} rawParams @param {string|null} lastObjectId @returns {object} */
+    function resolveBatchParams(rawParams, lastObjectId) {
+      if (!rawParams || typeof rawParams !== "object" || Array.isArray(rawParams)) return {};
+      let cloned = null;
+      for (const [k, v] of Object.entries(rawParams)) {
+        if (v === "$prev.object.objectId" || v === "$prev.result.objectId") {
+          if (!lastObjectId) throw new Error("CDP batch step missing previous objectId");
+          if (!cloned) cloned = {...rawParams};
+          cloned[k] = lastObjectId;
+        }
+      }
+      return cloned ?? rawParams;
+    }
+
     switch (method) {
       case "readTab": return serializeTab(await chrome.tabs.get(tabId));
       case "closeTab":
         await chrome.tabs.remove(tabId);
         forget(tabId);
         return null;
-      case "releaseTab":
+      case "releaseTab": {
         if (attached.has(tabId)) {
           await chrome.debugger.detach({tabId}).catch(() => {});
           attached.delete(tabId);
           frames.delete(tabId);
         }
-        await hideTabCursor(tabId);
+        void hideTabCursor(tabId).catch(() => {});
         if (badgeStates.get(tabId) === "active") {
-          await updateTabFaviconBadge(tabId, null);
+          void updateTabFaviconBadge(tabId, null).catch(() => {});
         }
+        const origGroupId = userOriginalGroups.get(tabId);
+        userOriginalGroups.delete(tabId);
+        if (Number.isSafeInteger(origGroupId) && origGroupId >= 0 && typeof chrome.tabs?.group === "function") {
+          const aliveOrig = await getAliveGroup(origGroupId, null);
+          if (aliveOrig) {
+            await chrome.tabs.group({groupId: origGroupId, tabIds: [tabId]}).catch(() => {});
+          }
+        }
+        downloadWatchers.delete(tabId);
+        cursorStates.delete(tabId);
+        faviconCache.delete(tabId);
+        newlyCreatedPopups.delete(tabId);
         owned.delete(tabId);
         userOwned.delete(tabId);
         return null;
+      }
       case "markTab": {
         const status = details?.status === "deliverable" ? "deliverable" : (details?.status === "handoff" ? "handoff" : null);
         const tab = typeof chrome.tabs?.get === "function" ? await chrome.tabs.get(tabId).catch(() => null) : null;
@@ -959,7 +1205,7 @@ function connect() {
           }
         }
         if (status) {
-          await updateTabFaviconBadge(tabId, status);
+          void updateTabFaviconBadge(tabId, status).catch(() => {});
           if (status === "deliverable" && !userOwned.has(tabId)) {
             const normUrl = normalizeComparableUrl(tab?.url || tab?.pendingUrl || "");
             if (normUrl) {
@@ -998,8 +1244,12 @@ function connect() {
           attached.add(tabId);
           frames.set(tabId, new Map());
         }
+        await Promise.all([
+          chrome.debugger.sendCommand({tabId}, "Emulation.setFocusEmulationEnabled", {enabled: true}).catch(() => {}),
+          chrome.debugger.sendCommand({tabId}, "Page.enable", {}).catch(() => {}),
+        ]);
         badgeStates.set(tabId, "active");
-        await syncTabVisuals(tabId);
+        void syncTabVisuals(tabId).catch(() => {});
         return null;
       case "detach":
         if (attached.has(tabId)) {
@@ -1007,9 +1257,9 @@ function connect() {
           attached.delete(tabId);
           frames.delete(tabId);
         }
-        await hideTabCursor(tabId);
+        void hideTabCursor(tabId).catch(() => {});
         if (badgeStates.get(tabId) === "active") {
-          await updateTabFaviconBadge(tabId, null);
+          void updateTabFaviconBadge(tabId, null).catch(() => {});
         }
         return null;
       case "navigate":
@@ -1022,86 +1272,45 @@ function connect() {
       case "unwatchDownloads":
         downloadWatchers.delete(tabId);
         return null;
-      case "execute": {
+      case "execute":
+        return await executeSingleCdp(tabId, details ?? {});
+      case "executeBatch": {
         if (!attached.has(tabId)) throw new Error("Debugger unattached");
-        const sessionId = details.childSession;
-        if (sessionId !== undefined && !frames.get(tabId)?.has(sessionId)) {
-          throw new Error("Child debugger session is unavailable to this tab");
+        const commands = Array.isArray(details?.commands) ? details.commands : null;
+        if (!commands || commands.length > 32) {
+          throw new Error("Chrome bridge executeBatch requires an array of at most 32 commands");
         }
-        const target = sessionId === undefined ? {tabId} : {tabId, sessionId};
-        const cdpMethod = details.method;
-        const cdpParams = details.params;
-
-        if (canMessageTabs() && cursorMode !== "off") {
-          if (cdpMethod === "Input.dispatchMouseEvent" && Number.isFinite(cdpParams?.x) && Number.isFinite(cdpParams?.y)) {
-            if (cdpParams.type === "mouseMoved") {
-              const wait = cursorMode === "smooth" && !cdpParams.buttons;
-              if (wait) {
-                await updateCursorPosition(tabId, Number(cdpParams.x), Number(cdpParams.y), {
-                  visible: true,
-                  animate: true,
-                  waitForArrival: true,
-                });
-              } else {
-                void updateCursorPosition(tabId, Number(cdpParams.x), Number(cdpParams.y), {
-                  visible: true,
-                  animate: true,
-                  waitForArrival: false,
-                });
-              }
-            } else if (cdpParams.type === "mousePressed" || cdpParams.type === "mouseWheel") {
-              void updateCursorPosition(tabId, Number(cdpParams.x), Number(cdpParams.y), {
-                visible: true,
-                animate: true,
-                waitForArrival: false,
-              });
-            }
-          } else if (cdpMethod === "DOM.focus" &&
-              (cdpParams?.objectId || Number.isSafeInteger(cdpParams?.backendNodeId))) {
-            const boxReq = cdpParams.objectId
-              ? {objectId: cdpParams.objectId}
-              : {backendNodeId: cdpParams.backendNodeId};
-            const box = await chrome.debugger.sendCommand(target, "DOM.getBoxModel", boxReq).catch(() => null);
-            const quad = box?.model?.border;
-            if (Array.isArray(quad) && quad.length === 8) {
-              const cx = (quad[0] + quad[2]) / 2;
-              const cy = (quad[1] + quad[5]) / 2;
-              if (Number.isFinite(cx) && Number.isFinite(cy)) {
-                const wait = cursorMode === "smooth";
-                if (wait) {
-                  await updateCursorPosition(tabId, cx, cy, {visible: true, animate: true, waitForArrival: true});
-                } else {
-                  void updateCursorPosition(tabId, cx, cy, {visible: true, animate: true, waitForArrival: false});
-                }
-              }
-            }
+        const results = [];
+        let lastObjectId = null;
+        for (const cmd of commands) {
+          const resolvedParams = resolveBatchParams(cmd?.params, lastObjectId);
+          if (cmd?.fireAndForget === true) {
+            void executeSingleCdp(tabId, {
+              method: cmd.method,
+              params: resolvedParams,
+              childSession: cmd.childSession,
+            }).catch(() => {});
+            results.push(null);
+            continue;
           }
-        }
-
-        const result = await chrome.debugger.sendCommand(target, cdpMethod, cdpParams);
-
-        if (canMessageTabs() && cursorMode !== "off" &&
-            (cdpMethod === "Runtime.evaluate" || cdpMethod === "Runtime.callFunctionOn")) {
-          const val = result?.result?.value;
-          if (val && typeof val === "object" && Number.isFinite(val.x) && Number.isFinite(val.y) &&
-              (val.__cursorMove === true || val.hovered === true)) {
-            const wait = cursorMode === "smooth";
-            if (wait) {
-              await updateCursorPosition(tabId, Number(val.x), Number(val.y), {
-                visible: true,
-                animate: true,
-                waitForArrival: true,
-              });
+          try {
+            const res = await executeSingleCdp(tabId, {
+              method: cmd?.method,
+              params: resolvedParams,
+              childSession: cmd?.childSession,
+            });
+            const nextId = res?.object?.objectId ?? res?.result?.objectId;
+            if (typeof nextId === "string" && nextId) lastObjectId = nextId;
+            results.push(res);
+          } catch (error) {
+            if (cmd?.ignoreError === true) {
+              results.push({error: error instanceof Error ? error.message : String(error)});
             } else {
-              void updateCursorPosition(tabId, Number(val.x), Number(val.y), {
-                visible: true,
-                animate: true,
-                waitForArrival: false,
-              });
+              throw error;
             }
           }
         }
-        return result;
+        return {results};
       }
       default: throw new Error("Unknown Chrome bridge request");
     }
@@ -1127,10 +1336,7 @@ function connect() {
     } else if (method === "Target.detachedFromTarget") {
       if (!tree.has(params?.sessionId)) return;
       dropFrame(tree, params.sessionId);
-    } else if (!/^(?:Page|Runtime|DOM)\./u.test(method) &&
-        !["Accessibility.loadComplete", "Accessibility.nodesUpdated",
-          "Network.requestWillBeSent", "Network.responseReceived",
-          "Network.loadingFinished", "Network.loadingFailed"].includes(method)) {
+    } else if (!FORWARDED_CDP_EVENTS.has(method)) {
       return;
     }
     if (sessionId === undefined && (method === "Page.frameStartedLoading" ||
@@ -1138,7 +1344,7 @@ function connect() {
       contentScriptReadyTabs.delete(tabId);
     }
     if (method === "Page.loadEventFired" && sessionId === undefined && attached.has(tabId)) {
-      void syncTabVisuals(tabId);
+      void syncTabVisuals(tabId).catch(() => {});
     }
     if (method === "Page.frameDetached" && params?.reason === "swap") {
       // The renderer lost its local frame. A debugger session for the same
@@ -1148,15 +1354,22 @@ function connect() {
       }
     }
     let outgoingParams = params;
-    if (method === "Network.requestWillBeSent") {
+    if (method === "Accessibility.loadComplete" || method === "Accessibility.nodesUpdated") {
+      const now = Date.now();
+      if (now - (lastAxNotifyAt.get(tabId) ?? 0) < AX_NOTIFY_THROTTLE_MS) return;
+      lastAxNotifyAt.set(tabId, now);
+      outgoingParams = {};
+    } else if (method === "Page.frameNavigated" && typeof params?.frame?.url === "string" && params.frame.url.length > 4096) {
+      outgoingParams = {...params, frame: {...params.frame, url: truncateLongUrl(params.frame.url)}};
+    } else if (method === "Network.requestWillBeSent") {
       outgoingParams = {
         requestId: params?.requestId,
         loaderId: params?.loaderId,
-        documentURL: params?.documentURL,
+        documentURL: truncateLongUrl(params?.documentURL),
         frameId: params?.frameId,
         type: params?.type,
         timestamp: params?.timestamp,
-        request: params?.request ? {url: params.request.url, method: params.request.method} : undefined,
+        request: params?.request ? {url: truncateLongUrl(params.request.url), method: params.request.method} : undefined,
       };
     } else if (method === "Network.responseReceived") {
       outgoingParams = {
@@ -1166,7 +1379,7 @@ function connect() {
         type: params?.type,
         timestamp: params?.timestamp,
         response: params?.response ? {
-          url: params.response.url,
+          url: truncateLongUrl(params.response.url),
           status: params.response.status,
           statusText: params.response.statusText,
           mimeType: params.response.mimeType,
@@ -1176,7 +1389,7 @@ function connect() {
       };
     }
     const event = {event: "onCDPEvent", tabId, params: {source: {tabId, sessionId}, method, params: outgoingParams}};
-    if (COMPACT_EVENTS.has(method) || JSON.stringify(event).length < 256 * 1024) {
+    if (COMPACT_EVENTS.has(method) || utf8ByteLength(JSON.stringify(event)) < 256 * 1024) {
       port.postMessage(event);
     }
   }
@@ -1269,6 +1482,8 @@ function connect() {
     chrome.tabs.onUpdated?.removeListener(onTabUpdated);
     chrome.tabs.onActivated?.removeListener(onTabActivated);
     chrome.tabGroups?.onRemoved?.removeListener(onTabGroupRemoved);
+    chrome.windows?.onFocusChanged?.removeListener(onWindowFocusChanged);
+    chrome.windows?.onRemoved?.removeListener(onWindowRemoved);
     chrome.runtime.onMessage?.removeListener(onRuntimeMessage);
     chrome.debugger.onEvent.removeListener(onDebuggerEvent);
     chrome.debugger.onDetach.removeListener(onDebuggerDetach);
@@ -1298,7 +1513,9 @@ function connect() {
     preparingContentScripts.clear();
     contentScriptReadyTabs.clear();
     windowActiveHistory.clear();
+    newlyCreatedPopups.clear();
     restoringFocus.clear();
+    userOriginalGroups.clear();
     agentGroups.clear();
     sessionGroups.clear();
     deliveredAgentTabs.clear();
@@ -1315,6 +1532,13 @@ function connect() {
         reconnectTimer = null;
         if (!disconnectActive && !manualDisconnect) connect();
       }, delayMs);
+      try {
+        chrome.alarms?.create?.("bu_reconnect", {delayInMinutes: Math.max(0.5, delayMs / 60_000)});
+      } catch {
+        // Best-effort SW wakeup alarm.
+      }
+    } else if (!manualDisconnect && reconnectAttempts >= 5) {
+      void chrome.action?.setBadgeText?.({text: "!"});
     }
   }
 
@@ -1331,15 +1555,33 @@ function connect() {
       return;
     }
     const serialized = JSON.stringify(val);
-    const size = 512 * 1024;
-    if (serialized.length <= size) port.postMessage(reply);
-    else if (serialized.length > size * 64) {
-      port.postMessage({id: reply.id, ok: false, error: "Chrome native response exceeds bridge limit"});
-    } else {
-      for (let offset = 0; offset < serialized.length; offset += size) {
-        port.postMessage({id: reply.id, index: offset / size, final: offset + size >= serialized.length,
-          chunk: serialized.slice(offset, offset + size)});
+    const charLimit = 512 * 1024;
+    const rawByteLimit = 768 * 1024;
+    const totalBytes = utf8ByteLength(serialized);
+    if (serialized.length <= charLimit && totalBytes <= rawByteLimit) {
+      try {
+        port.postMessage(reply);
+        return;
+      } catch {
+        // Fall back to chunked delivery if Chrome rejects the payload.
       }
+    }
+    if (totalBytes > 16 * 1024 * 1024) {
+      port.postMessage({id: reply.id, ok: false, error: "Chrome native response exceeds bridge limit"});
+      return;
+    }
+    // Use 256K char chunks when multi-byte UTF-8 or escaping could exceed 1 MiB, else 512K chars.
+    const chunkStep = totalBytes > serialized.length * 1.1 ? 200 * 1024 : charLimit;
+    let index = 0;
+    for (let offset = 0; offset < serialized.length; ) {
+      let end = Math.min(serialized.length, offset + chunkStep);
+      let piece = serialized.slice(offset, end);
+      while (end > offset + 1024 && utf8ByteLength(piece) > 700 * 1024) {
+        end = offset + Math.floor((end - offset) / 2);
+        piece = serialized.slice(offset, end);
+      }
+      port.postMessage({id: reply.id, index: index++, final: end >= serialized.length, chunk: piece});
+      offset = end;
     }
   });
   port.onDisconnect.addListener(onDisconnect);
@@ -1352,16 +1594,28 @@ function connect() {
   void cleanupStaleVisuals();
 }
 
+function persistManualDisconnect(val) {
+  try {
+    const res = chrome.storage?.local?.set?.({manualDisconnect: Boolean(val)});
+    if (res && typeof res.catch === "function") void res.catch(() => {});
+  } catch {
+    // Ignore when storage API is absent.
+  }
+}
+
 chrome.action.onClicked.addListener(() => {
   if (disconnectActive) {
     manualDisconnect = true;
+    persistManualDisconnect(true);
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    try { void chrome.alarms?.clear?.("bu_reconnect"); } catch { /* ignore */ }
     disconnectActive();
   } else {
     manualDisconnect = false;
+    persistManualDisconnect(false);
     reconnectAttempts = 0;
     connect();
   }
@@ -1379,10 +1633,38 @@ const autoConnect = () => {
 
 const resetAndAutoConnect = () => {
   manualDisconnect = false;
+  persistManualDisconnect(false);
   reconnectAttempts = 0;
   autoConnect();
 };
 
+chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm?.name === "bu_reconnect") autoConnect();
+});
 chrome.runtime.onInstalled?.addListener(resetAndAutoConnect);
 chrome.runtime.onStartup?.addListener(resetAndAutoConnect);
-if (chrome.runtime?.id) autoConnect();
+if (chrome.runtime?.id) {
+  if (typeof chrome.storage?.local?.get === "function") {
+    let storageHandled = false;
+    const applyStoredState = (data) => {
+      if (storageHandled) return;
+      storageHandled = true;
+      if (data?.manualDisconnect === true) {
+        manualDisconnect = true;
+        void chrome.action?.setBadgeText?.({text: "OFF"});
+      } else {
+        autoConnect();
+      }
+    };
+    try {
+      const maybePromise = chrome.storage.local.get(["manualDisconnect"], applyStoredState);
+      if (maybePromise && typeof maybePromise.then === "function") {
+        void maybePromise.then(applyStoredState).catch(() => applyStoredState(null));
+      }
+    } catch {
+      applyStoredState(null);
+    }
+  } else {
+    autoConnect();
+  }
+}

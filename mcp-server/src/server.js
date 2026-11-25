@@ -83,6 +83,7 @@ function shouldAttachErrorState(error, msg) {
   if (
     /^Browser evaluate (is read-only|could not parse|requires a JavaScript expression)/i.test(msg) ||
     /^(saveFile|readFile|saveScreenshot) (requires|payload exceeds)/i.test(msg) ||
+    /\b(ENOENT|EACCES|EISDIR)\b/u.test(msg) ||
     /^Maximum \d+ images per browser_run call exceeded/i.test(msg) ||
     /^No browser tab is active/i.test(msg)
   ) {
@@ -97,17 +98,20 @@ let browserPromise = null;
 /** @returns {Promise<BridgeBrowser>} */
 async function defaultGetBrowser() {
   if (browserPromise) {
-    const existing = await browserPromise.catch(() => null);
+    const pending = browserPromise;
+    const existing = await pending.catch(() => null);
     if (!existing || existing.isClosed?.() || existing.closed) {
-      browserPromise = null;
+      if (browserPromise === pending) browserPromise = null;
     } else {
       return existing;
     }
   }
-  browserPromise = BridgeBrowser.connect({ bridgeFile }).catch((error) => {
-    browserPromise = null;
-    throw error;
-  });
+  if (!browserPromise) {
+    browserPromise = BridgeBrowser.connect({ bridgeFile }).catch((error) => {
+      browserPromise = null;
+      throw error;
+    });
+  }
   return browserPromise;
 }
 
@@ -174,6 +178,7 @@ async function withOptionalState(browser, tabId, actionResult, returnState = "no
     screenshot: returnState === "both",
     diff: returnState === "diff",
     full: returnState === "full" || returnState === "both",
+    mode: "compact",
   });
   return stateResponse(state, actionResult);
 }
@@ -383,6 +388,7 @@ export function registerTools(server, deps = {}) {
             full: effectiveReturnState === "full" || effectiveReturnState === "both",
             maxLines: max_lines ?? 1_500,
             mode: mode ?? "compact",
+            allowUnindexedBaseline: true,
           }).catch(() => null);
           if (state?.screenshotBase64) {
             images.push({ data: state.screenshotBase64, mimeType: state.screenshotMimeType || "image/jpeg" });
@@ -424,7 +430,8 @@ export function registerTools(server, deps = {}) {
         return { content };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        const fallbackTab = run?.activeTabId ?? tab_id ?? browser?.activeTabId;
+        const meta = /** @type {any} */ (error)?.browserRunMeta;
+        const fallbackTab = run?.activeTabId ?? meta?.activeTabId ?? tab_id ?? browser?.activeTabId;
         const errState = (browser && fallbackTab != null && shouldAttachErrorState(error, msg))
           ? await browser.getState(fallbackTab, {
             screenshot: false,
@@ -434,7 +441,19 @@ export function registerTools(server, deps = {}) {
             allowUnindexedBaseline: true,
           }).catch(() => null)
           : null;
-        const parts = [msg];
+        const locStr = meta?.location ? `line ${meta.location.line}:${meta.location.column}` : null;
+        const headline = locStr ? `${msg} (at ${locStr})` : msg;
+        const parts = [headline];
+        const lastAction = meta?.last_action ?? meta?.lastAction;
+        const savedFiles = meta?.saved_files ?? meta?.savedFiles;
+        const partialLogs = meta?.partial_logs ?? meta?.logs;
+        if (meta && (partialLogs?.length || savedFiles?.length || lastAction)) {
+          parts.push(JSON.stringify({
+            ...(lastAction ? { last_action: lastAction } : {}),
+            ...(savedFiles?.length ? { saved_files: savedFiles } : {}),
+            ...(partialLogs?.length ? { partial_logs: partialLogs } : {}),
+          }, null, 2));
+        }
         if (errState?.notifications?.length) {
           parts.push(`<notifications>\n${errState.notifications.map((n) => `- ${n}`).join("\n")}\n</notifications>`);
         }
@@ -480,9 +499,19 @@ export function registerTools(server, deps = {}) {
         const fallbackTab = result.state?.tab_id ?? tab_id ?? browser.activeTabId;
         await browser.markTabs(resolveKeepEntries(keep, fallbackTab)).catch(() => {});
       }
+      const dataStepActions = new Set(["evaluate", "get_content", "read_tab", "new_tab", "get_state"]);
+      const stepResults = (result.completed_steps ?? [])
+        .filter((entry) => entry?.ok && dataStepActions.has(entry.action))
+        .map((entry) => {
+          if (entry.action === "get_state") {
+            return { step: entry.step, action: entry.action, tab_id: entry.result?.tab_id, elementCount: entry.result?.elementCount };
+          }
+          return { step: entry.step, action: entry.action, result: entry.result };
+        });
       const summary = {
         ok: result.ok,
         completed_steps: result.completed_steps.length,
+        ...(stepResults.length > 0 ? { step_results: stepResults } : {}),
         ...(result.ok ? {} : { failed_step: result.failed_step, error: result.error }),
         ...(endTurnResult ? { end_turn: endTurnResult } : {}),
       };
@@ -590,7 +619,7 @@ export function registerTools(server, deps = {}) {
       full_page: z.boolean().optional().describe("Full-page screenshot when screenshot=true"),
       format: z.enum(["jpeg", "png"]).optional().describe("Screenshot format (default jpeg)"),
       full: z.boolean().optional().describe("Return full AX tree instead of diff"),
-      mode: axModeEnum.optional().describe("AX mode: full (default), compact, or interactive"),
+      mode: axModeEnum.optional().describe("AX mode: compact (default), full, or interactive"),
       max_lines: z.number().int().min(1).max(10_000).optional().describe("Max accessibility lines (default 2000)"),
     },
     guarded(async ({ tab_id, screenshot, full_page, format, full, mode, max_lines }) => stateResponse(
@@ -600,7 +629,7 @@ export function registerTools(server, deps = {}) {
         format: format ?? "jpeg",
         diff: full !== true,
         full: full === true,
-        mode: mode ?? "full",
+        mode: mode ?? "compact",
         maxLines: max_lines ?? 2_000,
       }),
     )),
@@ -924,7 +953,12 @@ export function registerTools(server, deps = {}) {
         ? { ...(format ? { format } : {}), ...(max_chars !== undefined ? { maxChars: max_chars } : {}) }
         : undefined;
       const result = await (await getBrowser()).getContent(tab_id, opts);
-      return text(format === "tables" || format === "links" ? result : (result.content ?? result.text));
+      if (format === "tables" || format === "links") {
+        const clean = { ...result };
+        if (clean.content === clean.text) delete clean.content;
+        return text(clean);
+      }
+      return text(result.content ?? result.text);
     }),
   );
 
@@ -933,7 +967,7 @@ export function registerTools(server, deps = {}) {
     "Return a compact visible DOM tree (default) or clean YAML ARIA snapshot (`format=\"aria\"`) for fast selector discovery or line filtering.",
     {
       format: z.enum(["dom", "aria"]).optional().describe('Snapshot format: "dom" (compact visible DOM) or "aria" (YAML ARIA tree). Defaults to "dom"'),
-      mode: axModeEnum.optional().describe("ARIA compression mode when format='aria': full (default), compact, or interactive"),
+      mode: axModeEnum.optional().describe("ARIA compression mode when format='aria': compact (default), full, or interactive"),
       max_chars: z.number().int().min(1_000).max(100_000).optional().describe("Character limit for DOM format. Defaults to 24000"),
       max_lines: z.number().int().min(1).max(10_000).optional().describe("Line limit for ARIA format. Defaults to 2000"),
       tab_id: stringOrNumber.optional().describe("Optional tab_id"),
@@ -942,7 +976,7 @@ export function registerTools(server, deps = {}) {
       await (await getBrowser()).domSnapshot({
         tabId: tab_id,
         format: format ?? "dom",
-        mode: mode ?? "full",
+        mode: mode ?? "compact",
         maxChars: max_chars ?? 24_000,
         maxLines: max_lines ?? 2_000,
       }),
@@ -1061,12 +1095,13 @@ export function registerTools(server, deps = {}) {
     "browser_end_turn",
     "End agent turn: keep handoff/deliverable tabs open and close unmarked tabs.",
     {
-      keep: z.array(keepEntrySchema).optional().describe("Kept tabs"),
+      keep: keepParamSchema.optional().describe('Keep mode ("handoff"|"deliverable") or [{ tab_id, mode }]'),
       ungroup: z.boolean().optional().describe("Ungroup tabs on finish"),
     },
     guarded(async ({ keep, ungroup }) => {
       const browser = await getBrowser();
-      const res = await browser.endTurn({ keep: keep ?? [], ungroup: ungroup === true });
+      const entries = keep !== undefined ? resolveKeepEntries(keep, browser.activeTabId) : [];
+      const res = await browser.endTurn({ keep: entries, ungroup: ungroup === true });
       scriptSession.syncActiveTab(browser);
       return text(res);
     }),
@@ -1092,14 +1127,12 @@ export function registerTools(server, deps = {}) {
 export function createStandaloneServer(deps = {}) {
   const profile = deps.profile ?? resolveToolProfile();
   const server = new McpServer(
-    { name: "browser-use", version: "4.8.3" },
+    { name: "browser-use", version: "4.9.0" },
     {
       instructions: [
-        "Browser use through a local Chrome bridge. Can create new session tabs or inspect and claim existing open user tabs in Chrome (via `browser_list_tabs` + `browser_select_tab` or `tab_id`, or `browser.tabs.list()` / `browser.user.openTabs()` + `browser.tabs.read()` / `browser.user.claimTab()` in `browser_run`). Claimed user tabs join the session Chrome Tab Group and are released (kept open & grouped) when a turn ends.",
-        "Tab & Group Hygiene: Use 1 concise task name via `browser.nameSession()` for an entire workflow so tabs across turns consolidate into 1 Chrome Tab Group (avoid spawning separate groups per turn). Before opening a new tab (`tabs.new(url)`), check `browser.user.openTabs()` / `tabs.list()` and reuse an existing tab for the same URL. Keep all agent tabs in the background and never pass `focus: true` or steal focus from the user's active tab. Close ephemeral tabs with `keep: []` and pass `ungroup: true` when finishing if kept tabs no longer need a group label.",
-        "Speed & efficiency (Probe 1 -> Batch Loop All): When facing repetitive UI rows/modals/pages, inspect 1 sample item first, then pack the full loop (clicks, chunked reads, `saveFile()`, pagination) or known deterministic click sequence into ONE `browser_run` call (up to 300000ms) instead of repeating small calls. Includes persistent variables (`const`/`let`/`class`), bound tabs (`browser.tabs.new()` / `browser.tabs.get(id)` / parallel `browser.tabs.content(urls)` returning structured `.links`/`.tables`), `browser.nameSession()`, `browser.groups`, auto-waiting locators (including async CKEditor sync), `locator.screenshot()` / `saveScreenshot()`, `dev.enableNetwork({ captureBodies: true })` + `dev.responseBody(id)`, `markDeliverable`/`markHandoff`, and `browser.endTurn()`/`browser.end_turn()`.",
-        "Diff-first & inspect-first: Start with `ariaSnapshot({ mode: \"compact\" })` or `browser_get_state` / `ax.write()` before guessing selectors; narrow multi-matches with `.first()`/`.nth(i)` and use `reload()` rather than `goto(sameUrl)`. Request `screenshot: true` / `ax.write('screenshot')` / `saveScreenshot(..., { emit: true })` when visual inspection or Proof of Work is needed.",
-        "Pass end_turn/keep/ungroup to browser_run or browser_batch (or call `browser.endTurn()`/`markDeliverable()` inside `browser_run`), `browser_name_session` / `browser.nameSession()` to group tabs visually, and `browser_end_turn` at the end for tabs that must survive cleanup.",
+        "Real Chrome automation via local bridge. Reuse existing open user tabs via `browser.user.openTabs()` + passive `tabs.read()` / `user.claimTab()` (or `browser_list_tabs`). All agent tabs stay in the background; never pass `focus: true` or steal active tab focus.",
+        "Probe 1 -> Batch Loop All: Inspect 1 sample row/modal with `ariaSnapshot({ mode: \"compact\" })`, then pack full loops (`saveFile`, `pagination`, `dev.responseBody`, `saveScreenshot`) into ONE `browser_run` call (up to 300000ms) instead of small per-step tool turns.",
+        "Gotchas: `await tab.url()` is async (returns a Promise); calling `markDeliverable()`/`markHandoff()` triggers `end_turn` unless `end_turn: false` is passed; `browser.evaluate()` is read-only; pass `ungroup: true` to dissolve temporary session tab groups on completion.",
       ].join("\n"),
     },
   );
@@ -1118,11 +1151,16 @@ export async function main() {
   const server = createStandaloneServer();
   await server.connect(new StdioServerTransport());
 
-  const shutdown = async () => {
-    const browser = browserPromise ? await browserPromise.catch(() => null) : null;
-    browserPromise = null;
-    await browser?.close().catch(() => {});
-    process.exit(0);
+  let shutdownPromise = null;
+  const shutdown = () => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      const browser = browserPromise ? await browserPromise.catch(() => null) : null;
+      browserPromise = null;
+      await browser?.close().catch(() => {});
+      process.exit(0);
+    })();
+    return shutdownPromise;
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);

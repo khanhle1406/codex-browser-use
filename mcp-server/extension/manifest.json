@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Portable Browser Bridge",
-  "version": "0.6.5",
+  "version": "0.7.0",
   "description": "Connect the local Browser Use adapter to Chrome tabs with live virtual cursor and tab badges.",
   "icons": {
     "16": "icons/icon-16.png",
@@ -10,17 +10,9 @@
     "128": "icons/icon-128.png"
   },
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAndsDSeracZtACjaqft8oQdoYjz6RoOgdRBtxkFEjEXU360H9JMUP1V6+V0QwvvpktvBV0sIByD3BpzcnTRrAq+f/673hymrxQuWPpviCSm4ij7ZW7AOjoncX1g31jXbya7ot0bJIaZXS6NGqndnIlAODYOGAxwZkoLr/6nW4nL5wRXQL+OOy3N1YzCHjueH8P9Pt8TYbsez81CZ9BZPSUf12xM8eVO8ipMDfdNZzmVxBkUjHFRHq8Y4RqOhoA1zvvlpLCtGM0vrLWyeZ//TI8k7EW9K+TvBm1mqEb5SCxXeSsqsyQanG5iM3KjoJR93VduElvLE24SWTaTgRhdN8OwIDAQAB",
-  "permissions": ["nativeMessaging", "tabs", "debugger", "downloads", "tabGroups", "scripting", "favicon"],
+  "permissions": ["nativeMessaging", "tabs", "debugger", "downloads", "tabGroups", "scripting", "favicon", "storage", "alarms"],
   "host_permissions": ["<all_urls>"],
   "background": {"service_worker": "background.js"},
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content-script.js"],
-      "run_at": "document_start",
-      "all_frames": false
-    }
-  ],
   "action": {
     "default_title": "Connect or disconnect Portable Browser Bridge",
     "default_icon": {

@@ -1,5 +1,5 @@
 import { createServer } from "node:net";
-import { mkdtemp, rmdir } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { endianness, tmpdir } from "node:os";
 import path from "node:path";
 import { FrameReader, encodeFrame } from "./frame-reader.js";
@@ -147,7 +147,7 @@ export async function listenBackend(handlers) {
       });
     });
   } catch (error) {
-    await rmdir(directory);
+    await rm(directory, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
   /** @type {Promise<void> | undefined} */
@@ -158,7 +158,7 @@ export async function listenBackend(handlers) {
       closing ??= new Promise((resolve, reject) => {
         server.close((error) => error ? reject(error) : resolve());
         for (const socket of connections) socket.destroy();
-      }).then(() => rmdir(directory));
+      }).then(() => rm(directory, { recursive: true, force: true }));
       return closing;
     },
   };

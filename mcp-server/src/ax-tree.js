@@ -29,15 +29,15 @@ const COLLAPSIBLE_ITEM_ROLES = new Set([
 /**
  * Determine whether a node carries focused, editable, valued, selected, or checked state.
  * @param {string} value
- * @param {Map<string, unknown>} propMap
+ * @param {Record<string, unknown>} propMap
  * @returns {boolean}
  */
 function hasInteractiveState(value, propMap) {
   if (value) return true;
-  if (propMap.get("focused") === true) return true;
-  if (propMap.get("editable") === true) return true;
-  if (propMap.get("selected") === true) return true;
-  const checked = propMap.get("checked");
+  if (propMap.focused === true) return true;
+  if (propMap.editable === true) return true;
+  if (propMap.selected === true) return true;
+  const checked = propMap.checked;
   if (checked === true || (typeof checked === "string" && checked !== "false")) return true;
   return false;
 }
@@ -119,31 +119,38 @@ function truncateText(text, maxLength) {
 }
 
 /**
- * Extract named CDP AX property values into a lookup map.
+ * Extract named CDP AX property values into a plain lookup object.
  * @param {unknown} properties
- * @returns {Map<string, unknown>}
+ * @returns {Record<string, unknown>}
  */
+const PROPERTY_OBJ_CACHE = new WeakMap();
+
 function readPropertyMap(properties) {
-  const map = new Map();
-  if (!Array.isArray(properties)) return map;
-  for (const property of properties) {
+  if (!Array.isArray(properties) || properties.length === 0) return {};
+  const cached = PROPERTY_OBJ_CACHE.get(properties);
+  if (cached) return cached;
+  const obj = Object.create(null);
+  for (let i = 0; i < properties.length; i++) {
+    const property = properties[i];
     if (typeof property?.name === "string") {
-      map.set(property.name, property?.value?.value);
+      obj[property.name] = property?.value?.value;
     }
   }
-  return map;
+  PROPERTY_OBJ_CACHE.set(properties, obj);
+  return obj;
 }
 
 /**
  * Format compact state tokens for an AX node.
- * @param {Map<string, unknown>} propMap
+ * @param {Record<string, unknown>} propMap
  * @returns {{states:string, actions:string[]}}
  */
 function formatNodeStates(propMap) {
   const parts = [];
   const actions = [];
-  for (const [name, raw] of propMap) {
+  for (const name of Object.keys(propMap)) {
     if (!STATEFUL_PROPERTIES.has(name)) continue;
+    const raw = propMap[name];
     if (raw === true) {
       parts.push(name);
       if (name === "expanded") actions.push("Collapse");
@@ -154,7 +161,7 @@ function formatNodeStates(propMap) {
       parts.push(`${name}=${raw}`);
     }
   }
-  const level = propMap.get("level");
+  const level = propMap.level;
   if (typeof level === "number" && Number.isFinite(level)) {
     parts.push(`level=${level}`);
   }
@@ -392,21 +399,23 @@ export function buildAxState(nodes, {
           actions,
         });
       }
-      let line = `${"  ".repeat(depth)}${idx} ${role}`;
-      if (name) line += ` "${name}"`;
-      if (value) line += ` (value: "${value}")`;
+      const pad = "  ".repeat(depth);
+      let rest = role;
+      if (name) rest += ` "${name}"`;
+      if (value) rest += ` (value: "${value}")`;
       if (role === "link") {
-        const url = normalizeText(propMap.get("url"));
+        const url = normalizeText(propMap.url);
         if (url && !/^javascript:/iu.test(url)) {
-          line += ` (url: "${truncateText(url, 120)}")`;
+          rest += ` (url: "${truncateText(url, 120)}")`;
         }
       }
-      const placeholder = normalizeText(propMap.get("placeholder"));
+      const placeholder = normalizeText(propMap.placeholder);
       if (placeholder && placeholder !== name && placeholder !== value) {
-        line += ` (placeholder: "${truncateText(placeholder, 80)}")`;
+        rest += ` (placeholder: "${truncateText(placeholder, 80)}")`;
       }
-      if (states) line += ` ${states}`;
-      const body = bodyOfLine(line);
+      if (states) rest += ` ${states}`;
+      const line = `${pad}${idx} ${rest}`;
+      const body = `${pad}${rest}`;
       const scope = frameId ?? "main";
       const key = backendDOMNodeId !== null
         ? `${scope}:node:${backendDOMNodeId}:${role}`
@@ -523,7 +532,7 @@ export function mergeFrameAxStates(frames, {
  * @returns {{mode:"unchanged"|"diff"|"full", lines:string[], added:number, changed:number, removed:number}}
  */
 export function buildAxDiff(previous, current) {
-  if (!previous || (previous.documentKey && current.documentKey && previous.documentKey !== current.documentKey)) {
+  if (!previous || (previous.hasIndexedBaseline !== false && previous.mode && current.mode && previous.mode !== current.mode) || (previous.documentKey && current.documentKey && previous.documentKey !== current.documentKey)) {
     return { mode: "full", lines: current.lines, added: current.entries.length, changed: 0, removed: 0 };
   }
 
@@ -559,7 +568,7 @@ export function buildAxDiff(previous, current) {
   }
 
   const total = Math.max(1, current.entries.length);
-  if (added.length + changed.length > Math.ceil(total * 0.65)) {
+  if (added.length + changed.length > Math.ceil(total * 0.65) || (removed > 0 && added.length === 0 && changed.length === 0)) {
     return {
       mode: "full",
       lines: current.lines,
@@ -693,6 +702,7 @@ export function formatAriaSnapshot(nodes, {
   mode = "full",
   collapseRepeated,
   rootBackendDOMNodeId,
+  appendTruncatedMarker = true,
 } = {}) {
   const effectiveMode = mode === "compact" || mode === "interactive" ? mode : "full";
   const shouldCollapse = collapseRepeated ?? (effectiveMode === "compact");
@@ -730,18 +740,25 @@ export function formatAriaSnapshot(nodes, {
 
   const formatYamlBadges = (propMap) => {
     const badges = [];
-    const checked = propMap.get("checked");
+    const checked = propMap.checked;
     if (checked === true) badges.push("[checked]");
     else if (typeof checked === "string" && checked !== "false") badges.push(`[checked=${checked}]`);
-    if (propMap.get("selected") === true) badges.push("[selected]");
-    if (propMap.get("focused") === true) badges.push("[active]");
-    if (propMap.get("disabled") === true) badges.push("[disabled]");
-    if (propMap.get("expanded") === true) badges.push("[expanded]");
-    const pressed = propMap.get("pressed");
+    if (propMap.selected === true) badges.push("[selected]");
+    if (propMap.focused === true) badges.push("[active]");
+    if (propMap.disabled === true) badges.push("[disabled]");
+    if (propMap.readonly === true) badges.push("[readonly]");
+    if (propMap.expanded === true) badges.push("[expanded]");
+    else if (propMap.expanded === false) badges.push("[expanded=false]");
+    const pressed = propMap.pressed;
     if (pressed === true) badges.push("[pressed]");
     else if (typeof pressed === "string" && pressed !== "false") badges.push(`[pressed=${pressed}]`);
-    if (propMap.get("required") === true) badges.push("[required]");
-    const level = propMap.get("level");
+    if (propMap.required === true) badges.push("[required]");
+    if (propMap.invalid === true || (typeof propMap.invalid === "string" && propMap.invalid !== "false")) badges.push("[invalid]");
+    if (propMap.modal === true) badges.push("[modal]");
+    const haspopup = propMap.haspopup;
+    if (haspopup === true) badges.push("[haspopup]");
+    else if (typeof haspopup === "string" && haspopup !== "false") badges.push(`[haspopup=${haspopup}]`);
+    const level = propMap.level;
     if (typeof level === "number" && Number.isFinite(level)) badges.push(`[level=${level}]`);
     return badges.length ? ` ${badges.join(" ")}` : "";
   };
@@ -788,10 +805,14 @@ export function formatAriaSnapshot(nodes, {
         lines.push(line);
 
         if (role === "link") {
-          const url = normalizeText(propMap.get("url"));
+          const url = normalizeText(propMap.url);
           if (url && !/^javascript:/iu.test(url) && lines.length < maxLines) {
             lines.push(`${indent}  - /url: ${truncateText(url, 160)}`);
           }
+        }
+        const placeholder = truncateText(normalizeText(propMap.placeholder), 120);
+        if (placeholder && placeholder !== name && placeholder !== value && lines.length < maxLines) {
+          lines.push(`${indent}  - /placeholder: ${placeholder}`);
         }
       }
       nextAncestor = { role, name };
@@ -829,6 +850,9 @@ export function formatAriaSnapshot(nodes, {
     isTruncated: () => truncated,
     visitNode: visit,
   });
+  if (truncated && appendTruncatedMarker && lines.length > 0) {
+    lines.push(`${"  ".repeat(baseDepth)}...(truncated)`);
+  }
   return {
     text: lines.join("\n"),
     lineCount: lines.length,
@@ -867,6 +891,7 @@ export function mergeFrameAriaSnapshots(frames, {
       baseDepth,
       mode,
       collapseRepeated,
+      appendTruncatedMarker: false,
     });
     if (!snapshot.text) continue;
     const frameLines = snapshot.text.split("\n");
@@ -879,6 +904,9 @@ export function mergeFrameAriaSnapshots(frames, {
       truncated = true;
       break;
     }
+  }
+  if (truncated && lines.length > 0) {
+    lines.push("...(truncated)");
   }
 
   return {

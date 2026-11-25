@@ -1,7 +1,9 @@
 import vm from "node:vm";
+import { Buffer } from "node:buffer";
 import { mkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
 import path from "node:path";
 import { URL, URLSearchParams } from "node:url";
+import { TextDecoder, TextEncoder } from "node:util";
 import { parse } from "acorn";
 
 const RESERVED_PARAM_NAMES = new Set([
@@ -77,6 +79,11 @@ function collectDeclaredIdentifiers(pattern, out) {
   }
 }
 
+const TRANSFORM_CACHE_MAX = 128;
+/** @type {Map<string, {transformed:string, declaredNames:string[]}>} */
+const transformCache = new Map();
+const DECL_KEYWORD_RE = /\b(?:const|let|var|class|function)\b/;
+
 /**
  * Rewrite top-level `const`/`let`/`class` declarations to `var` so bindings persist
  * across `browser_run` calls and can be redeclared safely across turns.
@@ -85,6 +92,15 @@ function collectDeclaredIdentifiers(pattern, out) {
  */
 export function transformPersistentCode(code) {
   const source = String(code ?? "");
+  if (!DECL_KEYWORD_RE.test(source)) {
+    return { transformed: source, declaredNames: [] };
+  }
+  const cached = transformCache.get(source);
+  if (cached) {
+    transformCache.delete(source);
+    transformCache.set(source, cached);
+    return cached;
+  }
   const tree = parse(source, {
     ecmaVersion: "latest",
     sourceType: "script",
@@ -114,16 +130,29 @@ export function transformPersistentCode(code) {
     transformed = transformed.slice(0, edit.start) + edit.replacement + transformed.slice(edit.end);
   }
   const declaredNames = [...names].filter((n) => IDENTIFIER_RE.test(n) && !RESERVED_PARAM_NAMES.has(n));
-  return { transformed, declaredNames };
+  const out = { transformed, declaredNames };
+  if (transformCache.size >= TRANSFORM_CACHE_MAX) {
+    transformCache.delete(transformCache.keys().next().value);
+  }
+  transformCache.set(source, out);
+  return out;
 }
 
-/** @param {string} role @param {{name?:string|RegExp, exact?:boolean}} [opts] @returns {string} */
+/** @param {string} role @param {{name?:string|RegExp, exact?:boolean, level?:number, checked?:boolean, selected?:boolean, expanded?:boolean, pressed?:boolean, disabled?:boolean}} [opts] @returns {string} */
 function buildRoleStep(role, opts = {}) {
   let step = `role=${String(role)}`;
   if (opts?.name instanceof RegExp) {
     step += `[name=/${opts.name.source}/${opts.name.flags}]`;
   } else if (opts?.name !== undefined) {
     step += `[name=${JSON.stringify(String(opts.name))}][exact=${opts.exact ? "true" : "false"}]`;
+  }
+  if (Number.isInteger(opts?.level)) {
+    step += `[level=${opts.level}]`;
+  }
+  for (const attr of ["checked", "selected", "expanded", "pressed", "disabled"]) {
+    if (typeof opts?.[attr] === "boolean") {
+      step += `[${attr}=${opts[attr] ? "true" : "false"}]`;
+    }
   }
   return step;
 }
@@ -132,7 +161,16 @@ function buildRoleStep(role, opts = {}) {
 function buildTextStep(text, opts = {}) {
   if (text instanceof RegExp) return `text=/${text.source}/${text.flags}`;
   const str = String(text);
-  return opts?.exact ? `text=${JSON.stringify(str)}` : `text=${str}`;
+  return opts?.exact ? `text=${JSON.stringify(str)}` : `text=${JSON.stringify(str)}[exact=false]`;
+}
+
+/** @param {string} kind @param {string|RegExp} value @param {{exact?:boolean}} [opts] @returns {string} */
+function buildNamedMatchStep(kind, value, opts = {}) {
+  if (value instanceof RegExp) return `${kind}=/${value.source}/${value.flags}`;
+  const str = String(value);
+  return opts?.exact === true
+    ? `${kind}=${JSON.stringify(str)}[exact=true]`
+    : `${kind}=${JSON.stringify(str)}[exact=false]`;
 }
 
 /** @param {unknown} value @returns {boolean} */
@@ -147,14 +185,16 @@ function hasOnlyKeys(obj, allowedKeys) {
   return keys.length > 0 && keys.every((k) => allowedKeys.has(k));
 }
 
-const PAGE_EVAL_OPT_KEYS = new Set(["tabId", "tab_id", "timeoutMs", "timeout_ms"]);
-const LOCATOR_EVAL_OPT_KEYS = new Set(["tabId", "tab_id", "frame", "timeoutMs", "timeout_ms"]);
+const PAGE_EVAL_OPT_KEYS = new Set(["tabId", "tab_id", "timeout", "timeoutMs", "timeout_ms"]);
+const LOCATOR_EVAL_OPT_KEYS = new Set(["tabId", "tab_id", "frame", "timeout", "timeoutMs", "timeout_ms"]);
 
 /**
  * Persistent VM session for `browser_run`, retaining top-level bindings and active tab
  * state across turns while isolating host globals and enforcing read-only page evaluation.
  */
 export class BrowserScriptSession {
+  #runQueue = Promise.resolve();
+
   constructor() {
     this.reset();
   }
@@ -163,8 +203,53 @@ export class BrowserScriptSession {
     this.scope = Object.create(null);
     this.currentTabId = null;
     this.activeRun = null;
+    this.#runQueue = Promise.resolve();
+    const vmSetTimeout = (fn, ms, ...args) => {
+      const run = this.activeRun;
+      const timer = setTimeout((...cbArgs) => {
+        run?.activeTimers?.delete(timer);
+        if (typeof fn === "function") fn(...cbArgs);
+      }, ms, ...args);
+      run?.activeTimers?.add(timer);
+      return timer;
+    };
+    const vmClearTimeout = (timer) => {
+      this.activeRun?.activeTimers?.delete(timer);
+      clearTimeout(timer);
+    };
+    const vmSetInterval = (fn, ms, ...args) => {
+      const run = this.activeRun;
+      const timer = setInterval((...cbArgs) => {
+        if (run?.aborted) {
+          clearInterval(timer);
+          run.activeIntervals?.delete(timer);
+          return;
+        }
+        if (typeof fn === "function") fn(...cbArgs);
+      }, ms, ...args);
+      run?.activeIntervals?.add(timer);
+      return timer;
+    };
+    const vmClearInterval = (timer) => {
+      this.activeRun?.activeIntervals?.delete(timer);
+      clearInterval(timer);
+    };
     this.context = vm.createContext(
-      { URL, URLSearchParams, setTimeout, clearTimeout },
+      {
+        URL,
+        URLSearchParams,
+        Buffer,
+        TextEncoder,
+        TextDecoder,
+        atob: globalThis.atob,
+        btoa: globalThis.btoa,
+        crypto: globalThis.crypto,
+        structuredClone: globalThis.structuredClone,
+        setTimeout: vmSetTimeout,
+        clearTimeout: vmClearTimeout,
+        setInterval: vmSetInterval,
+        clearInterval: vmClearInterval,
+      },
       { codeGeneration: { strings: false, wasm: false } },
     );
   }
@@ -467,8 +552,8 @@ export class BrowserScriptSession {
     const tabFor = (opts) => this.#resolveTabArg(opts, boundTabId);
     const guardOpts = { trackActiveTab: boundTabId === null };
     const timeoutOpt = (opts) => (
-      opts?.timeoutMs !== undefined || opts?.timeout_ms !== undefined
-        ? this.#clampTimeout(opts?.timeoutMs ?? opts?.timeout_ms)
+      opts?.timeout !== undefined || opts?.timeoutMs !== undefined || opts?.timeout_ms !== undefined
+        ? this.#clampTimeout(opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms)
         : undefined
     );
 
@@ -482,8 +567,10 @@ export class BrowserScriptSession {
       },
       getByRole: (role, opts) => this.#createLocator([...chain, buildRoleStep(role, opts)], frame, boundTabId),
       getByText: (text, opts) => this.#createLocator([...chain, buildTextStep(text, opts)], frame, boundTabId),
-      getByLabel: (text) => this.#createLocator([...chain, `label=${JSON.stringify(String(text))}`], frame, boundTabId),
-      getByPlaceholder: (text) => this.#createLocator([...chain, `placeholder=${JSON.stringify(String(text))}`], frame, boundTabId),
+      getByLabel: (text, opts) => this.#createLocator([...chain, buildNamedMatchStep("label", text, opts)], frame, boundTabId),
+      getByPlaceholder: (text, opts) => this.#createLocator([...chain, buildNamedMatchStep("placeholder", text, opts)], frame, boundTabId),
+      getByAltText: (text, opts) => this.#createLocator([...chain, buildNamedMatchStep("alt", text, opts)], frame, boundTabId),
+      getByTitle: (text, opts) => this.#createLocator([...chain, buildNamedMatchStep("title", text, opts)], frame, boundTabId),
       getByTestId: (id) => this.#createLocator([...chain, `testid=${JSON.stringify(String(id))}`], frame, boundTabId),
       filter: ({ visible, hasText, hasNotText, has, hasNot } = {}) => {
         const steps = [];
@@ -511,7 +598,7 @@ export class BrowserScriptSession {
         modifiers: opts?.modifiers,
         force: opts?.force === true,
         timeoutMs: timeoutOpt(opts),
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `locator.click(${selector})`, guardOpts),
       dblclick: (opts = {}) => self.click({ ...opts, clickCount: 2 }),
       fill: (value, opts = {}) => this.#guard((b) => b.locatorFill(selector, String(value), {
@@ -519,21 +606,21 @@ export class BrowserScriptSession {
         frame: opts?.frame ?? frame ?? undefined,
         force: opts?.force === true,
         timeoutMs: timeoutOpt(opts),
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `locator.fill(${selector})`, guardOpts),
       clear: (opts = {}) => this.#guard((b) => b.locatorClear(selector, {
         tabId: tabFor(opts),
         frame: opts?.frame ?? frame ?? undefined,
         force: opts?.force === true,
         timeoutMs: timeoutOpt(opts),
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `locator.clear(${selector})`, guardOpts),
       press: (key, opts = {}) => this.#guard((b) => b.locatorPress(selector, String(key), {
         tabId: tabFor(opts),
         frame: opts?.frame ?? frame ?? undefined,
         force: opts?.force === true,
         timeoutMs: timeoutOpt(opts),
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `locator.press(${selector})`, guardOpts),
       type: (text, opts = {}) => this.#guard((b) => b.locatorType(selector, String(text), {
         tabId: tabFor(opts),
@@ -541,7 +628,7 @@ export class BrowserScriptSession {
         force: opts?.force === true,
         timeoutMs: timeoutOpt(opts),
         sequentially: false,
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `locator.type(${selector})`, guardOpts),
       pressSequentially: (text, opts = {}) => this.#guard((b) => b.locatorType(selector, String(text), {
         tabId: tabFor(opts),
@@ -550,21 +637,21 @@ export class BrowserScriptSession {
         timeoutMs: timeoutOpt(opts),
         sequentially: true,
         delayMs: opts?.delay ?? opts?.delayMs ?? 0,
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `locator.pressSequentially(${selector})`, guardOpts),
       check: (opts = {}) => this.#guard((b) => b.locatorCheck(selector, true, {
         tabId: tabFor(opts),
         frame: opts?.frame ?? frame ?? undefined,
         force: opts?.force === true,
         timeoutMs: timeoutOpt(opts),
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `locator.check(${selector})`, guardOpts),
       uncheck: (opts = {}) => this.#guard((b) => b.locatorCheck(selector, false, {
         tabId: tabFor(opts),
         frame: opts?.frame ?? frame ?? undefined,
         force: opts?.force === true,
         timeoutMs: timeoutOpt(opts),
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `locator.uncheck(${selector})`, guardOpts),
       setChecked: (checked, opts = {}) => (checked ? self.check(opts) : self.uncheck(opts)),
       selectOption: (spec, opts = {}) => {
@@ -631,7 +718,7 @@ export class BrowserScriptSession {
         selector,
         frame: opts?.frame ?? frame ?? undefined,
         state: opts?.state ?? "visible",
-        timeoutMs: this.#clampTimeout(opts?.timeoutMs ?? opts?.timeout_ms ?? 10_000),
+        timeoutMs: this.#clampTimeout(opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms ?? 10_000),
       }), `locator.waitFor(${selector})`, guardOpts),
       count: async (opts = {}) => (await this.#guard((b) => b.locatorCount(selector, {
         tabId: tabFor(opts),
@@ -685,6 +772,24 @@ export class BrowserScriptSession {
         tabId: tabFor(opts),
         frame: opts?.frame ?? frame ?? undefined,
       }), `locator.isChecked(${selector})`, guardOpts)).value,
+      isHidden: async (opts = {}) => !(await self.isVisible(opts)),
+      isDisabled: async (opts = {}) => !(await self.isEnabled(opts)),
+      focus: (opts = {}) => this.#guard((b) => b.locatorFocus(selector, {
+        tabId: tabFor(opts),
+        frame: opts?.frame ?? frame ?? undefined,
+        force: opts?.force === true,
+        timeoutMs: timeoutOpt(opts),
+      }), `locator.focus(${selector})`, guardOpts),
+      boundingBox: async (opts = {}) => (await this.#guard((b) => b.locatorBoundingBox(selector, {
+        tabId: tabFor(opts),
+        frame: opts?.frame ?? frame ?? undefined,
+        timeoutMs: timeoutOpt(opts),
+      }), `locator.boundingBox(${selector})`, guardOpts)) ?? null,
+      innerHTML: (opts = {}) => self.evaluate((el) => el.innerHTML, opts),
+      frameLocator: (sub) => this.#createFrameLocator(
+        frame ? `${frame} >> ${selector} >> ${String(sub)}` : `${selector} >> ${String(sub)}`,
+        boundTabId,
+      ),
       evaluate: async (...args) => {
         const [fnOrExpr, argOrOpts, maybeOpts] = args;
         const parsed = this.#parseLocatorEvalArgs(fnOrExpr, argOrOpts, maybeOpts, args.length);
@@ -729,8 +834,10 @@ export class BrowserScriptSession {
       },
       getByRole: (role, opts) => this.#createLocator([buildRoleStep(role, opts)], sel, boundTabId),
       getByText: (text, opts) => this.#createLocator([buildTextStep(text, opts)], sel, boundTabId),
-      getByLabel: (text) => this.#createLocator([`label=${JSON.stringify(String(text))}`], sel, boundTabId),
-      getByPlaceholder: (text) => this.#createLocator([`placeholder=${JSON.stringify(String(text))}`], sel, boundTabId),
+      getByLabel: (text, opts) => this.#createLocator([buildNamedMatchStep("label", text, opts)], sel, boundTabId),
+      getByPlaceholder: (text, opts) => this.#createLocator([buildNamedMatchStep("placeholder", text, opts)], sel, boundTabId),
+      getByAltText: (text, opts) => this.#createLocator([buildNamedMatchStep("alt", text, opts)], sel, boundTabId),
+      getByTitle: (text, opts) => this.#createLocator([buildNamedMatchStep("title", text, opts)], sel, boundTabId),
       getByTestId: (id) => this.#createLocator([`testid=${JSON.stringify(String(id))}`], sel, boundTabId),
     };
   }
@@ -775,18 +882,21 @@ export class BrowserScriptSession {
       close: () => tabApi.closeTab(boundId),
       goto: (url, opts = {}) => self.#guard((b) => b.goto(url, resolveTab(opts), {
         waitUntil: opts?.waitUntil ?? opts?.wait_until ?? "load",
-        timeoutMs: self.#clampTimeout(opts?.timeoutMs ?? opts?.timeout_ms ?? 15_000),
+        timeoutMs: self.#clampTimeout(opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms ?? 15_000),
       }), `goto(${url})`, guardOpts),
       back: (opts) => self.#guard((b) => b.history("back", resolveTab(opts)), "back", guardOpts),
+      goBack: (opts) => tabApi.back(opts),
       forward: (opts) => self.#guard((b) => b.history("forward", resolveTab(opts)), "forward", guardOpts),
+      goForward: (opts) => tabApi.forward(opts),
       reload: (opts) => self.#guard((b) => b.reload(resolveTab(opts)), "reload", guardOpts),
+      viewportSize: (opts = {}) => tabApi.evaluate("({ width: window.innerWidth, height: window.innerHeight })", opts),
       expectNavigation: async (action, opts = {}) => {
         const targetTab = resolveTab(opts);
         return self.#guard((b) => b.expectNavigation(action, {
           tabId: targetTab,
           url: opts?.url,
           waitUntil: opts?.waitUntil ?? opts?.wait_until ?? "load",
-          timeoutMs: self.#clampTimeout(opts?.timeoutMs ?? opts?.timeout_ms ?? 15_000),
+          timeoutMs: self.#clampTimeout(opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms ?? 15_000),
         }), "expectNavigation", guardOpts);
       },
       getState: (opts = {}) => self.#guard((b) => b.getState(resolveTab(opts), {
@@ -834,8 +944,8 @@ export class BrowserScriptSession {
         format: opts?.format ?? "jpeg",
         quality: opts?.quality ?? 75,
         scale: opts?.scale ?? "css",
-        timeoutMs: opts?.timeoutMs !== undefined || opts?.timeout_ms !== undefined
-          ? self.#clampTimeout(opts.timeoutMs ?? opts.timeout_ms)
+        timeoutMs: opts?.timeout !== undefined || opts?.timeoutMs !== undefined || opts?.timeout_ms !== undefined
+          ? self.#clampTimeout(opts.timeout ?? opts.timeoutMs ?? opts.timeout_ms)
           : undefined,
       }), `elementScreenshot(${selector})`, guardOpts),
       saveScreenshot: (filePath, opts = {}) => self.#saveScreenshot(filePath, opts, boundId),
@@ -965,8 +1075,10 @@ export class BrowserScriptSession {
       frameLocator: (sel) => self.#createFrameLocator(sel, boundId),
       getByRole: (role, opts) => self.#createLocator([buildRoleStep(role, opts)], null, boundId),
       getByText: (text, opts) => self.#createLocator([buildTextStep(text, opts)], null, boundId),
-      getByLabel: (text) => self.#createLocator([`label=${JSON.stringify(String(text))}`], null, boundId),
-      getByPlaceholder: (text) => self.#createLocator([`placeholder=${JSON.stringify(String(text))}`], null, boundId),
+      getByLabel: (text, opts) => self.#createLocator([buildNamedMatchStep("label", text, opts)], null, boundId),
+      getByPlaceholder: (text, opts) => self.#createLocator([buildNamedMatchStep("placeholder", text, opts)], null, boundId),
+      getByAltText: (text, opts) => self.#createLocator([buildNamedMatchStep("alt", text, opts)], null, boundId),
+      getByTitle: (text, opts) => self.#createLocator([buildNamedMatchStep("title", text, opts)], null, boundId),
       getByTestId: (id) => self.#createLocator([`testid=${JSON.stringify(String(id))}`], null, boundId),
       click: (target, opts = {}) => {
         const tabId = resolveTab(opts);
@@ -979,7 +1091,7 @@ export class BrowserScriptSession {
             clickCount: opts?.clickCount ?? opts?.click_count ?? target.clickCount ?? 1,
             button: opts?.button ?? opts?.mouse_button ?? "left",
             modifiers: opts?.modifiers,
-            settle: opts?.settle ?? true,
+            settle: opts?.settle ?? false,
           }), "click(point)", guardOpts);
         }
         if (isLocatorLike(target)) {
@@ -990,8 +1102,8 @@ export class BrowserScriptSession {
             button: opts?.button ?? opts?.mouse_button ?? "left",
             modifiers: opts?.modifiers,
             force: opts?.force === true,
-            timeoutMs: opts?.timeoutMs ?? opts?.timeout_ms,
-            settle: opts?.settle ?? true,
+            timeoutMs: opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms,
+            settle: opts?.settle ?? false,
           }), `click(${target})`, guardOpts);
         }
         return self.#guard((b) => b.click(target, {
@@ -999,7 +1111,7 @@ export class BrowserScriptSession {
           clickCount: opts?.clickCount ?? opts?.click_count ?? 1,
           button: opts?.button ?? opts?.mouse_button ?? "left",
           modifiers: opts?.modifiers,
-          settle: opts?.settle ?? true,
+          settle: opts?.settle ?? false,
         }), `click(${target})`, guardOpts);
       },
       locatorClick: (selector, opts = {}) => self.#guard((b) => b.locatorClick(selector, {
@@ -1009,8 +1121,8 @@ export class BrowserScriptSession {
         button: opts?.button ?? opts?.mouse_button ?? "left",
         modifiers: opts?.modifiers,
         force: opts?.force === true,
-        timeoutMs: opts?.timeoutMs ?? opts?.timeout_ms,
-        settle: opts?.settle ?? true,
+        timeoutMs: opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms,
+        settle: opts?.settle ?? false,
       }), `locatorClick(${selector})`, guardOpts),
       fill: (target, value, opts = {}) => {
         const tabId = resolveTab(opts);
@@ -1019,36 +1131,36 @@ export class BrowserScriptSession {
             tabId,
             frame: opts?.frame,
             force: opts?.force === true,
-            timeoutMs: opts?.timeoutMs ?? opts?.timeout_ms,
-            settle: opts?.settle ?? true,
+            timeoutMs: opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms,
+            settle: opts?.settle ?? false,
           }), `fill(${target})`, guardOpts);
         }
         return self.#guard((b) => b.setValue(target, String(value), {
           tabId,
-          settle: opts?.settle ?? true,
+          settle: opts?.settle ?? false,
         }), `setValue(${target})`, guardOpts);
       },
       locatorFill: (selector, value, opts = {}) => self.#guard((b) => b.locatorFill(selector, String(value), {
         tabId: resolveTab(opts),
         frame: opts?.frame,
         force: opts?.force === true,
-        timeoutMs: opts?.timeoutMs ?? opts?.timeout_ms,
-        settle: opts?.settle ?? true,
+        timeoutMs: opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms,
+        settle: opts?.settle ?? false,
       }), `locatorFill(${selector})`, guardOpts),
       setValue: (index, value, opts = {}) => self.#guard((b) => b.setValue(index, String(value), {
         tabId: resolveTab(opts),
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `setValue(${index})`, guardOpts),
       type: (text, opts = {}) => self.#guard((b) => b.typeText(String(text), {
         tabId: resolveTab(opts),
         elementIndex: opts?.elementIndex ?? opts?.element_index,
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), "typeText", guardOpts),
       typeText: (text, opts = {}) => tabApi.type(text, opts),
       press: (key, opts = {}) => self.#guard((b) => b.pressKey(String(key), {
         tabId: resolveTab(opts),
         elementIndex: opts?.elementIndex ?? opts?.element_index,
-        settle: opts?.settle ?? true,
+        settle: opts?.settle ?? false,
       }), `pressKey(${key})`, guardOpts),
       pressKey: (key, opts = {}) => tabApi.press(key, opts),
       hover: (target, opts = {}) => {
@@ -1063,7 +1175,7 @@ export class BrowserScriptSession {
             selector: target,
             frame: opts?.frame,
             force: opts?.force === true,
-            timeoutMs: opts?.timeoutMs ?? opts?.timeout_ms,
+            timeoutMs: opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms,
           }), `hover(${target})`, guardOpts);
         }
         return self.#guard((b) => b.hover({ tabId, elementIndex: target }), `hover(${target})`, guardOpts);
@@ -1106,7 +1218,7 @@ export class BrowserScriptSession {
         elementIndex: opts?.elementIndex ?? opts?.element_index,
         selector: opts?.selector,
         frame: opts?.frame,
-        timeoutMs: opts?.timeoutMs ?? opts?.timeout_ms,
+        timeoutMs: opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms,
       }), "uploadFiles", guardOpts),
       innerText: (selector, opts = {}) => {
         if (selector === undefined || selector === null || isPlainObject(selector)) {
@@ -1120,11 +1232,16 @@ export class BrowserScriptSession {
         }
         return tabApi.locator(selector).textContent(opts);
       },
+      innerHTML: (selector, opts = {}) => tabApi.locator(selector).innerHTML(opts),
       inputValue: (selector, opts = {}) => tabApi.locator(selector).inputValue(opts),
       getAttribute: (selector, name, opts = {}) => tabApi.locator(selector).getAttribute(name, opts),
       isVisible: (selector, opts = {}) => tabApi.locator(selector).isVisible(opts),
+      isHidden: (selector, opts = {}) => tabApi.locator(selector).isHidden(opts),
       isEnabled: (selector, opts = {}) => tabApi.locator(selector).isEnabled(opts),
+      isDisabled: (selector, opts = {}) => tabApi.locator(selector).isDisabled(opts),
       isChecked: (selector, opts = {}) => tabApi.locator(selector).isChecked(opts),
+      focus: (selector, opts = {}) => tabApi.locator(selector).focus(opts),
+      boundingBox: (selector, opts = {}) => tabApi.locator(selector).boundingBox(opts),
       check: (selector, opts = {}) => tabApi.locator(selector).check(opts),
       uncheck: (selector, opts = {}) => tabApi.locator(selector).uncheck(opts),
       waitFor: (optsOrMs) => {
@@ -1145,14 +1262,15 @@ export class BrowserScriptSession {
           loadState: opts.loadState ?? opts.load_state,
           state: opts.state,
           frame: opts.frame,
-          timeoutMs: self.#clampTimeout(opts.timeoutMs ?? opts.timeout_ms ?? 10_000),
+          timeoutMs: self.#clampTimeout(opts.timeout ?? opts.timeoutMs ?? opts.timeout_ms ?? 10_000),
         }), "waitFor", guardOpts);
       },
+      waitForSelector: (selector, opts = {}) => tabApi.locator(selector).waitFor(opts),
       wait: (optsOrMs) => tabApi.waitFor(optsOrMs),
       waitForEvent: async (eventName, opts = {}) => {
         const res = await self.#guard((b) => b.waitForEvent(eventName, {
           tabId: resolveTab(opts),
-          timeoutMs: self.#clampTimeout(opts?.timeoutMs ?? opts?.timeout_ms ?? 30_000),
+          timeoutMs: self.#clampTimeout(opts?.timeout ?? opts?.timeoutMs ?? opts?.timeout_ms ?? 30_000),
         }), `waitForEvent(${eventName})`, guardOpts);
         if (eventName === "popup" && res?.tab_id) {
           const handle = self.#createTabHandle(res.tab_id);
@@ -1326,7 +1444,7 @@ export class BrowserScriptSession {
         },
         performSecondaryAction: (idx, action, opts = {}) => self.#guard((b) => b.performSecondaryAction(idx, action, {
           tabId: resolveTab(opts),
-          settle: opts?.settle ?? true,
+          settle: opts?.settle ?? false,
         }), `ax.performSecondaryAction(${idx}, ${action})`, guardOpts),
         ariaSnapshot: (opts = {}) => tabApi.ariaSnapshot(opts),
       },
@@ -1433,7 +1551,15 @@ export class BrowserScriptSession {
    * @param {string} code
    * @param {{tabId?:unknown, timeoutMs?:number, maxLogChars?:number, maxResultChars?:number, maxImages?:number}} [options]
    */
-  async run(browser, code, options = {}) {
+  run(browser, code, options = {}) {
+    const exec = () => this.#runSerialized(browser, code, options);
+    const task = this.#runQueue.then(exec, exec);
+    this.#runQueue = task.catch(() => {});
+    return task;
+  }
+
+  /** @param {import("./bridge-browser.js").BridgeBrowser} browser @param {string} code @param {{tabId?:unknown, timeoutMs?:number, maxLogChars?:number, maxResultChars?:number, maxImages?:number}} [options] */
+  async #runSerialized(browser, code, options = {}) {
     const timeoutMs = Math.max(500, Math.min(300_000, Number(options.timeoutMs) || 45_000));
     const maxLogChars = options.maxLogChars ?? 16_000;
     const maxResultChars = options.maxResultChars ?? 32_000;
@@ -1462,6 +1588,7 @@ export class BrowserScriptSession {
       logChars: 0,
       images: [],
       activeTimers: new Set(),
+      activeIntervals: new Set(),
       maxLogChars,
       maxImages,
     };
@@ -1490,7 +1617,9 @@ export class BrowserScriptSession {
       .map((k) => `try { __scope[${JSON.stringify(k)}] = ${k}; } catch { /* uninitialized */ }`)
       .join("\n");
 
-    const wrapped = `(async function __browserRun(browser, page, log, sleep, viewImage, saveFile, readFile, saveScreenshot, nodeRepl, console, __scope) {\n${preloadLines}\ntry {\n${transformed}\n} finally {\n${saveLines}\n}\n})`;
+    const headerLines = `(async function __browserRun(browser, page, log, sleep, viewImage, saveFile, readFile, saveScreenshot, nodeRepl, console, __scope) {\n${preloadLines}\ntry {\n`;
+    const headerLineOffset = headerLines.match(/\n/g)?.length ?? 3;
+    const wrapped = `${headerLines}${transformed}\n} finally {\n${saveLines}\n}\n})`;
     const script = new vm.Script(wrapped, { filename: "browser-run.js" });
     const runner = script.runInContext(this.context, { timeout: Math.min(timeoutMs, 5_000) });
 
@@ -1546,6 +1675,26 @@ export class BrowserScriptSession {
         endTurnRequested: run.endTurnRequested,
         ungroupOnEndTurn: run.ungroupOnEndTurn,
       };
+    } catch (err) {
+      if (err && typeof err === "object") {
+        const stackMatch = typeof err.stack === "string"
+          ? /browser-run\.js:(\d+):(\d+)/.exec(err.stack)
+          : null;
+        const location = stackMatch
+          ? {
+              line: Math.max(1, Number(stackMatch[1]) - headerLineOffset),
+              column: Number(stackMatch[2]),
+            }
+          : null;
+        err.browserRunMeta = {
+          location,
+          last_action: run.lastAction ?? null,
+          saved_files: [...run.savedFiles.values()],
+          partial_logs: [...run.logs],
+          activeTabId: this.#activeTabId(),
+        };
+      }
+      throw err;
     } finally {
       run.aborted = true;
       clearTimeout(deadlineTimer);
@@ -1554,6 +1703,8 @@ export class BrowserScriptSession {
       run.pendingPromises.clear();
       for (const timer of run.activeTimers) clearTimeout(timer);
       run.activeTimers.clear();
+      for (const interval of run.activeIntervals) clearInterval(interval);
+      run.activeIntervals.clear();
       for (const unsub of run.eventCleanups.values()) {
         try { unsub(); } catch { /* Ignore cleanup failure */ }
       }

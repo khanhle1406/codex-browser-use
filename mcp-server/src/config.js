@@ -1,24 +1,57 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const SERVER_PATH = fileURLToPath(new URL("./server.js", import.meta.url));
-const HOMEBREW_NODE_LINK = "/opt/homebrew/bin/node";
+const HOMEBREW_ARM_NODE_LINK = "/opt/homebrew/bin/node";
+const HOMEBREW_INTEL_NODE_LINK = "/usr/local/bin/node";
 
 /**
- * Prefer Homebrew's unversioned symlink over a Cellar path so `brew upgrade node`
- * does not break existing client configs.
+ * Prefer an unversioned/alias Node binary over ephemeral Cellar, Volta image,
+ * or `fnm` multishell paths so `brew upgrade` / shell exit does not break configs.
+ * @param {string} [execPath]
+ * @param {(p:string)=>boolean} [fileExists]
+ * @param {string} [home]
  * @returns {string}
  */
-export function stableNodePath() {
-  if (
-    /^\/opt\/homebrew\/Cellar\/node\/[^/]+\/bin\/node$/u.test(process.execPath) &&
-    existsSync(HOMEBREW_NODE_LINK)
-  ) {
-    return HOMEBREW_NODE_LINK;
+export function stableNodePath(execPath = process.execPath, fileExists = existsSync, home = homedir()) {
+  if (/^\/opt\/homebrew\/Cellar\/node(?:@[\d.]+)?\/[^/]+\/bin\/node$/u.test(execPath) && fileExists(HOMEBREW_ARM_NODE_LINK)) {
+    return HOMEBREW_ARM_NODE_LINK;
   }
-  return process.execPath;
+  if (/^\/usr\/local\/Cellar\/node(?:@[\d.]+)?\/[^/]+\/bin\/node$/u.test(execPath) && fileExists(HOMEBREW_INTEL_NODE_LINK)) {
+    return HOMEBREW_INTEL_NODE_LINK;
+  }
+  if (/[/\\]\.volta[/\\]tools[/\\]image[/\\]node[/\\][^/\\]+[/\\]bin[/\\]node(?:\.exe)?$/u.test(execPath)) {
+    const voltaBin = path.join(home, ".volta", "bin", process.platform === "win32" ? "node.exe" : "node");
+    if (fileExists(voltaBin)) return voltaBin;
+  }
+  if (/[/\\]fnm_multishells[/\\][^/\\]+[/\\]bin[/\\]node(?:\.exe)?$/u.test(execPath)) {
+    for (const candidate of [
+      path.join(home, ".local", "share", "fnm", "aliases", "default", "bin", "node"),
+      path.join(home, ".fnm", "aliases", "default", "bin", "node"),
+      path.join(home, "Library", "Application Support", "fnm", "aliases", "default", "bin", "node"),
+    ]) {
+      if (fileExists(candidate)) return candidate;
+    }
+  }
+  return execPath;
+}
+
+/**
+ * Detect temporary/ephemeral package paths (e.g. `npx` `_npx` cache or OS temp dirs)
+ * that should not be hardcoded into persistent configs or native messaging launchers.
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+export function isEphemeralPackagePath(filePath) {
+  const resolved = path.resolve(String(filePath || ""));
+  if (/(?:^|[/\\])_npx(?:[/\\]|$)/u.test(resolved)) return true;
+  if (/(?:^|[/\\])npm-cache[/\\]_npx(?:[/\\]|$)/u.test(resolved)) return true;
+  const tmp = path.resolve(tmpdir());
+  if (resolved === tmp || resolved.startsWith(`${tmp}${path.sep}`)) return true;
+  if (/^\/(?:private\/)?var\/folders\//u.test(resolved)) return true;
+  return false;
 }
 
 /**
